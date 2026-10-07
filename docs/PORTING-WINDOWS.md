@@ -14,7 +14,7 @@
 与 Linux `build.sh` 并列），产物 `build/gdec-win.exe` + `build/gdec-api-win.exe`
 + `start_win.exe`；`start_win.exe` 一键启动引擎 + API 双进程（原生 Win32
 启动器，双击即用，不需要 Git Bash / PowerShell；客户端连 8731 走标准
-OpenAI 接口）。Git Bash 下 `start_win.sh` 与 Linux `start.sh` 并列。
+OpenAI 接口）。Git Bash 兼容入口为 `tools/start_win.sh`；日常 Windows 启动使用根目录 `start_win.exe` 或调优入口 `start-gfx1151-262k.ps1`。
 
 验证矩阵（全部 PASS）：
 
@@ -117,7 +117,7 @@ Windows 文件 IO 按需聚集。预期性能与 Linux 版持平（同一块 DRA
 ## 实测记录
 
 环境：HIP SDK 7.2（`C:\Program Files\AMD\ROCm\7.2`）+
-TheRock 10.0（`C:\therock-dist-windows-multiarch-10.0.0`），
+TheRock 10.0（`C:\TheRock\10.0.0-multiarch`），
 Adrenalin 驱动 32.0.22018.5（2025-09-17）。主机另有 RTX 2080 Ti（不参与 HIP 枚举）。
 
 ### 工具链与库（全部就绪）
@@ -237,7 +237,7 @@ TheRock 目录改名、HIP_PATH/ROCM_PATH 清空后 ktest 仍 ALL PASS）。运�
 2. ~~加载 heretic.hgn 冒烟：CLI 短生成，对拍 Linux 基线输出。~~ ✅ 出字正确，decode 32.5 tok/s
 3. ~~PLE 的 Windows 批量读路径 + 性能对拍（prefill/decode tok/s）。~~ ✅ IOCP 路径随冒烟/serve 通过
 4. ~~kernel 单测（`tools/ktest.cu`）在 Windows 全绿。~~ ✅ ALL PASS
-5. ~~API 前端与服务化收尾。~~ ✅ `gdec-api-win.exe` + `start_win.sh` 双进程，
+5. ~~API 前端与服务化收尾。~~ ✅ `gdec-api-win.exe` + `tools/start_win.sh` 双进程，
    `api_live_smoke.py` 8/8 PASS，多模态（PNG 图片问答）端到端实测通过；
    剩余可选：WebP 解码（需 libwebp 预编译库）
 

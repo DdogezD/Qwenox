@@ -27,7 +27,7 @@ for arg in "$@"; do
   case "$arg" in
     --bundle) BUNDLE_RUNTIME=1 ;;
     -h|--help) usage; exit 0 ;;
-    --*) echo "未知选项: $arg" >&2; usage >&2; exit 2 ;;
+    --*) echo "unknown option: $arg" >&2; usage >&2; exit 2 ;;
     *) POSITIONAL+=("$arg") ;;
   esac
 done
@@ -39,16 +39,16 @@ case "$TARGET" in
   all|engine|api|bench|test) ;;
   *) usage >&2; exit 2 ;;
 esac
-command -v flock >/dev/null || { echo '缺少 flock，请安装 util-linux' >&2; exit 1; }
+command -v flock >/dev/null || { echo 'flock not found; install util-linux' >&2; exit 1; }
 if processes="$(pgrep -af '(^|/)(gdec[^/[:space:]]*|flash_serve|serve_api\.py)([[:space:]]|$)')"; then
-  echo "已有引擎或 API 在运行，请先在原终端停止服务：$processes" >&2
+  echo "an engine or API is already running; stop it in its own terminal first: $processes" >&2
   exit 1
 fi
 mkdir -p build
 exec 9>build/.build.lock
-flock -n 9 || { echo '本目录已有编译任务在运行' >&2; exit 1; }
+flock -n 9 || { echo 'another build is already running in this directory' >&2; exit 1; }
 exec 8>"${XDG_RUNTIME_DIR:-/run/user/$UID}/hgn-work.lock"
-flock -n 8 || { echo '另一个 gfx1151-engine 编译或启动任务正在运行' >&2; exit 1; }
+flock -n 8 || { echo 'another gfx1151-engine build or start task is running' >&2; exit 1; }
 
 GPU_ARCH="${GPU_ARCH:-gfx1151}"
 if [[ "$TARGET" != api ]]; then
@@ -56,7 +56,7 @@ if [[ "$TARGET" != api ]]; then
     HIPCC="$(command -v hipcc || true)"
     HIPCC="${HIPCC:-/opt/rocm/bin/hipcc}"
   fi
-  command -v "$HIPCC" >/dev/null || { echo '找不到 hipcc，请安装 ROCm 或设置 HIPCC' >&2; exit 1; }
+  command -v "$HIPCC" >/dev/null || { echo 'hipcc not found; install ROCm or set HIPCC' >&2; exit 1; }
 fi
 CXX="${CXX:-g++}"
 BUNDLE_RPATH=()
@@ -79,7 +79,7 @@ run() {
 compile() {
   local output="$1" cap="$2" secs="$3"; shift 3
   local tmp="${output}.tmp.$$"
-  echo "[编译] $output"
+  echo "[build] $output"
   if run "$cap" "$secs" "$@" -o "$tmp"; then
     mv -f -- "$tmp" "$output"
   else
@@ -100,22 +100,22 @@ is_base_system_lib() {
 
 bundle_binary_libs() {
   local binary="$1" scan ldd_output line soname arrow resolved rest tmp
-  [[ -x "$binary" ]] || { echo "找不到待打包 ELF: $binary" >&2; return 1; }
-  command -v ldd >/dev/null || { echo '缺少 ldd，无法收集 Linux 运行库' >&2; return 1; }
+  [[ -x "$binary" ]] || { echo "ELF to package not found: $binary" >&2; return 1; }
+  command -v ldd >/dev/null || { echo 'ldd not found; cannot collect Linux runtime libraries' >&2; return 1; }
   mkdir -p build/lib "$BUNDLE_SCAN_DIR"
 
   # 在无 lib/ 邻居的临时目录解析，避免上次打包的 $ORIGIN/lib 干扰本次 ldd。
   scan="$BUNDLE_SCAN_DIR/$(basename "$binary")"
   cp -f -- "$binary" "$scan"
   if ! ldd_output="$(LC_ALL=C ldd "$scan")"; then
-    echo "无法解析 $binary 的运行库" >&2
+    echo "cannot resolve runtime libraries of $binary" >&2
     return 1
   fi
   while IFS= read -r line; do
     read -r soname arrow resolved rest <<<"$line"
     [[ "$arrow" == '=>' ]] || continue
     if [[ "$resolved" == 'not' ]]; then
-      echo "$binary 缺少运行库: $soname" >&2
+      echo "$binary is missing runtime library: $soname" >&2
       return 1
     fi
     [[ "$resolved" == /* ]] || continue
@@ -123,7 +123,7 @@ bundle_binary_libs() {
     tmp="build/lib/${soname}.tmp.$$"
     cp -Lf --preserve=mode,timestamps -- "$resolved" "$tmp"
     mv -f -- "$tmp" "build/lib/$soname"
-    echo "[运行库] $soname"
+    echo "[lib] $soname"
   done <<<"$ldd_output"
 }
 
@@ -141,7 +141,7 @@ resolve_rocm_root() {
     return
   fi
   [[ -d /opt/rocm ]] && { readlink -f /opt/rocm; return; }
-  echo '无法从 HIPCC 推断 ROCm 根目录，请设置 ROCM_PATH' >&2
+  echo 'cannot infer ROCm root from HIPCC; set ROCM_PATH' >&2
   return 1
 }
 
@@ -155,7 +155,7 @@ find_kernel_db() {
   candidate="$(find -L "$rocm_root" -maxdepth 5 -type d \
     -path "*/$component/library" -print -quit 2>/dev/null || true)"
   [[ -n "$candidate" ]] && { printf '%s\n' "$candidate"; return; }
-  echo "找不到 $component kernel db（ROCm: $rocm_root）" >&2
+  echo "$component kernel db not found (ROCm: $rocm_root)" >&2
   return 1
 }
 
@@ -183,7 +183,7 @@ bundle_kernel_db() {
   done
   (( copied )) || {
     rm -rf -- "$stage"
-    echo "$component kernel db 中没有 $GPU_ARCH: $src" >&2
+    echo "$component kernel db has no $GPU_ARCH: $src" >&2
     return 1
   }
   rm -rf -- "$dst"
@@ -205,7 +205,7 @@ bundle_gpu_runtime() {
 require_bundled_lib() {
   local pattern="$1"
   compgen -G "build/lib/$pattern" >/dev/null || {
-    echo "运行库未打包: $pattern" >&2
+    echo "runtime library not packaged: $pattern" >&2
     return 1
   }
 }
@@ -296,7 +296,7 @@ case "$TARGET" in
     build_api    & pids+=($!)
     fail=0
     for p in "${pids[@]}"; do wait "$p" || fail=1; done
-    [[ "$fail" == 0 ]] || { echo '[失败] 见上方编译输出' >&2; exit 1; }
+    [[ "$fail" == 0 ]] || { echo '[failed] see the compiler output above' >&2; exit 1; }
     if (( BUNDLE_RUNTIME )); then
       bundle_gpu_runtime "build/$ENGINE_NAME"
       bundle_api_runtime build/gdec-api
@@ -305,10 +305,10 @@ case "$TARGET" in
 esac
 if (( BUNDLE_RUNTIME )); then
   printf 'GPU_ARCH=%s\n' "$GPU_ARCH" >build/bundled-runtime.conf
-  echo '[完成] 分发产物与私有运行库位于 build/'
+  echo '[done] distribution binaries and private runtime libraries are in build/'
 else
   # 仅在本轮编译成功后清理旧分发库，避免编译失败破坏上次可用产物。
   rm -rf -- build/lib
   rm -f -- build/bundled-runtime.conf
-  echo '[完成] 编译输出位于 build/（使用系统运行库）'
+  echo '[done] binaries are in build/ (using system runtime libraries)'
 fi

@@ -183,7 +183,7 @@ bash build_win.sh bench     # standalone performance benchmark only
 bash build_win.sh api       # OpenAI API frontend → build/gdec-api-win.exe
 bash build_win.sh launcher  # script-free launcher → ./start_win.exe
 bash build_win.sh test      # build ktest-win and run kernel unit tests
-bash start_win.sh           # under Git Bash: start engine (line protocol 8730) + API (8731) as two processes
+bash tools/start_win.sh           # under Git Bash: start engine (line protocol 8730) + API (8731) as two processes
 ```
 
 **Use `start_win.exe` for daily launches**: a native Win32 launcher,
@@ -215,7 +215,7 @@ dependency; it is not needed at runtime.**
 
 Prerequisites (**build-time only**): the
 [TheRock](https://github.com/ROCm/TheRock) Windows multi-arch package
-(default `C:\therock-dist-windows-multiarch-10.0.0\...`, overridable with
+(default `C:\TheRock\10.0.0-multiarch`, overridable with
 `THEROCK=`) + Git Bash. The first build stages all runtime dependencies into
 `build/`: 6 TheRock DLLs, 3 MSVC runtimes, and the actual gfx1151 kernel db
 of rocBLAS/hipBLASLt (~30M total, not the all-architecture 1.2G). **The
@@ -224,9 +224,10 @@ same architecture and it runs — no need to install ROCm/TheRock, and no
 HIP_PATH/ROCM_PATH is set** (see PORTING-WINDOWS_EN.md for de-rooted
 real-world testing). The GPU needs enough VRAM partitioned in BIOS (heretic
 68 GiB weights + 256K context measured at a full 95 GiB, so partition 96
-GiB). `start_win.exe` / `start_win.sh` share the root `service.conf` with
-the Linux launchers (hgn section only) (model paths, ports, context window, etc. are all edited
-there; environment variables can override temporarily).
+GiB). `start_win.exe` shares the root `service.conf` with the Linux launchers;
+the Git Bash compatibility entrypoint is `tools/start_win.sh` (hgn section only)
+(model paths, ports, context window, etc. are all edited there; environment variables
+can override temporarily).
 
 ## Optional tools and common build problems
 

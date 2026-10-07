@@ -18,8 +18,10 @@ parallel to the Linux `build.sh`), producing `build/gdec-win.exe` +
 `build/gdec-api-win.exe` + `start_win.exe`; `start_win.exe` launches both
 the engine and API processes in one step (a native Win32 launcher,
 double-click to use, no Git Bash / PowerShell needed; clients connect to
-port 8731 via the standard OpenAI interface). Under Git Bash, `start_win.sh`
-is the counterpart of the Linux `start_hgn.sh` (Windows supports hgn weights only).
+port 8731 via the standard OpenAI interface). Under Git Bash,
+`tools/start_win.sh` is the compatibility launcher; daily Windows startup uses
+root `start_win.exe` or the tuned `start-gfx1151-262k.ps1` profile (Windows supports
+hgn weights only).
 
 Verification matrix (all PASS):
 
@@ -137,7 +139,7 @@ DRAM, measured bandwidth identical).
 ## Measurement Log
 
 Environment: HIP SDK 7.2 (`C:\Program Files\AMD\ROCm\7.2`) +
-TheRock 10.0 (`C:\therock-dist-windows-multiarch-10.0.0`),
+TheRock 10.0 (`C:\TheRock\10.0.0-multiarch`),
 Adrenalin driver 32.0.22018.5 (2025-09-17). The host also has an RTX 2080 Ti
 (not involved in HIP enumeration).
 
@@ -298,7 +300,7 @@ PASS). All runtime dependencies sit next to the exe:
    smoke/serve tests
 4. ~~Kernel unit tests (`tools/ktest.cu`) all green on Windows.~~ ✅ ALL PASS
 5. ~~API frontend and service-ization wrap-up.~~ ✅ `gdec-api-win.exe` +
-   `start_win.sh` dual processes, `api_live_smoke.py` 8/8 PASS, multimodal
+   `tools/start_win.sh` dual processes, `api_live_smoke.py` 8/8 PASS, multimodal
    (PNG image Q&A) verified end-to-end; remaining optional item: WebP
    decoding (needs a prebuilt libwebp)
 
