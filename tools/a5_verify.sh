@@ -59,7 +59,7 @@ echo
 echo "================ 3/5 start_hgn.sh --check：取生产环境 ================"
 # 在 Windows 上编辑过的文件可能带 CRLF 换行，bash 会报 "set: pipefail 无效的选项名"，
 # source service.conf 也会把 \r 带进每个值。这里直接转成 LF。
-for f in start_hgn.sh start_gguf.sh tools/serve_common.sh start_win.sh service.conf; do
+for f in start_hgn.sh start_gguf.sh tools/serve_common.sh tools/start_win.sh service.conf; do
   if [[ -f $f ]] && grep -q $'\r' "$f"; then
     sed -i 's/\r$//' "$f" && echo "已把 $f 的 CRLF 换行转成 LF"
   fi

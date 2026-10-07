@@ -8,7 +8,7 @@
 #   bash build_win.sh launcher   # 免脚本启动器 → ./start_win.exe（双击即用，托盘程序）
 #   bash build_win.sh test       # 编 build/ktest-win.exe 并运行 kernel 单测
 #
-# 前置：TheRock 多架构包（默认 C:\therock-dist-windows-multiarch-10.0.0\...，
+# 前置：TheRock 多架构包（默认 C:\TheRock\10.0.0-multiarch，
 # 可用 THEROCK=/path 覆盖）；GPU_ARCH 默认 gfx1151。
 #
 # 脚本同时准备好运行环境（只需做一次，之后重复运行为幂等跳过）：
@@ -22,7 +22,7 @@
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
-TR="${THEROCK:-/c/therock-dist-windows-multiarch-10.0.0/therock-dist-windows-multiarch-10.0.0}"
+TR="${THEROCK:-/c/TheRock/10.0.0-multiarch}"
 HIPCC="$TR/bin/hipcc.exe"
 [[ -x "$HIPCC" ]] || { echo "找不到 TheRock hipcc: $HIPCC（设 THEROCK=...）" >&2; exit 1; }
 # hipcc 会读 HIP_PATH 定位 clang（实测指向坏路径直接编译失败；指向 HIP SDK 7.2
@@ -154,4 +154,4 @@ case "$TARGET" in
   launcher) build_launcher ;;
   test) build_test ;;
 esac
-echo '[完成] 编译输出位于 build/；启动服务用 ./start_win.exe（或 bash start_win.sh）'
+echo '[完成] 编译输出位于 build/；启动服务用 ./start_win.exe（Git Bash 兼容入口：bash tools/start_win.sh）'

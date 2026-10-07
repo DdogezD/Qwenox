@@ -10,19 +10,19 @@ source "$ROOT/tools/serve_common.sh"
 serve_init "$@"
 
 for f in "$MODEL_FILE" "$NGRAM_FILE" "$OVERLAY_FILE" "$MTP_FILE" "$VISION_FILE"; do
-  [[ -z "$f" || "$f" == *.hgn ]] || fail "$LAUNCHER 只接受 .hgn 权重：$f（GGUF 请用 bash start_gguf.sh）"
+  [[ -z "$f" || "$f" == *.hgn ]] || fail "$LAUNCHER only accepts .hgn weights: $f (for GGUF use bash start_gguf.sh)"
 done
-need 主模型 "$MODEL_FILE"
+need 'main model' "$MODEL_FILE"
 NGRAM_FILE=${NGRAM_FILE:-$MODEL_FILE}
-need 'n-gram 表' "$NGRAM_FILE" 'w4b 与主模型同一文件；v2 指向 *-ngram.hgn'
-# overlay 可选：文件不在只警告并跳过（例如换成 v2 权重后忘了改配置）。
+need 'n-gram table' "$NGRAM_FILE" 'w4b shares the main model file; v2 points to *-ngram.hgn'
+# overlay is optional: warn and skip when missing (e.g. config left over after switching to v2 weights).
 if [[ -n "$OVERLAY_FILE" && ! -r "$OVERLAY_FILE" ]]; then
-  echo "警告：找不到 overlay：$OVERLAY_FILE，已跳过（v2 权重不用 overlay；不想看到这条可设 OVERLAY_FILE=\"\"）" >&2
+  echo "warning: overlay not found: $OVERLAY_FILE, skipped (v2 weights use no overlay; set OVERLAY_FILE=\"\" to silence this)" >&2
   OVERLAY_FILE=
 fi
-[[ -z "$MTP_FILE" ]] || need 'MTP 草稿' "$MTP_FILE" '设 MTP_FILE="" 退回 overlay 内置草稿头'
-[[ -z "$VISION_FILE" ]] || need 视觉塔 "$VISION_FILE" '纯文本可设 VISION_FILE=""'
-MISSING_HINT='hgn 权重由 tools/flashnext2hgn.py 转换生成（见 CONVERT.md）；手上是 llama.cpp GGUF 请用 bash start_gguf.sh（见 GGUF.md）。'
+[[ -z "$MTP_FILE" ]] || need 'MTP draft' "$MTP_FILE" 'set MTP_FILE="" to fall back to the overlay built-in draft head'
+[[ -z "$VISION_FILE" ]] || need 'vision tower' "$VISION_FILE" 'set VISION_FILE="" for text-only mode'
+MISSING_HINT='hgn weights are converted by tools/flashnext2hgn.py (see CONVERT.md); for llama.cpp GGUF weights use bash start_gguf.sh (see GGUF.md).'
 
 FORMAT=hgn
 MAIN_MODEL=$MODEL_FILE

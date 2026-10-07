@@ -27,7 +27,7 @@ T0=$SECONDS
 export PROBE_BINARY="$NEW_BIN"
 probe_precheck || exit 1
 [[ -x "$REF_BIN" ]] || { echo "找不到 REF_BIN=$REF_BIN（B0 之前的引擎二进制）" >&2; exit 1; }
-for f in start_hgn.sh start_gguf.sh tools/serve_common.sh start_win.sh service.conf; do
+for f in start_hgn.sh start_gguf.sh tools/serve_common.sh tools/start_win.sh service.conf; do
   [[ -f $f ]] && grep -q $'\r' "$f" && sed -i 's/\r$//' "$f"
 done
 chk="$(bash start_hgn.sh --check 2>&1)" || { echo "$chk"; echo "B0 VERIFY: FAIL（start_hgn.sh --check 失败）"; exit 1; }
