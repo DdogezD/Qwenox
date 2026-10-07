@@ -54,6 +54,7 @@ std::string g_root;
 std::string g_stamp;                        // 本次启动的时间戳，日志文件名用
 HANDLE g_children[2] = {nullptr, nullptr};  // 0 = 引擎，1 = API
 HANDLE g_job = nullptr;
+DWORD_PTR g_affinity = 0;  // 非零：spawn 时给子进程设处理器亲和性（AFFINITY 配置）
 bool g_own_console = false;  // 控制台是本进程 AllocConsole 出来的（退出前 pause）
 bool g_tray = true;          // false = --console / --check
 bool g_console_on = false;   // 子进程输出是否透传到控制台
@@ -477,6 +478,9 @@ Child spawn(const std::string& name, const std::string& exe,
         fail("启动失败（" + exe + "），错误码 " + std::to_string(err));
     }
     if (g_job) AssignProcessToJobObject(g_job, pi.hProcess);  // 失败也不影响运行
+    if (g_affinity && !SetProcessAffinityMask(pi.hProcess, g_affinity))
+        fprintf(stderr, "警告：SetProcessAffinityMask(%s) 失败，错误码 %lu\n",
+                name.c_str(), GetLastError());
     CloseHandle(pi.hThread);
 
     Child c;
@@ -638,6 +642,7 @@ UINT g_wm_taskbar_created = 0;  // 资源管理器重启后广播，需重新加
 enum MenuId : UINT {
     kIdDashboard = 1, kIdCopyUrl, kIdEngineLog, kIdApiLog, kIdLogDir, kIdSetup, kIdQuit
 };
+constexpr UINT_PTR kTipTimer = 1;
 
 std::wstring status_text() {
     switch (g_state) {
@@ -647,8 +652,101 @@ std::wstring status_text() {
     }
 }
 
+// 从引擎日志尾部解析最近一次请求的 pp/tg/acceptance；还没有请求就返回空串。
+std::wstring stats_text() {
+    if (g_plan.engine_log.empty()) return L"";
+    const std::string path = g_root + "\\" + g_plan.engine_log;
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return L"";
+    LARGE_INTEGER sz{};
+    GetFileSizeEx(h, &sz);
+    const LONGLONG cap = 192 * 1024;
+    LARGE_INTEGER off;
+    off.QuadPart = sz.QuadPart > cap ? sz.QuadPart - cap : 0;
+    SetFilePointerEx(h, off, nullptr, FILE_BEGIN);
+    std::string buf(static_cast<size_t>(sz.QuadPart - off.QuadPart), '\0');
+    DWORD got = 0;
+    ReadFile(h, buf.data(), static_cast<DWORD>(buf.size()), &got, nullptr);
+    CloseHandle(h);
+    buf.resize(got);
+    // "= <num> tok/s"：chain: 行是 tg；从尾往前找
+    auto last_toks = [&](const char* key) -> double {
+        for (size_t pos = buf.rfind(key); pos != std::string::npos;
+             pos = pos ? buf.rfind(key, pos - 1) : std::string::npos) {
+            const size_t eol = buf.find('\n', pos);
+            const std::string line =
+                buf.substr(pos, eol == std::string::npos ? eol : eol - pos);
+            const size_t eq = line.rfind("= ");
+            double v = 0;
+            if (eq != std::string::npos &&
+                sscanf(line.c_str() + eq + 2, "%lf tok/s", &v) == 1)
+                return v;
+        }
+        return -1;
+    };
+    // serve 路径的 eval 行："(22.33 ms/token, 44.8 tok/s)"
+    auto last_eval = [&](const char* key) -> double {
+        if (const size_t p = buf.rfind(key); p != std::string::npos) {
+            double v = 0;
+            const char* s = strstr(buf.c_str() + p, "ms/token, ");
+            if (s && sscanf(s + 10, "%lf tok/s", &v) == 1) return v;
+        }
+        return -1;
+    };
+    // 周期进度行的累计均值：pp 行 "prompt processing ... (avg 2058)"，
+    // tg 行 "n_decoded = ... (avg 33.1) | accept 54.7%"
+    auto last_avg = [&](const char* key) -> double {
+        if (const size_t p = buf.rfind(key); p != std::string::npos) {
+            double v = 0;
+            const char* s = strstr(buf.c_str() + p, "(avg ");
+            if (s && sscanf(s + 5, "%lf", &v) == 1) return v;
+        }
+        return -1;
+    };
+    double pp = last_avg("prompt processing");  // 长 prefill 的进度行
+    if (pp < 0) pp = last_eval("prompt eval");  // 短 prompt 只有结算行
+    if (pp < 0) pp = last_toks("prefill: ");    // CLI --ppl/--kld 模式的行
+    double tg = last_avg("n_decoded = ");
+    if (tg < 0) tg = last_toks("chain: ");
+    if (tg < 0) tg = last_eval("decode eval");
+    double acc = -1;  // 百分比
+    if (const size_t p = buf.rfind("n_decoded = "); p != std::string::npos) {
+        if (const char* s = strstr(buf.c_str() + p, "accept "))
+            sscanf(s + 7, "%lf%%", &acc);
+    }
+    if (acc < 0) {  // 请求结算行是小数
+        if (const size_t p = buf.rfind("draft acceptance = "); p != std::string::npos)
+            if (sscanf(buf.c_str() + p + 19, "%lf", &acc) == 1) acc *= 100;
+    }
+    if (pp < 0 && tg < 0 && acc < 0) return L"";
+    std::wstring out;
+    wchar_t num[64];
+    if (pp > 0) {
+        swprintf(num, ARRAYSIZE(num), L"pp %.0f tok/s", pp);
+        out += num;
+    }
+    if (tg > 0) {
+        swprintf(num, ARRAYSIZE(num), L"%stg %.1f tok/s", out.empty() ? L"" : L" · ", tg);
+        out += num;
+    }
+    if (acc >= 0) {
+        swprintf(num, ARRAYSIZE(num), L"%s接受率 %.1f%%", out.empty() ? L"" : L" · ", acc);
+        out += num;
+    }
+    return out;
+}
+
 void tray_update_tip() {
-    const std::wstring tip = L"gfx1151-engine · " + status_text();
+    std::wstring tip;
+    if (g_state == kReady) {
+        tip = L"已就绪 · " + to_w(local_base() + "/v1");
+        const std::wstring st = stats_text();
+        if (!st.empty()) tip += L"\n" + st;
+    } else {
+        tip = status_text();
+    }
     g_nid.uFlags = NIF_TIP;
     lstrcpynW(g_nid.szTip, tip.c_str(), ARRAYSIZE(g_nid.szTip));
     if (g_tray_added) Shell_NotifyIconW(NIM_MODIFY, &g_nid);
@@ -688,7 +786,7 @@ void tray_add() {
     g_nid.hIcon = small_icon ? small_icon
                              : LoadIconA(nullptr, IDI_APPLICATION);  // 未定义 UNICODE：IDI_* 是窄串
     g_nid.hBalloonIcon = big_icon;
-    const std::wstring tip = L"gfx1151-engine · " + status_text();
+    const std::wstring tip = status_text();
     lstrcpynW(g_nid.szTip, tip.c_str(), ARRAYSIZE(g_nid.szTip));
     // 开机自启时任务栏可能还没起来：失败就等 TaskbarCreated 再加
     if (Shell_NotifyIconW(NIM_ADD, &g_nid)) InterlockedExchange(&g_tray_added, 1);
@@ -798,9 +896,18 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     if (msg == WM_SVC_STATE) {
         tray_update_tip();
-        if (wp == static_cast<WPARAM>(kReady))
+        // 就绪后每 3 s 从引擎日志尾部刷新一次 pp/tg/接受率
+        if (wp == static_cast<WPARAM>(kReady)) {
+            SetTimer(h, kTipTimer, 3000, nullptr);
             tray_balloon(L"服务已就绪",
                          to_w(local_base() + "/v1\n双击图标打开面板，右键查看更多"));
+        } else {
+            KillTimer(h, kTipTimer);
+        }
+        return 0;
+    }
+    if (msg == WM_TIMER && wp == kTipTimer) {
+        tray_update_tip();
         return 0;
     }
     if (msg == WM_SVC_EXIT) {
@@ -909,6 +1016,8 @@ int main(int argc, char** argv) {
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
     load_conf(g_root + "\\service.conf");
+    // 机器专署覆盖（不入 git）：后加载者覆盖 service.conf 的同名键。
+    load_conf(g_root + "\\service.local.conf");
 
     // 启动配置面板：--setup 强制显示；否则只在 service.conf 没有
     // "# start_win: configured" 标记（首次启动）时显示。面板在"启动服务"时
@@ -948,7 +1057,7 @@ int main(int argc, char** argv) {
     // prefill 分段（见 service.conf）：决定 prefill 工作区在 arena 里的尺寸
     // （8192≈6.9 GiB，4096≈3.5 GiB）。0 = 引擎内置默认（Windows 8192）。
     const int prefill_chunk = cfg_int("PREFILL_CHUNK", 0, 0, 1 << 20);
-    const int start_timeout = env_int("START_TIMEOUT", 1800, 30, 86400);
+    const int start_timeout = cfg_int("START_TIMEOUT", 1800, 30, 86400);
     // YaRN（见 service.conf）：默认关闭（ROPE_FACTOR=1 即原生 RoPE）。字符串原样
     // 转发给引擎/API（GDEC_ROPE_*），这里只做与 start_win.sh 相同的校验。
     const std::string rope_factor_s = cfg("ROPE_FACTOR", "1");
@@ -1032,6 +1141,39 @@ int main(int argc, char** argv) {
     } else {
         printf("KV：不分页（KV_PAGED=0）\n");
     }
+
+    // GDEC_* 键从 conf 导出到子进程环境（引擎只读 env）：环境变量已有值优先；
+    // conf 里值为空 = 确保子进程环境中没有该变量（替代脚本的防御性清除）。
+    // 在下方固定 flags 块之前执行，launcher 内置 flags 仍可强制覆盖 conf。
+    for (const auto& kv : g_conf) {
+        if (kv.first.compare(0, 5, "GDEC_") != 0) continue;
+        if (getenv(kv.first.c_str())) continue;
+        SetEnvironmentVariableA(kv.first.c_str(),
+                                kv.second.empty() ? nullptr : kv.second.c_str());
+        printf("conf → env: %s=%s\n", kv.first.c_str(), kv.second.c_str());
+    }
+
+    // 处理器亲和性（如 Strix Halo 双 CCD：upper-half = 上半逻辑处理器）。
+    const std::string affinity = cfg("AFFINITY", "");
+    if (!affinity.empty()) {
+        if (affinity == "upper-half") {
+            SYSTEM_INFO si;
+            GetSystemInfo(&si);
+            const DWORD n = si.dwNumberOfProcessors;
+            if (n >= 2 && n <= 64) {
+                const unsigned long long all = n == 64 ? ~0ull : ((1ull << n) - 1);
+                g_affinity = all & (~0ull << (n / 2));
+            }
+        } else {
+            g_affinity = static_cast<DWORD_PTR>(strtoull(affinity.c_str(), nullptr, 0));
+        }
+        if (g_affinity)
+            printf("亲和性：mask 0x%llX\n",
+                   static_cast<unsigned long long>(g_affinity));
+        else
+            fprintf(stderr, "警告：AFFINITY \"%s\" 无法解析，忽略\n", affinity.c_str());
+    }
+
     if (check_only) {
         printf("检查通过；没有启动引擎或 API。\n");
         fflush(stdout);
