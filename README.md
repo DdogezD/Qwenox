@@ -337,9 +337,9 @@ Linux `start_gguf.sh` 用)、第 2 页上下文/并发/YaRN 勾选(扩展倍数�
 - 图片解码经 stb_image 支持 PNG/JPEG(WebP 未接)
 - prefill chunk 默认 8192
 - 冷加载为整权重读盘(分钟级,进度见控制台/日志)
-- 启动器未开 `GDEC_GEMM_WMMA` 与 `GDEC_GDN_FUSED`(Linux 启动器已转正的
-  自写 WMMA GEMM 与 GDN 融合 kernel,合计约 8-10% PP,TheRock 下未验证——
-  故 Windows 端 prefill 走 hipBLASLt + 旧 GDN 路径)
+- 启动器内置开启 `GDEC_GEMM_WMMA` 与 `GDEC_GDN_FUSED`（自写 WMMA GEMM 与
+  GDN 融合 kernel，合计约 8-10% PP）；机器专署调优（`GDEC_MOE_Q4W` 等）写在
+  不入库的 `service.local.conf`，启动器把其中的 `GDEC_*` 键导出给引擎环境
 
 已知问题(原因均未查明;疑难杂症较多,待解决,优先级很低):
 

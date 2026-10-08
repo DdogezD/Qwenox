@@ -435,10 +435,11 @@ Differences from the Linux version:
 - Prefill chunk defaults to 8192
 - Cold loading reads the full weights from disk (minute-scale, progress
   shown in console/logs)
-- The launchers do not enable `GDEC_GEMM_WMMA` or `GDEC_GDN_FUSED` (the
-  self-written WMMA GEMM and fused GDN kernel already promoted on Linux
-  launchers, worth ~8-10% PP combined but unverified under TheRock — so
-  Windows prefill uses hipBLASLt plus the legacy GDN path)
+- The launcher enables `GDEC_GEMM_WMMA` and `GDEC_GDN_FUSED` built in (the
+  self-written WMMA GEMM and fused GDN kernel, worth ~8-10% PP combined);
+  machine-specific tuning (`GDEC_MOE_Q4W` etc.) lives in the untracked
+  `service.local.conf`, whose `GDEC_*` keys the launcher exports to the
+  engine environment
 
 Known issues (root causes unknown; there are quite a few quirks, fixes
 pending, priority very low):
