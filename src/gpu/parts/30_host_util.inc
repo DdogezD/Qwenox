@@ -1098,53 +1098,28 @@ static void embed_rows(const WView& et, const int* d_tok, int P, void* out,
                                        et.scale_stride, (float*)out, outstride);
 }
 
-// Multi-row GEMV dispatch (P in 1..8; v2 ht/q6g64 up to QWENOX_GEMVMR_MAXP via
-// chunked ≤8-row passes, weights re-read per pass) for q4cp (dtype 5,
-// fp32/bf16 x), bf16 (dtype 0) and q8g64 (dtype 7) weights: streams the
-// weight once for all P rows. Returns false when the shape/layout is
-// unsupported (caller falls back to the dequant->bf16->hipBLASLt path).
+// Multi-row GEMV dispatch: P ≤ 8 streams the weight once for all P rows;
+// 8 < P ≤ QWENOX_GEMVMR_MAXP runs chunked ≤8-row passes (weights re-read
+// per pass). Covers q4cp (dtype 5, fp32/bf16 x), bf16 (dtype 0), q8g64
+// (dtype 7), q8g32 (dtype 8) and v2 ht/q6g64 (dtype 16/24). Returns false
+// when the shape/layout is unsupported (caller falls back to the
+// dequant->bf16->hipBLASLt path).
 static int gemvmr_maxp() {
   // 24: gfx1151 A/B crossover (logs/gemvmr_ps*.log, exact-P psweep vs MAXP=8):
   // P=16 -21~-24% wall, P=24 -6.4%, P=32 +8% (chunked re-reads scale P/8).
+  // Measured on v2 ht/q6g64; dtype 0/5/7/8 share the default pending their
+  // own sweep (per-pass weight cost is the same 0.5-0.75 B/elem order).
   static const int v = [] {
     const char* e = getenv("QWENOX_GEMVMR_MAXP");
     return e && *e ? atoi(e) : 24;
   }();
   return v;
 }
-static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
-                            uint64_t xstride, bool xbf16 = false) {
-  if (getenv("QWENOX_NO_GEMVMR")) return false;
-  // P > 8: v2 ht/q6g64 only — chunked passes of <= 8 rows re-read the weight
-  // (0.5-0.75 B/elem/pass vs ~4.5 B/elem for deq+WMMA, so the crossover is
-  // empirical; A/B in logs/gemvmr_sweep_*.log). dtype 0/5/7/8 keep the hard
-  // cap 8 — w4b q4cp and GGUF q8 are structurally untouched.
-  const bool v2q = (w.dtype == 16 || w.dtype == 24);
-  if (P < 1 || P > (v2q ? gemvmr_maxp() : 8)) return false;
-  if (!xstride) xstride = w.cols;
-  if (xbf16) {
-    if (xstride % 8 || (((uintptr_t)x | (uintptr_t)y) & 15)) return false;
-  } else if (xstride % 4 || (((uintptr_t)x | (uintptr_t)y) & 15))
-    return false;
-  if (v2q && P > 8) {
-    static bool mrlog = false;
-    if (!mrlog) {
-      mrlog = true;
-      fprintf(stderr, "gemvmr: v2 chunked ht/q6g64 gemv P<=%d (QWENOX_GEMVMR_MAXP)\n",
-              gemvmr_maxp());
-    }
-    for (int off = 0; off < P; off += 8) {
-      const int pn = std::min(8, P - off);
-      const void* xp = xbf16 ? (const void*)((const uint16_t*)x + (size_t)off * xstride)
-                             : (const void*)((const float*)x + (size_t)off * xstride);
-      float* yp = y + (size_t)off * w.rows;
-      const bool ok = w.dtype == 16
-          ? ht_gemv(w, xp, xbf16, xstride, yp, w.rows, pn, 0, w.rows)
-          : q6g64_gemv(w, xp, xbf16, xstride, yp, w.rows, pn, 0, w.rows);
-      if (!ok) return false;
-    }
-    return true;
-  }
+// P in 1..8 core: one pass over the weights for all P rows. xstride must be
+// non-zero and x/y alignment already checked by the caller.
+static bool gemv_multi_q4cp_le8(const WView& w, const void* x, float* y, int P,
+                                uint64_t xstride, bool xbf16) {
+  if (P < 1 || P > 8) return false;
   if (w.dtype == 16) return ht_gemv(w, x, xbf16, xstride, y, w.rows, P, 0, w.rows);
   if (w.dtype == 24) return q6g64_gemv(w, x, xbf16, xstride, y, w.rows, P, 0, w.rows);
   int threads = 512;
@@ -1380,6 +1355,38 @@ static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
 #undef QWENOX_GEMV_MR_CASE
     default:
       return false;
+  }
+  return true;
+}
+
+static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
+                            uint64_t xstride, bool xbf16 = false) {
+  if (getenv("QWENOX_NO_GEMVMR")) return false;
+  if (P < 1 || P > gemvmr_maxp()) return false;
+  if (!xstride) xstride = w.cols;
+  if (xbf16) {
+    if (xstride % 8 || (((uintptr_t)x | (uintptr_t)y) & 15)) return false;
+  } else if (xstride % 4 || (((uintptr_t)x | (uintptr_t)y) & 15))
+    return false;
+  if (P <= 8) return gemv_multi_q4cp_le8(w, x, y, P, xstride, xbf16);
+  // P > 8: chunked passes of ≤ 8 rows re-read the weight per pass
+  // (0.5-0.75 B/elem/pass vs ~4.5 B/elem for deq+WMMA, so the crossover is
+  // empirical; v2 A/B in logs/gemvmr_sweep_*.log: P=16 −21~−24% wall,
+  // P=24 −6.4%, P=32 +8%). y rows per pass stay contiguous (w.rows is a
+  // multiple of 16 for every shape on the decode path), so the 16-byte
+  // alignment of y carries over to each chunk.
+  static bool mrlog = false;
+  if (!mrlog) {
+    mrlog = true;
+    fprintf(stderr, "gemvmr: chunked multi-row gemv P<=%d (QWENOX_GEMVMR_MAXP)\n",
+            gemvmr_maxp());
+  }
+  for (int off = 0; off < P; off += 8) {
+    const int pn = std::min(8, P - off);
+    const void* xp = xbf16 ? (const void*)((const uint16_t*)x + (size_t)off * xstride)
+                           : (const void*)((const float*)x + (size_t)off * xstride);
+    float* yp = y + (size_t)off * w.rows;
+    if (!gemv_multi_q4cp_le8(w, xp, yp, pn, xstride, xbf16)) return false;
   }
   return true;
 }
