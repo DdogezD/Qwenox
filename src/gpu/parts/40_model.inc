@@ -202,6 +202,9 @@ struct GpuModel {
   // aggr 10-05: default ON (paged support + tail-edge sel-offset fix added;
   // 16K +0.9% paged, +2.2% unpaged; NOT bit-identical — key order — KLD
   // pending). QWENOX_QSA_UNION=0 restores the per-token kernel.
+  // D2-S1b: spec verify chunks (spec_snap) never take the union path — group
+  // membership depends on (base+P)&~3, i.e. on gamma, breaking row invariance
+  // (γ=2 vs γ=3 near-tie flip at pos 8193; d2s1b_vgd_* probes pcL3).
   bool qsa_union = qsa_wmma_btv && !env_zero("QWENOX_QSA_UNION");
   uint16_t* d_ublk = nullptr;  // [ngroups][QSA_UCAP] 并集块号
   uint16_t* d_umask = nullptr; // [ngroups][QSA_UCAP] 4 query x 4 slot 掩码
@@ -2851,6 +2854,14 @@ struct GpuModel {
   // QWENOX_GDN_LOOP=1 falls back to the per-token recurrence loop.
   void gdn_b(int l, int gi, int P) {
     char buf[128];
+    // D2-S1b bisect: QWENOX_VGDUMP_GL=<layer> 时对该 GDN 层逐阶段打行 hash。
+    const int vgl = [] {
+      const char* e = getenv("QWENOX_VGDUMP_GL");
+      return e ? atoi(e) : -1;
+    }();
+    auto vgd_g = [&](const char* tag, const void* p, size_t bytes) {
+      if (l == vgl) vg_dump_buf(tag, P, p, bytes);
+    };
     KP_SUB("gdn:proj");
     snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_qkv.weight", l);
     gemm(wview(ckpt.at(buf)), d_xb, d_qkvb, P);
@@ -2861,6 +2872,10 @@ struct GpuModel {
     snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_z.weight", l);
     gemm(wview(ckpt.at(buf)), d_xb, d_zb, P);
     KP_SUB_END();
+    vgd_g("gq", d_qkvb, (size_t)P * 10240 * 4);
+    vgd_g("ga", d_g48b, (size_t)P * 48 * 4);
+    vgd_g("bt", d_beta48b, (size_t)P * 48 * 4);
+    vgd_g("zb", d_zb, (size_t)P * 6144 * 4);
     float* convst = d_convst + (size_t)gi * 3 * 10240;
     const float* cw = d_convw + (size_t)gi * 10240 * 4;
     const float* Alog = d_Alog + (size_t)gi * 48;
@@ -2898,6 +2913,22 @@ struct GpuModel {
       k_gdn_gates<<<P, 64, 0, g_str>>>(d_g48b, d_beta48b, Alog, dtb, d_g48b, d_beta48b,
                                        48, 48);
       KP_SUB_END();
+      vgd_g("gc", d_convb, (size_t)P * 10240 * 4);
+      vgd_g("ga2", d_g48b, (size_t)P * 48 * 4);
+      vgd_g("bt2", d_beta48b, (size_t)P * 48 * 4);
+      // D2-S1b: whole-state hash of S at scan entry (scalar line — row mode
+      // would split it differently per P). Tells apart "S entered the round
+      // different" (rollback path) from "scan kernel diverged mid-batch".
+      if (l == vgl && !vg_capturing_ && getenv("QWENOX_VGDUMP")) {
+        CK(hipStreamSynchronize(g_str));
+        static std::vector<uint8_t> sh;
+        sh.resize((size_t)48 * 128 * 128 * 4);
+        CK(hipMemcpy(sh.data(), S, sh.size(), hipMemcpyDeviceToHost));
+        uint64_t fnv = 1469598103934665603ULL;
+        for (uint8_t b : sh) { fnv ^= b; fnv *= 1099511628211ULL; }
+        fprintf(stderr, "[sS] P=%d base=%d bufhash=%016llx\n", P, moe_dump_base_,
+                (unsigned long long)fnv);
+      }
       if (spec_snap) {
         int ngdn = g_cfg.layers - g_cfg.layers / 4;
         k_gdn_snap<<<48, 512, 0, g_str>>>(
@@ -2906,7 +2937,15 @@ struct GpuModel {
             P, 10240, (size_t)ngdn * 48 * 128 * 128);
       }
       KP_SUB("gdn:scan");
-      if (ngram_verify_active && !ngram_legacy_gdn && P <= 65) {
+      // D2-S1b: spec verify rounds (spec_snap) always take k_gdn_verify.
+      // Its per-row state recurrence is bit-identical to k_gdn_snap's (same
+      // 512-thread layout, same reduction order), so the committed S has a
+      // single provenance whether the round full-accepts (scan write-back)
+      // or rolls back (snap restore). The fused/stream kernels are fp16-WMMA
+      // / chunked-reassociated: their write-back differs from snap in LSBs,
+      // and acceptance-pattern differences across gamma then leak into the
+      // committed state (gs fork at abs 8196, γ2 P=3 vs γ3 P=4).
+      if ((ngram_verify_active || spec_snap) && !ngram_legacy_gdn && P <= 65) {
         k_gdn_verify<<<48, 512, 0, g_str>>>(
             d_convb, d_g48b, d_beta48b, S, d_convb, P, 10240);
       } else if (gdn_nosplit) {
@@ -3001,11 +3040,15 @@ struct GpuModel {
           d_convb + 4096, d_zb, gnw, nullptr, g_cfg.norm_eps, 10240, 6144,
           d_xbf16b, P);
       KP_SUB_END();
+      vgd_g("gs", d_convb, (size_t)P * 10240 * 4);
+      // d_xbf16b rows are 48*128 = 6144 bf16 (gatednorm writes (t*48+h)*128).
+      vgd_g("gz", d_xbf16b, (size_t)P * 6144 * 2);
       KP_SUB("gdn:oproj");
       snprintf(buf, sizeof buf, "layers.%d.linear_attn.out_proj.weight", l);
       gemm(wview(ckpt.at(buf)), d_convb + 4096, d_yb, P, 10240 /*row stride*/,
            d_xbf16b);
       KP_SUB_END();
+      vgd_g("go", d_yb, (size_t)P * 2560 * 4);
       return;
     }
     for (int t = 0; t < P; t++) {
@@ -3120,7 +3163,12 @@ struct GpuModel {
             d_qsb, kc, vc, d_attnb, P, 256, 2, 24, sel, first_abs, nullptr, nullptr,
             nullptr, base, ptab, dvb);
       else if constexpr (sizeof(KVT) == 2) {
-        if (qsa_union && vc_transposed) {
+        // spec verify (spec_snap): force the per-token kernel. Union group
+        // membership depends on the batch end (ge = (base+P) & ~3), so the
+        // same row lands in a group at P=4 but on a ragged edge at P=3 —
+        // and the union kernel is NOT bit-identical to the per-token one
+        // (key order). Row invariance across gamma requires one kernel.
+        if (qsa_union && vc_transposed && !spec_snap) {
           // 并集路径：[ga, ge) 内的 4 对齐完整组走 merge + k_qsa_wmma_u，
           // 两侧 ragged 边缘回退逐 token 的 k_qsa_wmma<true>
           const int ga = (first_abs + 3) & ~3;
@@ -3771,6 +3819,15 @@ struct GpuModel {
     snprintf(buf, sizeof buf, "layers.%d.self_attn.v_proj.weight", l);
     gemm(wview(ckpt.at(buf)), d_xb, d_vbb, P);
     KP_SUB_END();
+    if (getenv("QWENOX_VGDUMP")) {  // D2-S1b bisect: q/k/v proj outs
+      char tag[12];
+      snprintf(tag, sizeof tag, "qg%d", l);
+      vg_dump_buf(tag, P, d_qgb, (size_t)P * 12288 * 4);
+      snprintf(tag, sizeof tag, "vk%d", l);
+      vg_dump_buf(tag, P, d_kbb, (size_t)P * 512 * 4);
+      snprintf(tag, sizeof tag, "vv%d", l);
+      vg_dump_buf(tag, P, d_vbb, (size_t)P * 512 * 4);
+    }
     snprintf(buf, sizeof buf, "layers.%d.self_attn.q_norm.weight", l);
     float* qnw = ensure_norm256(buf);
     snprintf(buf, sizeof buf, "layers.%d.self_attn.k_norm.weight", l);
@@ -3792,6 +3849,11 @@ struct GpuModel {
       k_qsa_qsplit<true><<<dim3(24, P), 256, 0, g_str>>>(
           d_qgb, qnw, d_qsb, gate_bf16 ? nullptr : d_gsb, 256, g_cfg.norm_eps, base,
           d_ropecs);
+      if (getenv("QWENOX_VGDUMP")) {  // D2-S1b bisect: q post split+rope
+        char tag[12];
+        snprintf(tag, sizeof tag, "qs%d", l);
+        vg_dump_buf(tag, P, d_qsb, (size_t)P * 6144 * 4);
+      }
       int dense_P = qsa_dense ? P : min(P, std::max(0, 2051 - base));
       if (qsa_kv_fp32) {
         float* kc = d_kc + qsa_off;
@@ -3901,9 +3963,47 @@ struct GpuModel {
                                       tv ? (uint16_t)strtoul(tv, nullptr, 16) : 0);
         }
         KP_SUB_END();
+        if (getenv("QWENOX_VGDUMP")) {  // D2-S1b bisect: k/v post norm+rope
+          char tag[12];
+          snprintf(tag, sizeof tag, "kn%d", l);
+          vg_dump_buf(tag, P, d_kbb, (size_t)P * 512 * 4);
+          snprintf(tag, sizeof tag, "vn%d", l);
+          vg_dump_buf(tag, P, d_vbb, (size_t)P * 512 * 4);
+        }
         KP_SUB("qsa:flash");
         qsa_flash_b(kc, vc, P, dense_P, base, vct, kvpt(), dvb);
         KP_SUB_END();
+        if (getenv("QWENOX_VGDUMP")) {  // D2-S1b bisect: raw attention out
+          char tag[12];
+          snprintf(tag, sizeof tag, "at%d", l);
+          vg_dump_buf(tag, P, d_attnb, (size_t)P * 6144 * 4);
+        }
+        // D2-S1b: QWENOX_ATDUMP=<layer> dumps row P-1 of d_attnb as 12
+        // per-512-float FNV hashes + first 8 floats (locate the differing
+        // head/dim segment between P=3 and P=4 runs).
+        if (getenv("QWENOX_ATDUMP") && atoi(getenv("QWENOX_ATDUMP")) == l) {
+          const int dr = [] { const char* e = getenv("QWENOX_ATDROW");
+                              return e ? atoi(e) : 2; }();
+          if (P > dr) {
+          CK(hipStreamSynchronize(g_str));
+          std::vector<float> h(6144);
+          CK(hipMemcpy(h.data(), d_attnb + (size_t)dr * 6144, 6144 * 4,
+                       hipMemcpyDeviceToHost));
+          fprintf(stderr, "[atd%d] P=%d row%d head", l, P, dr);
+          for (int s = 0; s < 12; s++) {
+            uint64_t fnv = 1469598103934665603ULL;
+            for (int i = s * 512; i < s * 512 + 512; i++) {
+              uint32_t u;
+              memcpy(&u, &h[i], 4);
+              fnv ^= u; fnv *= 1099511628211ULL;
+            }
+            fprintf(stderr, " %016llx", (unsigned long long)fnv);
+          }
+          fprintf(stderr, "\n[atd%d] first8", l);
+          for (int i = 0; i < 8; i++) fprintf(stderr, " %a", (double)h[i]);
+          fprintf(stderr, "\n");
+          }
+        }
         if (base > 0 && getenv("QWENOX_ATTN_HASH")) dbg_attn_hash(qi, base, P, kc, vc, vct);
       }
       KP_SUB("qsa:gate");
@@ -3956,6 +4056,11 @@ struct GpuModel {
     snprintf(buf, sizeof buf, "layers.%d.self_attn.o_proj.weight", l);
     gemm(wview(ckpt.at(buf)), d_attnb, d_yb, P, 0, attn_bf);
     KP_SUB_END();
+    if (getenv("QWENOX_VGDUMP")) {  // D2-S1b bisect: o_proj out
+      char tag[12];
+      snprintf(tag, sizeof tag, "op%d", l);
+      vg_dump_buf(tag, P, d_yb, (size_t)P * 2560 * 4);
+    }
   }
 
   // MoE: router batched; expert GEMVs grouped over P*k slots (naive: full
@@ -4823,6 +4928,13 @@ struct GpuModel {
       gr_write_b(attn_prefix, P);
       gr_read_b(mlp_prefix, P);
     }
+    {  // D2-S1b bisect: QWENOX_VGDUMP_GL=<layer> → attn-HC 后 / MoE 后的 d_Rb
+      static const int vgl2 = [] {
+        const char* e = getenv("QWENOX_VGDUMP_GL");
+        return e ? atoi(e) : -1;
+      }();
+      if (l == vgl2) vg_dump_row("ra", P, base);
+    }
     KP("moe");
     // B2-1 (QWENOX_HC_FUSE_WRITE, 默认关 — KPROF 实测回退，见 HANDOFF-PREFILL-ALL
     // §4 B2-1 状态段): fold the mlp site's HC write-back into the moe reduce
@@ -4847,6 +4959,13 @@ struct GpuModel {
       h_rms("gpu", l, "mlp-y", d_yb + (size_t)(P - 1) * 2560, 2560);
     }
     KP("hc3");
+    {
+      static const int vgl3 = [] {
+        const char* e = getenv("QWENOX_VGDUMP_GL");
+        return e ? atoi(e) : -1;
+      }();
+      if (l == vgl3) vg_dump_row("rm", P, base);  // D2-S1b: MoE 后的 d_Rb
+    }
     if (flush_mlp) {
       if (!hcw) gr_write_b(mlp_prefix, P);
     } else if (hcw) {
@@ -5073,15 +5192,28 @@ struct GpuModel {
   }
 
   // QWENOX_VGDUMP (debug): sync + D2H an arbitrary device buffer, FNV-1a hash.
+  // QWENOX_VGDUMP_ROWS=1: one hash per row (bytes/P each) so runs with
+  // different P can be compared row by row.
   void vg_dump_buf(const char* tag, int P, const void* p, size_t bytes) {
     if (vg_capturing_ || P < 2 || P > 16 || !getenv("QWENOX_VGDUMP")) return;
     CK(hipStreamSynchronize(g_str));
     std::vector<uint8_t> h(bytes);
     CK(hipMemcpy(h.data(), p, bytes, hipMemcpyDeviceToHost));
-    uint64_t fnv = 1469598103934665603ULL;
-    for (uint8_t b : h) { fnv ^= b; fnv *= 1099511628211ULL; }
-    fprintf(stderr, "[%s] P=%d bufhash=%016llx\n", tag, P,
-            (unsigned long long)fnv);
+    auto fnv1a = [](const uint8_t* d, size_t n) {
+      uint64_t fnv = 1469598103934665603ULL;
+      for (size_t i = 0; i < n; i++) { fnv ^= d[i]; fnv *= 1099511628211ULL; }
+      return fnv;
+    };
+    if (getenv("QWENOX_VGDUMP_ROWS") && bytes % (size_t)P == 0) {
+      const size_t rb = bytes / (size_t)P;
+      fprintf(stderr, "[%s] P=%d base=%d rows", tag, P, moe_dump_base_);
+      for (int r = 0; r < P; r++)
+        fprintf(stderr, " %016llx", (unsigned long long)fnv1a(h.data() + (size_t)r * rb, rb));
+      fprintf(stderr, "\n");
+      return;
+    }
+    fprintf(stderr, "[%s] P=%d base=%d bufhash=%016llx\n", tag, P,
+            moe_dump_base_, (unsigned long long)fnv1a(h.data(), bytes));
   }
 
   // QWENOX_VGDUMP (debug): sync + D2H d_Rb rows [0,P), print an FNV-1a hash of
@@ -5094,10 +5226,21 @@ struct GpuModel {
     std::vector<uint8_t> h((size_t)P * row);
     CK(hipMemcpy(h.data(), (const uint8_t*)d_Rb, (size_t)P * row,
                  hipMemcpyDeviceToHost));
-    uint64_t fnv = 1469598103934665603ULL;
-    for (uint8_t b : h) { fnv ^= b; fnv *= 1099511628211ULL; }
+    auto fnv1a = [](const uint8_t* d, size_t n) {
+      uint64_t fnv = 1469598103934665603ULL;
+      for (size_t i = 0; i < n; i++) { fnv ^= d[i]; fnv *= 1099511628211ULL; }
+      return fnv;
+    };
+    if (getenv("QWENOX_VGDUMP_ROWS")) {
+      fprintf(stderr, "[%s] P=%d base=%d rows", tag, P, base);
+      for (int r = 0; r < P; r++)
+        fprintf(stderr, " %016llx",
+                (unsigned long long)fnv1a(h.data() + (size_t)r * row, row));
+      fprintf(stderr, "\n");
+      return;
+    }
     fprintf(stderr, "[%s] P=%d base=%d rowhash=%016llx\n", tag, P, base,
-            (unsigned long long)fnv);
+            (unsigned long long)fnv1a(h.data(), h.size()));
   }
 
   // embed all tokens: gather rows then repeat to 4 branches (in-place safe).

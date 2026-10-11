@@ -196,6 +196,10 @@ __global__ void k_sigmoid_gate_bf16_v4(const float* __restrict__ a,
 // result is NOT independent of those V bits (stale finite values changed
 // the output LSBs; A5 off-vs-paged divergence, 2026-09-24). Zero keeps the
 // output a function of valid rows only, identical for paged / unpaged.
+// D2-S1b: k_qsa_wmma<true> now also masks slots >= ntok in registers after
+// the group load (a verify batch of P+1 writes a real V where a batch of P
+// wrote 0); this store-side zero stays as belt-and-braces for the
+// k_qsa_wmma6 / union readers.
 __global__ void k_f32_to_bf16_v4_bt(const float* __restrict__ x,
                                     uint16_t* __restrict__ out, uint64_t xs,
                                     int P, int n, int base,
@@ -1705,6 +1709,26 @@ __global__ void __launch_bounds__(256)
 #pragma unroll
           for (int blk = 0; blk < 4; ++blk)
             pk[dt][blk] = *(const unsigned long long*)(vb[blk] + dim * 4);
+        }
+        // Zero slots past ntok in registers (D2-S1b). On gfx1151 the WMMA
+        // result is NOT independent of B-operand bits multiplied by an
+        // exact-zero A element (see k_f32_to_bf16_v4_bt), and those vct
+        // bytes are not batch-composition invariant: a verify batch of P+1
+        // writes a real V where a batch of P wrote 0 (trailing partial
+        // block), which then leaked into the shared rows' output LSBs.
+        // ntok is a function of the token only, so masking by it makes
+        // every token's output independent of P. Whole groups past ntok
+        // (vs == 0 -> block 0) are zeroed by the same rule.
+#pragma unroll
+        for (int blk = 0; blk < 4; ++blk) {
+          const int vk0 = it * QW_KITER + ks * QW_KTILE + blk * 4;
+          if (vk0 + 4 > ntok)
+#pragma unroll
+            for (int slot = 0; slot < 4; ++slot)
+              if (vk0 + slot >= ntok) {
+                pk[0][blk] &= ~(0xFFFFull << (slot * 16));
+                pk[1][blk] &= ~(0xFFFFull << (slot * 16));
+              }
         }
 #pragma unroll
         for (int dt = 0; dt < 2; ++dt) {

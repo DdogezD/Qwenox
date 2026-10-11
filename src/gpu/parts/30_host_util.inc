@@ -962,11 +962,16 @@ static void q6g64_gemv_p(const WView& w, const void* x, bool xbf16, uint64_t xs,
     else
       k_q6g64_gemv<P, float, 8><<<blocks, 256, 0, g_str>>>(wq, (const float*)x, xs, y, ys, R,
                                                            C, st);
-  } else if (P >= 2 && C >= 4096 && R <= 2048 && [] {  // P=1: LPR=32 faster (decode -1.7%)
+  } else if (C >= 4096 && R <= 2048 && [] {
                const char* e = getenv("QWENOX_Q6G_SPLITK");
                return !(e && e[0] == '0' && e[1] == 0);
              }()) {
-    // aggr 10-05: split-K for long-K small-R (HC mix-down 320x10240)
+    // aggr 10-05: split-K for long-K small-R (HC mix-down 320x10240).
+    // D2-S1b: 门控不再带 P>=2——LPR=32 与 split-K 的归约树不同，P=1 走
+    // LPR=32 会让同一行在 decode(P=1) 与 verify(P>=2) 间换 bits（ktest
+    // ri_q6g64_320x10240/4x10240 实测 P1 vs P2..24 全部分叉）。行不变性
+    // 要求 kernel 选择只是形状的函数；代价是 P=1 放弃 LPR=32（历史实测
+    // decode -1.7% 的由来），split-K 在 P=1 略慢但逐位一致。
     // fixed-size scratch, allocated on first use before any graph capture
     // (q6g64_splitk_init from v2_init); C <= 32768 -> ns <= 16.
     const int ng = C >> 6, gps = 32;

@@ -990,18 +990,24 @@ __global__ void k_gdn_step(const float* __restrict__ q, const float* __restrict_
 
 // Short speculative batches: keep the entire recurrent state in registers.
 // The four partial reductions and accumulation order follow k_gdn_step.
-// qkv and out may alias; all input values are read before output is stored.
+// Thread map: the four jc shards of one column i sit in adjacent lanes of
+// one warp (i = warp * warpSize/4 + lane/4, jc = lane%4), so both part[0..3]
+// reductions run as four __shfl_sync fetches summed in the same left-to-right
+// order (bit-identical to the shared-memory version) and the row loop needs
+// no __syncthreads at all. qkv and out may alias: each row's value is read
+// before the first shfl of that row and the output store happens after the
+// second, inside the same warp.
 __global__ void k_gdn_verify(const float* qkv, const float* g48,
                              const float* b48, float* S, float* out,
                              int P, int stride) {
-  const int h = blockIdx.x, i = threadIdx.x % 128;
-  const int jc = threadIdx.x / 128, j0 = jc * 32;
+  const int h = blockIdx.x;
+  const int lane = threadIdx.x % warpSize;
+  const int i = (threadIdx.x / warpSize) * (warpSize / 4) + (lane >> 2);
+  const int jc = lane & 3, j0 = jc * 32, jb = lane & ~3;
   float* Sh = S + (size_t)h * 128 * 128;
   float state[32];
 #pragma unroll
   for (int j = 0; j < 32; ++j) state[j] = Sh[(j0 + j) * 128 + i];
-  __shared__ float part[4][128];
-  __shared__ float delta_shared[128];
   for (int row = 0; row < P; ++row) {
     const float* q = qkv + (size_t)row * stride + (h / 3) * 128;
     const float* k = q + 2048;
@@ -1014,26 +1020,23 @@ __global__ void k_gdn_verify(const float* qkv, const float* g48,
       state[j] *= alpha;
       kv += state[j] * k[j0 + j];
     }
-    part[jc][i] = kv;
-    __syncthreads();
-    float kvf = part[0][i] + part[1][i] + part[2][i] + part[3][i];
-    float delta = (value - kvf) * beta;
-    if (jc == 0) delta_shared[i] = delta;
-    __syncthreads();
-    delta = delta_shared[i];
+    const float kv0 = __shfl_sync(~0ull, kv, jb + 0);
+    const float kv1 = __shfl_sync(~0ull, kv, jb + 1);
+    const float kv2 = __shfl_sync(~0ull, kv, jb + 2);
+    const float kv3 = __shfl_sync(~0ull, kv, jb + 3);
+    const float delta = (value - (kv0 + kv1 + kv2 + kv3)) * beta;
     float result = 0.f;
 #pragma unroll
     for (int j = 0; j < 32; ++j) {
       state[j] += k[j0 + j] * delta;
       result += state[j] * q[j0 + j];
     }
-    __syncthreads();
-    part[jc][i] = result;
-    __syncthreads();
+    const float r0 = __shfl_sync(~0ull, result, jb + 0);
+    const float r1 = __shfl_sync(~0ull, result, jb + 1);
+    const float r2 = __shfl_sync(~0ull, result, jb + 2);
+    const float r3 = __shfl_sync(~0ull, result, jb + 3);
     if (jc == 0)
-      out[(size_t)row * stride + 4096 + h * 128 + i] =
-          part[0][i] + part[1][i] + part[2][i] + part[3][i];
-    __syncthreads();
+      out[(size_t)row * stride + 4096 + h * 128 + i] = r0 + r1 + r2 + r3;
   }
 #pragma unroll
   for (int j = 0; j < 32; ++j) Sh[(j0 + j) * 128 + i] = state[j];
