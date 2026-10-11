@@ -495,10 +495,15 @@ struct GpuModel {
   std::vector<int> sms_out_ids;    // truncated top-k results [rows][k]
   std::vector<float> sms_out_vals;
   // Rollback snapshots (spec verify): S/convst per accepted depth, indexer
-  // proj rows per QSA layer. Written only when spec_snap is set.
-  float* d_Ssnap = nullptr;    // [maxbatch+1][ngdn][48*128*128]
-  float* d_csnap = nullptr;    // [maxbatch+1][ngdn][3*10240]
-  float* d_iproj_snap = nullptr;  // [nqsa][maxbatch+1][128]
+  // proj rows per QSA layer. Written only when spec_snap is set. One slot's
+  // verify chunk needs gamma+1 <= 9 rows (gamma <= 8); kVSnapRows reserves
+  // extra rows so several slots' chunks can coexist (D2 rendezvous), each
+  // slot addressing its segment via vsnap_row0_.
+  static constexpr int kVSnapRows = 24;
+  float* d_Ssnap = nullptr;    // [kVSnapRows][ngdn][48*128*128]
+  float* d_csnap = nullptr;    // [kVSnapRows][ngdn][3*10240]
+  float* d_iproj_snap = nullptr;  // [nqsa][kVSnapRows][128]
+  int vsnap_row0_ = 0;         // row base of the bound slot's snap segment
   bool spec_snap = false;         // set around spec verify chunks only
   // aggr 10-05 in-pass snapshot cut: the serve loop used to split the prompt
   // at the frontend snapshot point cc (prefill [0,cc), checkpoint, then a tiny
@@ -1017,10 +1022,11 @@ struct GpuModel {
           DALLOC(&d_mring_ckpt, 512 * 4);
           // Rollback snapshots: per-row GDN S / convst / indexer-proj state
           // captured during a spec verify chunk, indexed by accepted depth.
-          // Spec chunks are gamma+1 <= 9 rows (gamma <= 8), not maxbatch.
-          DALLOC(&d_Ssnap, (size_t)9 * ngdn * 48 * 128 * 128 * 4);
-          DALLOC(&d_csnap, (size_t)9 * ngdn * 3 * 10240 * 4);
-          DALLOC(&d_iproj_snap, (size_t)(g_cfg.layers / 4) * 9 * 128 * 4);
+          // Spec chunks are gamma+1 <= 9 rows (gamma <= 8), not maxbatch;
+          // kVSnapRows rows are allocated for the multi-slot rendezvous (D2).
+          DALLOC(&d_Ssnap, (size_t)kVSnapRows * ngdn * 48 * 128 * 128 * 4);
+          DALLOC(&d_csnap, (size_t)kVSnapRows * ngdn * 3 * 10240 * 4);
+          DALLOC(&d_iproj_snap, (size_t)(g_cfg.layers / 4) * kVSnapRows * 128 * 4);
         }
         if (!qsa_dense) {
           d_mik = d_ik + (size_t)nqsa * ik_layer_blocks * 128;
@@ -2878,7 +2884,8 @@ struct GpuModel {
       if (spec_snap) {
         int ngdn = g_cfg.layers - g_cfg.layers / 4;
         k_convst_snap<<<P, 512, 0, g_str>>>(
-            d_qkvb, convst, d_csnap + (size_t)gi * 3 * 10240, P, 10240,
+            d_qkvb, convst,
+            d_csnap + ((size_t)vsnap_row0_ * ngdn + gi) * 3 * 10240, P, 10240,
             (size_t)ngdn * 3 * 10240);
       }
       if (cut_r_)  // in-pass cut: conv state after the first r rows
@@ -2894,7 +2901,8 @@ struct GpuModel {
       if (spec_snap) {
         int ngdn = g_cfg.layers - g_cfg.layers / 4;
         k_gdn_snap<<<48, 512, 0, g_str>>>(
-            d_convb, d_g48b, d_beta48b, S, d_Ssnap + (size_t)gi * 48 * 128 * 128,
+            d_convb, d_g48b, d_beta48b, S,
+            d_Ssnap + ((size_t)vsnap_row0_ * ngdn + gi) * 48 * 128 * 128,
             P, 10240, (size_t)ngdn * 48 * 128 * 128);
       }
       KP_SUB("gdn:scan");
@@ -3617,7 +3625,8 @@ struct GpuModel {
                                                          cut_r_, base, vbptr());
       if (spec_snap)
         k_iproj_snap<<<P, 128, 0, g_str>>>(
-            d_iproj, d_iproj_snap + (size_t)qi * 9 * 128, P);
+            d_iproj, d_iproj_snap + ((size_t)qi * kVSnapRows + vsnap_row0_) * 128,
+            P);
       // Paged: the score sgemm / tiled kernel read keys [0, nb) contiguously;
       // gather them into d_ikg first (same values, same sgemm shape -> the
       // scores and selections stay bit-identical to the unpaged layout).
@@ -6060,22 +6069,23 @@ struct GpuModel {
 
   // =================== MTP speculative loop (Phase B) ========================
   // gr_bf16 shims: d_Rb rows are bf16 under QWENOX_GR_BF16, but the MTP ingest
-  // path and the decode state d_R are fp32. spec_taps stages rows 0..P-1 as
-  // fp32 in d_Rhatb (scratch outside prefill; consumed by mtp_input_b before
-  // anything else touches it).
-  const float* spec_taps(int P) {
-    if (!gr_bf16) return d_Rb;
+  // path and the decode state d_R are fp32. spec_taps stages rows
+  // row0..row0+P-1 as fp32 in d_Rhatb (scratch outside prefill; consumed by
+  // mtp_input_b before anything else touches it). row0 is the slot's row base
+  // in d_Rb for the D2 rendezvous; 0 for B=1.
+  const float* spec_taps(int P, int row0 = 0) {
+    if (!gr_bf16) return d_Rb + (size_t)row0 * 10240;
     uint64_t n = (uint64_t)P * 10240;
     k_bf16_to_f32<<<(unsigned)((n + 255) / 256), 256, 0, g_str>>>(
-        (const uint16_t*)d_Rb, d_Rhatb, n);
+        (const uint16_t*)d_Rb + (size_t)row0 * 10240, d_Rhatb, n);
     return d_Rhatb;
   }
-  void restore_dR_row(int d) {
+  void restore_dR_row(int d, int row0 = 0) {
     if (gr_bf16)
       k_bf16_to_f32<<<(10240 + 255) / 256, 256, 0, g_str>>>(
-          (const uint16_t*)d_Rb + (size_t)d * 10240, d_R, 10240);
+          (const uint16_t*)d_Rb + (size_t)(row0 + d) * 10240, d_R, 10240);
     else
-      CK(hipMemcpyAsync(d_R, d_Rb + (size_t)d * 10240, 10240 * 4,
+      CK(hipMemcpyAsync(d_R, d_Rb + (size_t)(row0 + d) * 10240, 10240 * 4,
                         hipMemcpyDeviceToDevice, g_str));
   }
   // Spec checkpoints: only the position-mod rings (PLE ring + QSA indexer raw
@@ -6763,15 +6773,16 @@ struct GpuModel {
         const size_t sL = 48 * 128 * 128;
         for (int gi = 0; gi < ngdn; gi++)
           CK(hipMemcpyAsync(d_S + (size_t)gi * sL,
-                            d_Ssnap + ((size_t)d * ngdn + gi) * sL, sL * 4,
+                            d_Ssnap + ((size_t)(vsnap_row0_ + d) * ngdn + gi) * sL, sL * 4,
                             hipMemcpyDeviceToDevice, g_str));
-        CK(hipMemcpyAsync(d_convst, d_csnap + (size_t)d * ngdn * 3 * 10240,
+        CK(hipMemcpyAsync(d_convst, d_csnap + (size_t)(vsnap_row0_ + d) * ngdn * 3 * 10240,
                           (size_t)ngdn * 3 * 10240 * 4,
                           hipMemcpyDeviceToDevice, g_str));
         if (ckpt_iraw)
           k_iraw_restore<<<g_cfg.layers / 4, 128, 0, g_str>>>(
-              d_iproj_snap, d_ckpt + (ckpt_S + ckpt_convst + ckpt_ring) / 4,
-              d_iraw, q + 1, q + d + 1, 9);
+              d_iproj_snap + (size_t)vsnap_row0_ * 128,
+              d_ckpt + (ckpt_S + ckpt_convst + ckpt_ring) / 4,
+              d_iraw, q + 1, q + d + 1, kVSnapRows);
         const float* ckring = d_ckpt + (ckpt_S + ckpt_convst) / 4;
         for (int p = q + d + 2; p <= q + g + 1; p++)
           CK(hipMemcpyAsync(d_ring + (size_t)(p % 9) * 10240,
@@ -7110,15 +7121,16 @@ struct GpuModel {
           const size_t sL = 48 * 128 * 128;
           for (int gi = 0; gi < ngdn; gi++)
             CK(hipMemcpyAsync(d_S + (size_t)gi * sL,
-                              d_Ssnap + ((size_t)d * ngdn + gi) * sL, sL * 4,
+                              d_Ssnap + ((size_t)(vsnap_row0_ + d) * ngdn + gi) * sL, sL * 4,
                               hipMemcpyDeviceToDevice, g_str));
-          CK(hipMemcpyAsync(d_convst, d_csnap + (size_t)d * ngdn * 3 * 10240,
+          CK(hipMemcpyAsync(d_convst, d_csnap + (size_t)(vsnap_row0_ + d) * ngdn * 3 * 10240,
                             (size_t)ngdn * 3 * 10240 * 4,
                             hipMemcpyDeviceToDevice, g_str));
           if (ckpt_iraw)
             k_iraw_restore<<<g_cfg.layers / 4, 128, 0, g_str>>>(
-                d_iproj_snap, d_ckpt + (ckpt_S + ckpt_convst + ckpt_ring) / 4,
-                d_iraw, q + 1, q + d + 1, 9);
+                d_iproj_snap + (size_t)vsnap_row0_ * 128,
+                d_ckpt + (ckpt_S + ckpt_convst + ckpt_ring) / 4,
+                d_iraw, q + 1, q + d + 1, kVSnapRows);
           const float* ckring = d_ckpt + (ckpt_S + ckpt_convst) / 4;
           for (int p = q + d + 2; p <= q + g + 1; p++)
             CK(hipMemcpyAsync(d_ring + (size_t)(p % 9) * 10240,
@@ -7378,15 +7390,16 @@ struct GpuModel {
         const size_t sL = 48 * 128 * 128;
         for (int gi = 0; gi < ngdn; gi++)
           CK(hipMemcpyAsync(d_S + (size_t)gi * sL,
-                            d_Ssnap + ((size_t)d * ngdn + gi) * sL, sL * 4,
+                            d_Ssnap + ((size_t)(vsnap_row0_ + d) * ngdn + gi) * sL, sL * 4,
                             hipMemcpyDeviceToDevice, g_str));
-        CK(hipMemcpyAsync(d_convst, d_csnap + (size_t)d * ngdn * 3 * 10240,
+        CK(hipMemcpyAsync(d_convst, d_csnap + (size_t)(vsnap_row0_ + d) * ngdn * 3 * 10240,
                           (size_t)ngdn * 3 * 10240 * 4,
                           hipMemcpyDeviceToDevice, g_str));
         if (ckpt_iraw)
           k_iraw_restore<<<g_cfg.layers / 4, 128, 0, g_str>>>(
-              d_iproj_snap, d_ckpt + (ckpt_S + ckpt_convst + ckpt_ring) / 4,
-              d_iraw, q + 1, q + d + 1, 9);
+              d_iproj_snap + (size_t)vsnap_row0_ * 128,
+              d_ckpt + (ckpt_S + ckpt_convst + ckpt_ring) / 4,
+              d_iraw, q + 1, q + d + 1, kVSnapRows);
         const float* ckring = d_ckpt + (ckpt_S + ckpt_convst) / 4;
         for (int p = q + d + 2; p <= q + g + 1; p++)
           CK(hipMemcpyAsync(d_ring + (size_t)(p % 9) * 10240,
@@ -7903,15 +7916,16 @@ struct GpuModel {
           const size_t sL = 48 * 128 * 128;
           for (int gi = 0; gi < ngdn; gi++)
             CK(hipMemcpyAsync(d_S + (size_t)gi * sL,
-                              d_Ssnap + ((size_t)d * ngdn + gi) * sL, sL * 4,
+                              d_Ssnap + ((size_t)(vsnap_row0_ + d) * ngdn + gi) * sL, sL * 4,
                               hipMemcpyDeviceToDevice, g_str));
-          CK(hipMemcpyAsync(d_convst, d_csnap + (size_t)d * ngdn * 3 * 10240,
+          CK(hipMemcpyAsync(d_convst, d_csnap + (size_t)(vsnap_row0_ + d) * ngdn * 3 * 10240,
                             (size_t)ngdn * 3 * 10240 * 4,
                             hipMemcpyDeviceToDevice, g_str));
           if (ckpt_iraw)
             k_iraw_restore<<<g_cfg.layers / 4, 128, 0, g_str>>>(
-                d_iproj_snap, d_ckpt + (ckpt_S + ckpt_convst + ckpt_ring) / 4,
-                d_iraw, q + 1, q + d + 1, 9);
+                d_iproj_snap + (size_t)vsnap_row0_ * 128,
+                d_ckpt + (ckpt_S + ckpt_convst + ckpt_ring) / 4,
+                d_iraw, q + 1, q + d + 1, kVSnapRows);
           const float* ckring = d_ckpt + (ckpt_S + ckpt_convst) / 4;
           for (int p = q + d + 2; p <= q + g + 1; p++)
             CK(hipMemcpyAsync(d_ring + (size_t)(p % 9) * 10240,
@@ -8350,9 +8364,11 @@ struct GpuModel {
   // Everything one sequence carries from step to step: host mirrors, GDN /
   // conv / PLE ring / indexer ring state, the page table (the KV pages live
   // in the shared pool, MTP layer included), the MTP indexer ring and
-  // position, per-slot decode graphs (they bake these
+  // position, the verify rollback checkpoints (d_ckpt / d_mring_ckpt — D2
+  // swaps slots between checkpoint save and restore), per-slot decode graphs
+  // (they bake these
   // pointers) and the request-scoped flags/stats. Weights, prefill/decode
-  // scratch, logits, verify checkpoints and the KV pool are shared: slots
+  // scratch, logits and the KV pool are shared: slots
   // time-slice the GPU and hand it over only at yield_point(), where none of
   // the shared buffers holds live data. bind(s) swaps slot s into the model
   // members, so every kernel path runs unchanged on the bound slot.
@@ -8362,14 +8378,14 @@ struct GpuModel {
   X(pos) X(ple_ringpos) X(chist) X(ngram) X(mtp_pos) X(kv_seq) X(d_ptab)      \
   X(mrope_active_) X(rope_delta_) X(mrope_pos_) X(mrope_grids_) X(d_rdelta)   \
   X(img_inj) X(img_hash_) X(d_img_emb) X(img_emb_rows) X(img_emb_cap)         \
-  X(mtp_tap_capture) X(spec_snap) X(ngram_verify_active)                      \
+  X(mtp_tap_capture) X(spec_snap) X(vsnap_row0_) X(ngram_verify_active)       \
   X(cut_abs) X(cut_r_) X(cut_hit) X(cut_mtp_hit)                              \
   X(prog_total) X(prog_base) X(prog_last_est) X(prog_req) X(prog_t0)          \
   X(prog_last) X(last_spec_rounds) X(last_spec_commit) X(last_spec_rollbacks) \
   X(last_spec_proposed) X(live_spec_rounds) X(live_spec_commits)              \
   X(live_spec_proposed) X(g1_exec) X(g2_exec)                                 \
   X(d_S) X(d_convst) X(d_ring) X(d_iraw) X(d_R) X(d_pos) X(d_ringpos)         \
-  X(d_miraw) X(d_mpos)
+  X(d_miraw) X(d_mpos) X(d_ckpt) X(d_mring_ckpt)
   struct SeqState {
 #define QWENOX_SLOT_DECL(f) decltype(GpuModel::f) f{};
     QWENOX_SLOT_FIELDS(QWENOX_SLOT_DECL)
@@ -8627,6 +8643,9 @@ struct GpuModel {
         DALLOC(&t.d_iraw, sIraw);
         CK(hipMemset(t.d_iraw, 0, sIraw));
       }
+      // Verify rollback checkpoints: write-before-read scratch, no memset
+      // (same as slot 0's d_ckpt / d_mring_ckpt in the constructor).
+      DALLOC(&t.d_ckpt, sS + sC + sRing + (ckpt_iraw ? sIraw : 0));
       t.kv_seq.init(kv_lpages, kv_pool.guard());
       DALLOC(&t.d_ptab, (size_t)kv_lpages * 4);
       CK(hipMemcpy(t.d_ptab, t.kv_seq.tab.data(), (size_t)kv_lpages * 4,
@@ -8639,6 +8658,7 @@ struct GpuModel {
           DALLOC(&t.d_miraw, 4 * 128 * 4);
           CK(hipMemset(t.d_miraw, 0, 4 * 128 * 4));
         }
+        if (d_mring_ckpt) DALLOC(&t.d_mring_ckpt, 512 * 4);
       }
       t.prog_req = -1;
       if (graphs_ok) {  // per-slot decode graphs (they bake the slot pointers)

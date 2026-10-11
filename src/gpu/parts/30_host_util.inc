@@ -77,7 +77,8 @@ static int eff_tail_slack() {
 }
 
 // 并发序列槽数（QWENOX_PARALLEL，serve 模式；1..8）。槽共享同一个 KV 页池，
-// 每多一个槽只多 GDN/卷积/环形状态、页表和 MTP KV（见 GpuModel::slots_init）。
+// 每多一个槽只多 GDN/卷积/环形状态、verify 回滚检查点、页表和 MTP KV
+// （见 GpuModel::slots_init）。
 static int eff_parallel() {
   const char* e = getenv("QWENOX_PARALLEL");
   return e ? std::max(1, std::min(8, atoi(e))) : 1;
@@ -270,19 +271,23 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
       add(9 * 10240 * 4);                              // d_ring
       add(4); add(4); add(4);                          // d_pos d_ringpos d_rdelta
       if (!qsa_dense) add(nqsa * 4 * 128 * 4);         // d_iraw
+      add(ngdn * 48 * 128 * 128 * 4 + ngdn * 3 * 10240 * 4 + 9 * 10240 * 4 +
+          (qsa_dense ? 0 : nqsa * 4 * 128 * 4));       // d_ckpt（D2 起 per-slot）
       add(kvpg * 4);                                   // d_ptab
       if (mtp_on) {
         add(4);                                        // d_mpos
         if (!qsa_dense) add(4 * 128 * 4);              // d_miraw（MTP KV/ik 在页池里）
+        add(512 * 4);                                  // d_mring_ckpt
       }
     }
   if (mtp_on) {
     add(rb * 4 * 3 + (size_t)g_cfg.d * 4 * 5 + 8);  // mR mRhat mh me meo mt mnorm_*
     add(3 * BP * 10240 * 4);                        // mRb mRhatb mtap
     add(512 * 4);                                   // mring_ckpt
-    add(9 * ngdn * 48 * 128 * 128 * 4);             // Ssnap
-    add(9 * ngdn * 3 * 10240 * 4);                  // csnap
-    add(nqsa * 9 * 128 * 4);                        // iproj_snap
+    // kVSnapRows = 24（40_model.inc，D2 会合预留多槽段；单槽只用前 9 行）
+    add(24 * ngdn * 48 * 128 * 128 * 4);            // Ssnap
+    add(24 * ngdn * 3 * 10240 * 4);                 // csnap
+    add(nqsa * 24 * 128 * 4);                       // iproj_snap
     if (!qsa_dense) {
       add(4 * 128 * 4 + 256 * 4);                   // miraw minorm
       if (index_f32) add((size_t)640 * 2560 * 4);   // miw
