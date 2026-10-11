@@ -2023,6 +2023,172 @@ static void borrow_skip(GpuModel& m) {
   borrow_abort_check();
 }
 
+// ---- D2-S2a: verify rendezvous pool (VerifyPool) ---------------------------
+// Greedy spec workers reach the rendezvous after drafting a round: they hand
+// the GPU turn over and wait; the last submitter (or a waiter whose window
+// elapsed) becomes the executor and runs ONE batched multi-segment verify
+// for the round (GpuModel::verify_segments, bit-identical to serial per the
+// S1c selftest). Judging/emit/rollback stay on each worker after it
+// re-acquires the turn, so abort/cancel semantics are unchanged.
+struct VrReq {
+  int slot;
+  const std::vector<int>* vt;  // worker stack; valid while the worker blocks
+  int base;                    // q+1
+  int* vout;                   // worker stack v.data(), room for vt->size()
+  bool done = false;
+  bool dropped = false;        // abort/guard refusal -> worker serial rerun
+};
+struct VerifyPool {
+  std::mutex mu;
+  std::condition_variable cv;
+  std::vector<VrReq*> pend;    // current round's submissions
+  int active = 0;              // workers inside greedy spec_loop (under mu)
+  bool executing = false;
+  std::chrono::steady_clock::time_point first_submit;
+  long batches = 0, solo = 0, timeouts = 0, fallbacks = 0;
+};
+static VerifyPool g_vr;
+static int g_vr_wait_ms = 50;  // QWENOX_VR_WAIT_MS
+
+// Counts one worker inside a greedy spec loop. Every exit path (eos, cancel,
+// KvOverflow unwind) must decrement, else the all-arrived trigger never
+// fires and the pool stalls to the timeout each round.
+struct VrActive {
+  VrActive() {
+    std::lock_guard<std::mutex> lk(g_vr.mu);
+    g_vr.active++;
+  }
+  ~VrActive() {
+    {
+      std::lock_guard<std::mutex> lk(g_vr.mu);
+      g_vr.active--;
+    }
+    g_vr.cv.notify_all();  // the round may now be complete without us
+  }
+};
+
+static int vseg_active() {
+  std::lock_guard<std::mutex> lk(g_vr.mu);
+  return g_vr.active;
+}
+
+// Executor half. Runs on the promoting worker's thread; acquires the GPU
+// turn (FIFO behind the peers, so their drafts finish first), runs the
+// batched verify, scatters the per-segment argmax rows into each worker's
+// vout, and wakes everyone. Call with the turn NOT held; returns with it
+// released again.
+static void vr_execute(GpuModel& m) {
+  g_turn.acquire();
+  m.bind(tl_slot);
+  std::vector<VrReq*> mine;
+  {
+    std::lock_guard<std::mutex> lk(g_vr.mu);
+    mine.swap(g_vr.pend);
+  }
+  std::vector<GpuModel::VSeg> segs;
+  std::vector<VrReq*> run;  // run[i] owns segs[i]
+  int rows = 0;
+  for (VrReq* r : mine) {
+    {
+      std::lock_guard<std::mutex> lk(g_sm);
+      if (g_slots[(size_t)r->slot].abort) { r->dropped = true; continue; }
+    }
+    const int P = (int)r->vt->size();
+    if (rows + P > (int)GpuModel::kVSnapRows) {  // hard row budget
+      r->dropped = true;
+      g_vr.fallbacks++;
+      continue;
+    }
+    rows += P;
+    segs.push_back(GpuModel::VSeg{r->slot, r->vt, r->base});
+    run.push_back(r);
+  }
+  if (!segs.empty()) {
+    std::vector<int> v((size_t)rows);
+    if (m.verify_segments(segs.data(), (int)segs.size(), v.data())) {
+      int off = 0;
+      for (size_t i = 0; i < segs.size(); i++) {
+        const int P = (int)segs[i].toks->size();
+        memcpy(run[i]->vout, v.data() + off, (size_t)P * sizeof(int));
+        off += P;
+      }
+    } else {
+      // Batched pass refused by a guard: serial per segment — today's
+      // time-sliced behavior, still inside this worker's turn.
+      g_vr.fallbacks++;
+      fprintf(stderr, "%s [vr] batched verify refused (%zu segments, %d rows);"
+                      " serial fallback\n", log_ts(), segs.size(), rows);
+      for (size_t i = 0; i < segs.size(); i++) {
+        m.bind(segs[i].slot);
+        if (!m.verify_segments(&segs[i], 1, run[i]->vout))
+          run[i]->dropped = true;  // worker re-runs prefill_batch+batch_argmax
+      }
+    }
+  }
+  static const bool vr_dbg = getenv("QWENOX_VR_DBG") != nullptr;
+  {
+    std::lock_guard<std::mutex> lk(g_vr.mu);
+    for (VrReq* r : mine) r->done = true;
+    g_vr.executing = false;
+    g_vr.batches++;
+    if (segs.size() <= 1) g_vr.solo++;
+    if (vr_dbg)
+      fprintf(stderr, "%s [vr] batch: %zu segs %d rows (batches %ld, solo %ld,"
+                      " timeouts %ld, fallbacks %ld)\n",
+              log_ts(), segs.size(), rows, g_vr.batches, g_vr.solo,
+              g_vr.timeouts, g_vr.fallbacks);
+  }
+  g_vr.cv.notify_all();
+  g_turn.release();
+}
+
+// Worker half (GpuModel::vseg_pool_fn), called from spec_loop holding the
+// GPU turn, drafts done. Returns true with vout filled, or false when the
+// pool could not run this segment (caller runs the serial verify).
+static bool vseg_pool(GpuModel& m, const GpuModel::VSeg& self, int* vout) {
+  {
+    std::lock_guard<std::mutex> lk(g_vr.mu);
+    if (g_vr.active <= 1) return false;  // sole decoder: keep the serial path
+  }
+  VrReq req{self.slot, self.toks, self.base, vout, false, false};
+  bool am_exec = false;
+  {
+    std::lock_guard<std::mutex> lk(g_vr.mu);
+    if (g_vr.pend.empty()) g_vr.first_submit = std::chrono::steady_clock::now();
+    g_vr.pend.push_back(&req);
+    if ((int)g_vr.pend.size() >= g_vr.active && !g_vr.executing)
+      am_exec = g_vr.executing = true;  // everyone is in: run the round
+  }
+  g_turn.release();  // let the peers' drafts/judging run while we wait
+  if (!am_exec) {
+    std::unique_lock<std::mutex> lk(g_vr.mu);
+    for (;;) {
+      if (req.done) break;
+      if (!g_vr.executing) {
+        // The round completed without us (a peer left its loop), or the wait
+        // window elapsed: run what we have instead of waiting forever.
+        if ((int)g_vr.pend.size() >= g_vr.active ||
+            std::chrono::steady_clock::now() - g_vr.first_submit >=
+                std::chrono::milliseconds(g_vr_wait_ms)) {
+          am_exec = g_vr.executing = true;
+          if ((int)g_vr.pend.size() < g_vr.active) g_vr.timeouts++;
+          break;
+        }
+        g_vr.cv.wait_until(lk, g_vr.first_submit +
+                                   std::chrono::milliseconds(g_vr_wait_ms));
+      } else {
+        g_vr.cv.wait(lk);
+      }
+    }
+    lk.unlock();
+  }
+  if (am_exec) vr_execute(m);
+  g_turn.acquire();
+  m.bind(tl_slot);
+  borrow_abort_check();
+  return !req.dropped;
+}
+
 // GpuModel::kv_starve_fn (pool dry after rckpt eviction), GPU owner only.
 static bool starve(GpuModel& m) {
   const int cur = tl_slot;
@@ -2689,7 +2855,10 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
               dl_tick();
               return !cancel;
             };
-            m.spec_loop(cur, g.max_tokens - 1, spec_gamma, emit);
+            {
+              VrActive vr_act;  // rendezvous membership; every exit counts
+              m.spec_loop(cur, g.max_tokens - 1, spec_gamma, emit);
+            }
           }
           spec_r += m.last_spec_rounds;
           spec_c += m.last_spec_commit;
@@ -3062,6 +3231,20 @@ static int run(GpuModel& m, const std::string& host, int port) {
     m.borrow_query_fn = &borrow_query;
     m.borrow_fn = &borrow_turn;
     m.borrow_skip_fn = &borrow_skip;
+    // D2-S2a verify rendezvous: opt out with QWENOX_NO_VR=1 (serial
+    // single-segment verify, the pre-S2 behavior). QWENOX_VR_WAIT_MS bounds
+    // how long a submitter waits for stragglers before running the round.
+    static const bool no_vr =
+        getenv("QWENOX_NO_VR") && !GpuModel::env_zero("QWENOX_NO_VR");
+    if (!no_vr) {
+      m.vseg_pool_fn = &vseg_pool;
+      m.vseg_active_fn = &vseg_active;
+    }
+    if (const char* v = getenv("QWENOX_VR_WAIT_MS")) {
+      g_vr_wait_ms = atoi(v);
+      if (g_vr_wait_ms < 1) g_vr_wait_ms = 1;
+      if (g_vr_wait_ms > 5000) g_vr_wait_ms = 5000;
+    }
   }
   rckpt::prewarm(m.kv_nl > g_cfg.layers / 4);  // pinned checkpoint pool, background
   fprintf(stderr, "serve: listening on %s:%d (maxctx %d, %d slot%s)\n", host.c_str(), port,

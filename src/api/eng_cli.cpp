@@ -19,6 +19,10 @@
 #include "engine_client.h"
 #include "tokenizer.h"
 
+#ifdef _WIN32
+#include "../gpu/os_win32.h"  // wsa_init()
+#endif
+
 using nlohmann::json;
 
 static qwenox::GenParams params_from_json(const json& q, qwenox::Tokenizer* tok) {
@@ -55,6 +59,12 @@ static qwenox::GenParams params_from_json(const json& q, qwenox::Tokenizer* tok)
 }
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    if (!wsa_init()) {
+        std::fprintf(stderr, "WSAStartup failed\n");
+        return 1;
+    }
+#endif
     bool dump_only = false;
     std::string host = "127.0.0.1:8730";
     std::string tok_dir = "models/tokenizer";

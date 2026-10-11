@@ -173,6 +173,14 @@ struct GpuModel {
   bool (*borrow_query_fn)() = nullptr;      // someone queued on the turnstile?
   void (*borrow_fn)(GpuModel&) = nullptr;   // release+reacquire under g_borrow_light
   void (*borrow_skip_fn)(GpuModel&) = nullptr;  // heavy chunk during borrow: requeue
+  // D2-S2a: verify rendezvous pool (serve mode, nslots > 1). Non-null
+  // vseg_pool_fn reroutes the greedy spec loop's eager verify into the pool;
+  // false = the pool is unavailable for this round, caller falls back to
+  // single-segment verify_segments. vseg_active_fn reports how many workers
+  // are inside greedy spec loops (gamma clamp for the shared row budget).
+  struct VSeg;
+  bool (*vseg_pool_fn)(GpuModel&, const VSeg&, int*) = nullptr;
+  int (*vseg_active_fn)() = nullptr;
   int conc_rmax_ = 32;                      // borrow round row cap (= small ws rows)
   float conc_quantum_ms_ = 300;             // min GPU-busy ms between lends
   int kv_nl = 0;                // layers in d_kc/d_vc/d_kcb/d_vcb/d_ik (+1 = MTP)
@@ -5973,6 +5981,13 @@ struct GpuModel {
     // D2-S1c: multi-segment (or non-bound slot) batched pass. vout receives
     // all R rows concatenated in segment order; row voff_s+P_s-1 is segment
     // s's next token. Guards failed -> false -> caller runs serial per segment.
+    // Pack each segment's rollback-snapshot window at its batch row offset so
+    // the post-verify restore/ingest (vsnap_row0_-relative) finds its own rows.
+    int voff = 0;
+    for (int s = 0; s < nseg; s++) {
+      slot_vsnap_row0_(segs[s].slot) = voff;
+      voff += (int)segs[s].toks->size();
+    }
     if (!prefill_chunk_vseg(segs, nseg)) return false;
     int R = 0;
     for (int s = 0; s < nseg; s++) R += (int)segs[s].toks->size();
@@ -7218,6 +7233,13 @@ struct GpuModel {
       int q = pos - 1;  // trunk processed through q
       if (d_iraw) vg_dump_buf("irT", 2, d_iraw, 512 * 4);  // P3-B bisect
       int g = std::min(gctl.cur, gen - (int)out.size());
+      // D2-S2a: cap the round so a rendezvous batch stays within the
+      // kVSnapRows verify budget (round-top snapshot; the pool executor
+      // re-checks the hard cap per segment and drops overflow).
+      if (vseg_active_fn) {
+        const int va = vseg_active_fn();
+        if (va > 1) g = std::min(g, std::max(1, (int)kVSnapRows / va - 1));
+      }
       size_t chist_sz = chist.size();
       mtp_ckpt_save();
       if (d_iraw) vg_dump_buf("irC", 2, d_iraw, 512 * 4);  // P3-B bisect
@@ -7246,13 +7268,21 @@ struct GpuModel {
       vt.push_back(cur);
       for (int j = 0; j < g; j++) vt.push_back(drafts[j]);
       spec_snap = true;  // capture per-row rollback snapshots during verify
+      // D2-S2a: the pool's batched verify repacks this slot's snap window at
+      // its segment row offset; serial paths (and slot reuse) start at row 0.
+      vsnap_row0_ = 0;
       if (!verify_graph_round_try(vt, q + 1, v.data())) {
         // D2-S1a: single-segment verify_segments (bit-identical); the env
         // opt-out and any misfit (multi-slot, oversize) keep the old path.
         static const bool no_vseg =
             getenv("QWENOX_NO_VSEG") && !env_zero("QWENOX_NO_VSEG");
         const VSeg vseg{bound_, &vt, q + 1};
-        if (no_vseg || !verify_segments(&vseg, 1, v.data())) {
+        // D2-S2a: rendezvous verify — the pool's executor already ran this
+        // segment (rollback snapshots included) when it returns true; false
+        // (dropped / pool idle) -> run the serial verify here.
+        if (vseg_pool_fn && vseg_pool_fn(*this, vseg, v.data()))
+          spec_snap = false;
+        else if (no_vseg || !verify_segments(&vseg, 1, v.data())) {
           prefill_batch(vt, q + 1, false, true);
           batch_argmax(g + 1, v.data());
         }
@@ -7351,7 +7381,9 @@ struct GpuModel {
         CK(hipMemcpyAsync(d_pos, &pos, 4, hipMemcpyHostToDevice, g_str));
         CK(hipMemcpyAsync(d_ringpos, &ple_ringpos, 4, hipMemcpyHostToDevice,
                           g_str));
-        restore_dR_row(d);
+        // vsnap_row0_ = this slot's d_Rb row base (D2-S2a rendezvous packing;
+        // 0 on the serial path).
+        restore_dR_row(d, vsnap_row0_);
         cur = v[d];
       }
       auto t4 = std::chrono::steady_clock::now();
@@ -7361,7 +7393,7 @@ struct GpuModel {
                         g_str));
       if (d > 0) {
         std::vector<int> mtoks(drafts.begin(), drafts.begin() + d);
-        mtp_ingest_b(spec_taps(d), mtoks, d, q + 1);
+        mtp_ingest_b(spec_taps(d, vsnap_row0_), mtoks, d, q + 1);
       } else {
         mtp_pos = q + 1;
         CK(hipMemcpyAsync(d_mpos, &mtp_pos, 4, hipMemcpyHostToDevice, g_str));
@@ -7642,6 +7674,7 @@ struct GpuModel {
         vt.push_back(cur);
         for (int j = 0; j < g; j++) vt.push_back(drafts[j]);
         spec_snap = true;  // capture per-row rollback snapshots during verify
+        vsnap_row0_ = 0;  // D2-S2a: serial verify always packs at row 0
         if (!verify_graph_round_try(vt, q + 1, v.data())) {
           prefill_batch(vt, q + 1, false, true);
           spec_snap = false;
@@ -7828,6 +7861,7 @@ struct GpuModel {
       vt.push_back(cur);
       for (int j = 0; j < g; j++) vt.push_back(drafts[j]);
       spec_snap = true;
+      vsnap_row0_ = 0;  // D2-S2a: serial verify always packs at row 0
       prefill_batch(vt, q + 1, true, true);
       spec_snap = false;
       bool smg_v = false;
@@ -8364,6 +8398,7 @@ struct GpuModel {
         vt.push_back(cur);
         for (int j = 0; j < g; j++) vt.push_back(drafts[j]);
         spec_snap = true;  // capture per-row rollback snapshots during verify
+        vsnap_row0_ = 0;  // D2-S2a: serial verify always packs at row 0
         prefill_batch(vt, q + 1, true, true);
         spec_snap = false;
         bool smg_v = false;
