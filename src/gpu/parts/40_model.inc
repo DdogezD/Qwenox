@@ -6154,29 +6154,42 @@ struct GpuModel {
     gemv(wview(ckpt.at(buf)), d_attn, y);
   }
 
-  // D2-S3c: mtp_qsa on an explicit (possibly unbound) slot -- the batched
-  // draft executor runs these serially per member without bind(). Identical
-  // launches to mtp_qsa with d_mpos/d_miraw/d_rdelta/kvpt() swapped for the
-  // slot's own state; d_mik/d_mkc{b,f}/d_mvc{b,f} are shared pool layer
-  // views, so they stay.
+  // D2-S3d: per-slot QSA mid-section for the batched draft executor. The
+  // q/k/v projections run batched (gemv_multi rows, P=B) before the member
+  // loop and o_proj batched after it; the q8g64 mr kernels are
+  // row-invariant, so every row is bit-identical to the serial mtp_qsa gemv.
+  // The indexer block must stay inside the per-slot section: d_iproj/d_iq/
+  // d_iscores/d_iselected are single-row scratch consumed by the same slot's
+  // flash before the next slot overwrites them. Identical launches to
+  // mtp_qsa with d_mpos/d_miraw/d_rdelta/kvpt() swapped for the slot's own
+  // state; d_mik/d_mkc{b,f}/d_mvc{b,f} are shared pool layer views, so they
+  // stay.
   template <typename KVT>
-  void mtp_qsa_attn_slot(int s, const KVT* kc, const KVT* vc) {
+  void mtp_qsa_attn_slot(int s, const float* q, float* out, const KVT* kc,
+                         const KVT* vc) {
     auto* const mp = slot_d_mpos(s);
     const auto* const pt = kv_paged ? slot_d_ptab(s) : nullptr;
     k_qsa_flash<true, false, KVT, true>
         <<<dim3(QSA_DEC_NSPLIT, 2), 128, 0, g_str>>>(
-            d_qs, kc, vc, d_attn, 1, 256, 2, 24,
+            q, kc, vc, out, 1, 256, 2, 24,
             qsa_dense ? nullptr : d_iselected, 0, mp, d_pacc, d_pml, 0, pt);
-    k_qsa_flash_combine<<<dim3(12, 2), 64, 0, g_str>>>(d_pml, d_pacc, d_attn,
+    k_qsa_flash_combine<<<dim3(12, 2), 64, 0, g_str>>>(d_pml, d_pacc, out,
                                                        12, 256, mp);
   }
-  void mtp_qsa_slot(int s, const float* x, float* y) {
+  void mtp_qsa_core_slot(int s, int r) {
     const char* pfx = "mtp.layers.0.self_attn";
     char buf[128];
     auto* const mp = slot_d_mpos(s);
     auto* const ir = slot_d_miraw(s);
     const auto* const rd = slot_d_rdelta(s);
     const auto* const pt = kv_paged ? slot_d_ptab(s) : nullptr;
+    const float* const x = d_xb + (size_t)r * 2560;
+    float* const qg = d_qgb + (size_t)r * 12288;
+    float* const kb = d_kbb + (size_t)r * 512;
+    float* const vb = d_vbb + (size_t)r * 512;
+    float* const qs = d_qsb + (size_t)r * 6144;
+    float* const gs = d_gsb + (size_t)r * 6144;
+    float* const at = d_attnb + (size_t)r * 6144;
     ensure_rope_tab(g_cfg.rope_theta, g_cfg.rotary_dim);
     if (!qsa_dense) {
       snprintf(buf, sizeof buf, "%s.indexer.index_qk_proj.weight", pfx);
@@ -6194,36 +6207,28 @@ struct GpuModel {
           d_iq, d_mik, d_iscores, index_blocks, mp, pt);
       index_select(d_iscores, index_blocks, d_iselected, 0, 1, mp);
     }
-    snprintf(buf, sizeof buf, "%s.q_proj.weight", pfx);
-    gemv(wview(ckpt.at(buf)), x, d_qg);
-    snprintf(buf, sizeof buf, "%s.k_proj.weight", pfx);
-    gemv(wview(ckpt.at(buf)), x, d_kb);
-    snprintf(buf, sizeof buf, "%s.v_proj.weight", pfx);
-    gemv(wview(ckpt.at(buf)), x, d_vb);
     snprintf(buf, sizeof buf, "%s.q_norm.weight", pfx);
     float* qnw = ensure_norm256(buf);
     snprintf(buf, sizeof buf, "%s.k_norm.weight", pfx);
     float* knw = ensure_norm256(buf);
-    k_qsa_qsplit<<<dim3(24, 1), 256, 0, g_str>>>(d_qg, qnw, d_qs, d_gs, 256,
+    k_qsa_qsplit<<<dim3(24, 1), 256, 0, g_str>>>(qg, qnw, qs, gs, 256,
                                                  g_cfg.norm_eps);
-    k_rmsnorm_zc_grouped<<<2, 256, 0, g_str>>>(d_kb, knw, d_kb, 256,
+    k_rmsnorm_zc_grouped<<<2, 256, 0, g_str>>>(kb, knw, kb, 256,
                                                g_cfg.norm_eps, 1);
-    k_rope<<<(24 * 32 + 127) / 128, 128, 0, g_str>>>(d_qs, 24, 256, 64, mp,
+    k_rope<<<(24 * 32 + 127) / 128, 128, 0, g_str>>>(qs, 24, 256, 64, mp,
                                                      g_cfg.rope_theta, rd);
-    k_rope<<<(2 * 32 + 127) / 128, 128, 0, g_str>>>(d_kb, 2, 256, 64, mp,
+    k_rope<<<(2 * 32 + 127) / 128, 128, 0, g_str>>>(kb, 2, 256, 64, mp,
                                                     g_cfg.rope_theta, rd);
     if (qsa_kv_fp32) {
-      k_store_kv<<<2, 256, 0, g_str>>>(d_kb, d_vb, d_mkcf, d_mvcf, mp, pt);
-      mtp_qsa_attn_slot(s, d_mkcf, d_mvcf);
+      k_store_kv<<<2, 256, 0, g_str>>>(kb, vb, d_mkcf, d_mvcf, mp, pt);
+      mtp_qsa_attn_slot(s, qs, at, d_mkcf, d_mvcf);
     } else {
-      k_store_kv_bf16<<<2, 256, 0, g_str>>>(d_kb, d_vb, d_mkcb, d_mvcb, mp,
+      k_store_kv_bf16<<<2, 256, 0, g_str>>>(kb, vb, d_mkcb, d_mvcb, mp,
                                             nullptr, pt);
-      mtp_qsa_attn_slot(s, d_mkcb, d_mvcb);
+      mtp_qsa_attn_slot(s, qs, at, d_mkcb, d_mvcb);
     }
-    k_sigmoid_gate<<<(24 * 256 + 255) / 256, 256, 0, g_str>>>(d_attn, d_gs,
-                                                              d_attn, 24 * 256);
-    snprintf(buf, sizeof buf, "%s.o_proj.weight", pfx);
-    gemv(wview(ckpt.at(buf)), d_attn, y);
+    k_sigmoid_gate<<<(24 * 256 + 255) / 256, 256, 0, g_str>>>(at, gs, at,
+                                                              24 * 256);
   }
 
   // MTP MoE step (mirrors moe()).
@@ -6456,6 +6461,10 @@ struct GpuModel {
     const char* wts[] = {
         "mtp.fc_embedding.weight",
         "mtp.fc_hidden.weight",
+        "mtp.layers.0.self_attn.q_proj.weight",
+        "mtp.layers.0.self_attn.k_proj.weight",
+        "mtp.layers.0.self_attn.v_proj.weight",
+        "mtp.layers.0.self_attn.o_proj.weight",
         "mtp.layers.0.attn_hyper_connection.input_mix_weight_down.weight",
         "mtp.layers.0.attn_hyper_connection.input_mix_weight_up.weight",
         "mtp.layers.0.attn_hyper_connection.block_inject_weight.weight",
@@ -6485,8 +6494,10 @@ struct GpuModel {
 
   // Run one draft round for n slots as a per-step batch. segs[i]: slot s_i
   // drafts g_i tokens from (slot_d_R(s_i), tok0_i). Step j batches the
-  // members {i : g_i > j} through the P-row buffers; QSA/MoE run serially
-  // per member on its own slot state via the slot accessors (no bind).
+  // members {i : g_i > j} through the P-row buffers; the QSA q/k/v/o
+  // projections run batched (row-invariant gemv_multi), the QSA mid-section
+  // (indexer, rope, KV store, flash, gate) and MoE run serially per member
+  // on its own slot state via the slot accessors (no bind).
   // Every kernel is per-row identical to the serial mtp_step chain, so the
   // drafts -- and therefore the accept stats -- match the serial burst bit
   // for bit. Guards run before any GPU work; a refusal (false) leaves every
@@ -6553,9 +6564,20 @@ struct GpuModel {
       }
       mtp_input_b(d_mtap, B);
       mtp_gr_read_d("mtp.layers.0.attn_hyper_connection", B);
-      for (int r = 0; r < B; r++)
-        mtp_qsa_slot(segs[cur[r]].slot, d_xb + (size_t)r * 2560,
-                     d_yb + (size_t)r * 2560);
+      {
+        const char* pfx = "mtp.layers.0.self_attn";
+        char buf[128];
+        snprintf(buf, sizeof buf, "%s.q_proj.weight", pfx);
+        gemm(wview(ckpt.at(buf)), d_xb, d_qgb, B);
+        snprintf(buf, sizeof buf, "%s.k_proj.weight", pfx);
+        gemm(wview(ckpt.at(buf)), d_xb, d_kbb, B);
+        snprintf(buf, sizeof buf, "%s.v_proj.weight", pfx);
+        gemm(wview(ckpt.at(buf)), d_xb, d_vbb, B);
+        for (int r = 0; r < B; r++)
+          mtp_qsa_core_slot(segs[cur[r]].slot, r);
+        snprintf(buf, sizeof buf, "%s.o_proj.weight", pfx);
+        gemm(wview(ckpt.at(buf)), d_attnb, d_yb, B);
+      }
       mtp_gr_write_d("mtp.layers.0.attn_hyper_connection", B);
       mtp_gr_read_d("mtp.layers.0.mlp_hyper_connection", B);
       for (int r = 0; r < B; r++)
