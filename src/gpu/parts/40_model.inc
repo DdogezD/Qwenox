@@ -3108,7 +3108,17 @@ struct GpuModel {
   template <typename KVT>
   void qsa_flash_b(const KVT* kc, const KVT* vc, int P, int dense_P, int base = 0,
                    const uint16_t* vc_transposed = nullptr,
-                   const int* ptab = nullptr, const int* dvb = nullptr) {
+                   const int* ptab = nullptr, const int* dvb = nullptr,
+                   int row0 = 0, int spec_ovr = -1) {
+    // D2-S1c: row0 shifts the batch-local row bases of the [BP] workspaces
+    // (d_qsb/d_attnb/d_iselected) so one segment of a multi-segment verify
+    // batch reads/writes only its own rows; spec_ovr >= 0 overrides the
+    // spec_snap gate (per-slot flag). row0 == 0 && spec_ovr == -1 reproduces
+    // the old single-segment behaviour exactly.
+    float* const qsb = d_qsb + (size_t)row0 * 6144;
+    float* const attnb = d_attnb + (size_t)row0 * 6144;
+    const int* const iselb = d_iselected + (size_t)row0 * 512;
+    const bool usnap = spec_ovr >= 0 ? spec_ovr != 0 : spec_snap;
     // dvb (P3-B graph capture): the kernels read base from *dvb and recompute
     // first_abs / ga / ge on device. Requires base >= 2051 (the verify graph
     // gate), so first_abs == base, nsparse == P and sel is the batch-local
@@ -3129,38 +3139,38 @@ struct GpuModel {
           if (vc_transposed) {
             if (ptab)
               k_qsa_wmma<true, true, true><<<dim3(dense_P, 2), 256, 0, g_str>>>(
-                  d_qsb, kc, vc, vc_transposed, d_attnb, dense_P, 256, 2, 24,
+                  qsb, kc, vc, vc_transposed, attnb, dense_P, 256, 2, 24,
                   nullptr, base, base, ptab, dvb);
             else
               k_qsa_wmma<true, false, true><<<dim3(dense_P, 2), 256, 0, g_str>>>(
-                  d_qsb, kc, vc, vc_transposed, d_attnb, dense_P, 256, 2, 24,
+                  qsb, kc, vc, vc_transposed, attnb, dense_P, 256, 2, 24,
                   nullptr, base, base, nullptr, dvb);
           } else {
             if (ptab)
               k_qsa_wmma<false, true, true><<<dim3(dense_P, 2), 256, 0, g_str>>>(
-                  d_qsb, kc, vc, nullptr, d_attnb, dense_P, 256, 2, 24, nullptr,
+                  qsb, kc, vc, nullptr, attnb, dense_P, 256, 2, 24, nullptr,
                   base, base, ptab, dvb);
             else
               k_qsa_wmma<false, false, true><<<dim3(dense_P, 2), 256, 0, g_str>>>(
-                  d_qsb, kc, vc, nullptr, d_attnb, dense_P, 256, 2, 24, nullptr,
+                  qsb, kc, vc, nullptr, attnb, dense_P, 256, 2, 24, nullptr,
                   base, base, nullptr, dvb);
           }
         }
       }
       if (!dense_launched)
         k_qsa_flash<false, false, KVT><<<dim3((dense_P + 15) / 16, 24), 128, 0, g_str>>>(
-            d_qsb, kc, vc, d_attnb, dense_P, 256, 2, 24, nullptr, 0, nullptr, nullptr,
+            qsb, kc, vc, attnb, dense_P, 256, 2, 24, nullptr, 0, nullptr, nullptr,
             nullptr, base, ptab, dvb);
     }
     int first_abs = std::max(base, 2051), nsparse = base + P - first_abs;
     if (dvb) nsparse = P;  // gate: base >= 2051 -> first_abs == base
     if (!qsa_dense && nsparse > 0) {
       // d_iselected rows are batch-local (row = abs - base; A1b)
-      const int* sel = dvb ? d_iselected
-                           : d_iselected + (size_t)(first_abs - base) * 512;
+      const int* sel = dvb ? iselb
+                           : iselb + (size_t)(first_abs - base) * 512;
       if (qsa_global_v)
         k_qsa_flash<true, false, KVT><<<dim3(nsparse, 2), 128, 0, g_str>>>(
-            d_qsb, kc, vc, d_attnb, P, 256, 2, 24, sel, first_abs, nullptr, nullptr,
+            qsb, kc, vc, attnb, P, 256, 2, 24, sel, first_abs, nullptr, nullptr,
             nullptr, base, ptab, dvb);
       else if constexpr (sizeof(KVT) == 2) {
         // spec verify (spec_snap): force the per-token kernel. Union group
@@ -3168,7 +3178,7 @@ struct GpuModel {
         // same row lands in a group at P=4 but on a ragged edge at P=3 —
         // and the union kernel is NOT bit-identical to the per-token one
         // (key order). Row invariance across gamma requires one kernel.
-        if (qsa_union && vc_transposed && !spec_snap) {
+        if (qsa_union && vc_transposed && !usnap) {
           // 并集路径：[ga, ge) 内的 4 对齐完整组走 merge + k_qsa_wmma_u，
           // 两侧 ragged 边缘回退逐 token 的 k_qsa_wmma<true>
           const int ga = (first_abs + 3) & ~3;
@@ -3181,15 +3191,15 @@ struct GpuModel {
           }
           if (ngroups > 0) {
             k_qsa_union_merge<<<ngroups, 128, 0, g_str>>>(
-                d_iselected, ga, d_ublk, d_umask, d_ucount, QSA_UCAP, base, P,
+                iselb, ga, d_ublk, d_umask, d_ucount, QSA_UCAP, base, P,
                 dvb);
             if (ptab)
               k_qsa_wmma_u<true><<<dim3(ngroups, 2), 256, 0, g_str>>>(
-                  d_qsb, kc, vc_transposed, d_attnb, 256, 2, 24, d_ublk, d_umask,
+                  qsb, kc, vc_transposed, attnb, 256, 2, 24, d_ublk, d_umask,
                   d_ucount, QSA_UCAP, ga, base, ptab, P, dvb);
             else
               k_qsa_wmma_u<<<dim3(ngroups, 2), 256, 0, g_str>>>(
-                  d_qsb, kc, vc_transposed, d_attnb, 256, 2, 24, d_ublk, d_umask,
+                  qsb, kc, vc_transposed, attnb, 256, 2, 24, d_ublk, d_umask,
                   d_ucount, QSA_UCAP, ga, base, nullptr, P, dvb);
           }
           // ragged edges: per-token kernel (selected rows relative to its
@@ -3198,10 +3208,10 @@ struct GpuModel {
             const int* es = sel + (size_t)(f - first_abs) * 512;
             if (ptab)
               k_qsa_wmma<true, true><<<dim3(n, 2), 256, 0, g_str>>>(
-                  d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, es, f, base, ptab);
+                  qsb, kc, vc, vc_transposed, attnb, P, 256, 2, 24, es, f, base, ptab);
             else
               k_qsa_wmma<true><<<dim3(n, 2), 256, 0, g_str>>>(
-                  d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, es, f, base);
+                  qsb, kc, vc, vc_transposed, attnb, P, 256, 2, 24, es, f, base);
           };
           if (dvb) {
             // baked 3-token grids for both edges; kernels mask by *dvb
@@ -3209,12 +3219,12 @@ struct GpuModel {
             for (int ek = 2; ek >= 1; ek--) {
               if (ptab)
                 k_qsa_wmma<true, true><<<dim3(3, 2), 256, 0, g_str>>>(
-                    d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24,
-                    d_iselected, 0, 0, ptab, dvb, ek);
+                    qsb, kc, vc, vc_transposed, attnb, P, 256, 2, 24,
+                    iselb, 0, 0, ptab, dvb, ek);
               else
                 k_qsa_wmma<true><<<dim3(3, 2), 256, 0, g_str>>>(
-                    d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24,
-                    d_iselected, 0, 0, nullptr, dvb, ek);
+                    qsb, kc, vc, vc_transposed, attnb, P, 256, 2, 24,
+                    iselb, 0, 0, nullptr, dvb, ek);
             }
           } else {
             if (ga > first_abs) edge(first_abs, std::min(ga, base + P) - first_abs);
@@ -3223,35 +3233,35 @@ struct GpuModel {
         }
         else if (qsa_wmma6 && vc_transposed)
           k_qsa_wmma6<<<dim3(nsparse, 2), 128, 0, g_str>>>(
-              d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, sel,
+              qsb, kc, vc, vc_transposed, attnb, P, 256, 2, 24, sel,
               first_abs, base);
         else if (qsa_wmma_btv && vc_transposed) {
           if (ptab)  // A1c paged instantiation (never taken unpaged)
             k_qsa_wmma<true, true><<<dim3(nsparse, 2), 256, 0, g_str>>>(
-                d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, sel, first_abs,
+                qsb, kc, vc, vc_transposed, attnb, P, 256, 2, 24, sel, first_abs,
                 base, ptab, dvb);
           else
             k_qsa_wmma<true><<<dim3(nsparse, 2), 256, 0, g_str>>>(
-                d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, sel, first_abs,
+                qsb, kc, vc, vc_transposed, attnb, P, 256, 2, 24, sel, first_abs,
                 base, nullptr, dvb);
         } else if (qsa_wmma) {
           // QWENOX_QSA_WMMA=1: WMMA bf16 sparse flash (256 thr), see k_qsa_wmma.
           if (ptab)
             k_qsa_wmma<false, true><<<dim3(nsparse, 2), 256, 0, g_str>>>(
-                d_qsb, kc, vc, nullptr, d_attnb, P, 256, 2, 24, sel, first_abs, base,
+                qsb, kc, vc, nullptr, attnb, P, 256, 2, 24, sel, first_abs, base,
                 ptab, dvb);
           else
             k_qsa_wmma<false><<<dim3(nsparse, 2), 256, 0, g_str>>>(
-                d_qsb, kc, vc, nullptr, d_attnb, P, 256, 2, 24, sel, first_abs, base,
+                qsb, kc, vc, nullptr, attnb, P, 256, 2, 24, sel, first_abs, base,
                 nullptr, dvb);
         } else
           // BF16 KV mode (!qsa_kv_fp32): bf16 LDS tiles + fdot2 (-61% at 32K).
           k_qsa_flash_bf16<KVT><<<dim3(nsparse, 2), 128, 0, g_str>>>(
-              d_qsb, kc, vc, d_attnb, P, 256, 2, 24, sel, first_abs, base, dvb);
+              qsb, kc, vc, attnb, P, 256, 2, 24, sel, first_abs, base, dvb);
       }
       else
         k_qsa_flash<true, true, KVT><<<dim3(nsparse, 2), 128, 0, g_str>>>(
-            d_qsb, kc, vc, d_attnb, P, 256, 2, 24, sel, first_abs, nullptr, nullptr,
+            qsb, kc, vc, attnb, P, 256, 2, 24, sel, first_abs, nullptr, nullptr,
             nullptr, base, ptab, dvb);
     }
   }
@@ -3274,17 +3284,23 @@ struct GpuModel {
   // per_page (A2: rows beyond the live mapping have no backing page).
   template <typename F>
   void kv_runs(int r0, int r1, int per_page, F&& fn) const {
+    kv_runs_seq(kv_seq, r0, r1, per_page, fn);
+  }
+  // D2-S1c: sequence-explicit variants; the member wrappers above delegate
+  // with (kv_seq, d_ptab), so the bound-slot path is byte-identical.
+  template <typename F>
+  void kv_runs_seq(const KvSeqTable& seq, int r0, int r1, int per_page, F&& fn) const {
     if (r1 <= r0) return;
     if (!kv_paged) {
       fn(r0, (size_t)r0, r1 - r0);
       return;
     }
-    if ((size_t)r1 > (size_t)kv_seq.mapped * per_page) {
+    if ((size_t)r1 > (size_t)seq.mapped * per_page) {
       fprintf(stderr, "[kvpage] FATAL: kv_runs [%d, %d) x%d beyond the %d mapped pages\n",
-              r0, r1, per_page, kv_seq.mapped);
+              r0, r1, per_page, seq.mapped);
       abort();
     }
-    const std::vector<int>& h_ptab = kv_seq.tab;
+    const std::vector<int>& h_ptab = seq.tab;
     for (int t = r0; t < r1;) {
       const int lp = t / per_page, pp = h_ptab[lp];
       int q = lp + 1;
@@ -3306,45 +3322,53 @@ struct GpuModel {
     return (kv_evict_fn && kv_evict_fn(*this)) || (kv_starve_fn && kv_starve_fn(*this));
   }
   [[noreturn]] void kv_fatal(const char* what, int end) {
+    kv_fatal_seq(what, end, kv_seq.mapped);
+  }
+  [[noreturn]] void kv_fatal_seq(const char* what, int end, int mapped) {
     fprintf(stderr,
             "[kvpage] FATAL: %s (%d tokens; pool %d pages, %d free, table %d "
             "pages, mapped %d)\n",
-            what, end, kv_pool_pages, kv_pool.nfree(), kv_lpages, kv_seq.mapped);
+            what, end, kv_pool_pages, kv_pool.nfree(), kv_lpages, mapped);
     exit(1);
   }
-  void kv_reserve(int end) {
-    if (!kv_paged || end <= kv_seq.rows()) return;
-    if ((end + KV_PAGE - 1) / KV_PAGE > kv_lpages) kv_fatal("beyond maxctx", end);
-    const int m0 = kv_seq.mapped;
+  void kv_reserve(int end) { kv_reserve_seq(kv_seq, d_ptab, end); }
+  void kv_reserve_seq(KvSeqTable& seq, int* ptab, int end) {
+    if (!kv_paged || end <= seq.rows()) return;
+    if ((end + KV_PAGE - 1) / KV_PAGE > kv_lpages)
+      kv_fatal_seq("beyond maxctx", end, seq.mapped);
+    const int m0 = seq.mapped;
     // pool dry: evict pinned checkpoints (LRU first) until the rows fit
-    while (!kv_seq.reserve(kv_pool, end))
-      if (!kv_evict_one()) kv_fatal("pool exhausted", end);
-    CK(hipMemcpy(d_ptab + m0, kv_seq.tab.data() + m0,
-                 (size_t)(kv_seq.mapped - m0) * 4, hipMemcpyHostToDevice));
+    while (!seq.reserve(kv_pool, end))
+      if (!kv_evict_one()) kv_fatal_seq("pool exhausted", end, seq.mapped);
+    CK(hipMemcpy(ptab + m0, seq.tab.data() + m0,
+                 (size_t)(seq.mapped - m0) * 4, hipMemcpyHostToDevice));
     if (kv_zero_dbg)  // debug: fresh pages read as zeros, like a zeroed unpaged cache
-      for (int lp = m0; lp < kv_seq.mapped; lp++)
-        kv_page_regions_k(kv_seq.tab[(size_t)lp], [&](void* q, size_t n, char c) {
+      for (int lp = m0; lp < seq.mapped; lp++)
+        kv_page_regions_k(seq.tab[(size_t)lp], [&](void* q, size_t n, char c) {
           if (kv_zero_has(c)) CK(hipMemset(q, 0, n));
         });
     if (kv_mode == 2 && m0 == 0)
       fprintf(stderr, "[kvpage] seq map: logical 0 -> phys %d (free %d/%d)\n",
-              kv_seq.tab[0], kv_pool.nfree(), kv_pool_pages);
+              seq.tab[0], kv_pool.nfree(), kv_pool_pages);
   }
   // A3: rows [start, end) are about to be written. Pages there that a pinned
   // checkpoint shares are copied first (in practice only the partial page
   // holding `start`), then the tail is mapped. Cheap host check otherwise.
-  void kv_prepare(int start, int end) {
+  void kv_prepare(int start, int end) { kv_prepare_seq(kv_seq, d_ptab, start, end); }
+  void kv_prepare_seq(KvSeqTable& seq, int* ptab, int start, int end) {
     if (!kv_paged) return;
-    const int lp1 = std::min(kv_seq.mapped, (end + KV_PAGE - 1) / KV_PAGE);
+    const int lp1 = std::min(seq.mapped, (end + KV_PAGE - 1) / KV_PAGE);
     for (int lp = std::max(0, start) / KV_PAGE; lp < lp1; lp++)
-      if (kv_pool.ref[(size_t)kv_seq.tab[(size_t)lp]] > 1) kv_cow(lp);
-    kv_reserve(end);
+      if (kv_pool.ref[(size_t)seq.tab[(size_t)lp]] > 1) kv_cow_seq(seq, ptab, lp);
+    kv_reserve_seq(seq, ptab, end);
   }
-  void kv_cow(int lp) {
-    const int old = kv_seq.tab[(size_t)lp];
+  void kv_cow(int lp) { kv_cow_seq(kv_seq, d_ptab, lp); }
+  void kv_cow_seq(KvSeqTable& seq, int* ptab, int lp) {
+    const int old = seq.tab[(size_t)lp];
     int p;
     while ((p = kv_pool.alloc()) < 0) {
-      if (!kv_evict_one()) kv_fatal("pool exhausted (copy-on-write)", lp * KV_PAGE);
+      if (!kv_evict_one())
+        kv_fatal_seq("pool exhausted (copy-on-write)", lp * KV_PAGE, seq.mapped);
       if (kv_pool.ref[(size_t)old] == 1) return;  // the other holder was evicted
     }
     CK(hipDeviceSynchronize());  // no in-flight kernel may still write `old`
@@ -3353,8 +3377,8 @@ struct GpuModel {
     kv_page_regions(p, [&](void* q, size_t n) { dst.emplace_back(q, n); });
     for (size_t i = 0; i < src.size(); i++)
       CK(hipMemcpy(dst[i].first, src[i].first, src[i].second, hipMemcpyDeviceToDevice));
-    kv_seq.replace(kv_pool, lp, p);
-    CK(hipMemcpy(d_ptab + lp, &p, 4, hipMemcpyHostToDevice));
+    seq.replace(kv_pool, lp, p);
+    CK(hipMemcpy(ptab + lp, &p, 4, hipMemcpyHostToDevice));
     kv_cow_count++;
     if (kv_mode == 2)
       fprintf(stderr, "[kvpage] cow logical %d: phys %d -> %d (free %d/%d)\n", lp,
@@ -4129,9 +4153,12 @@ struct GpuModel {
     else
       k_router_topk<<<P, 512, 0, g_str>>>(d_routerb, d_topidsb, d_topwb, g_cfg.experts, k);
   }
-  bool moe_b(int l, int P, bool try_hcw = false) {
+  bool moe_b(int l, int P, bool try_hcw = false, bool vseg = false) {
     char buf[128];
-    const bool direct_output = pp_moe_out && P > 8;
+    // D2-S1c: vseg = one segment of a multi-segment verify batch. Force the
+    // per-row naive path so the batched rows stay bit-identical to each
+    // segment's serial P<=8 run (the direct_output/q4w gates are P-dependent).
+    const bool direct_output = pp_moe_out && P > 8 && !vseg;
     float* const acc = direct_output ? d_yb : d_moeaccb;
     snprintf(buf, sizeof buf, "layers.%d.mlp.gate.weight", l);
     gemm(wview(ckpt.at(buf)), d_xb, d_routerb, P);
@@ -4200,7 +4227,7 @@ struct GpuModel {
     // the routed experts reuse it), so its add folds into the routed reduce.
     // QWENOX_MOE_SG_FUSE=0: old order + k_axpy_sg.
     static const bool sg_fuse = !env_zero("QWENOX_MOE_SG_FUSE");
-    if (!moe_naive && P > moe_naive_max && sg_fuse && moe_q4w_ok(gu, dn, P)) {
+    if (!vseg && !moe_naive && P > moe_naive_max && sg_fuse && moe_q4w_ok(gu, dn, P)) {
       KP("moe:shared");
       moe_b_shared_ey(l, P);
       moe_q4w_run(gu, dn, d_xb, d_topidsb, d_topwb, acc, P, d_eyb, d_sgb,
@@ -4211,7 +4238,7 @@ struct GpuModel {
                           g_str));
       return false;
     }
-    if (!moe_naive && P > moe_naive_max &&
+    if (!vseg && !moe_naive && P > moe_naive_max &&
         moe_q4w_run(gu, dn, d_xb, d_topidsb, d_topwb, acc, P)) {
       KP("moe:shared");
       moe_b_shared(l, P, acc, direct_output);
@@ -4221,7 +4248,7 @@ struct GpuModel {
     bool fused_ok = g_cfg.moe_mid % MOE_CT == 0 && g_cfg.d % MOE_CT == 0 &&
                     g_cfg.d % FD_CT_DN == 0 &&
                     gu.cols % MOE_KC == 0 && dn.cols % MOE_KC == 0;
-    bool naive_path = moe_naive || !fused_ok || P <= moe_naive_max;
+    bool naive_path = vseg || moe_naive || !fused_ok || P <= moe_naive_max;
     bool direct_down = naive_path && moe_down_topk && k == 10 && dn.cols == 640;
     // Direct-down and deterministic reductions overwrite every output element.
     // Atomic/ordered accumulation still requires a zero destination.
@@ -5067,6 +5094,12 @@ struct GpuModel {
 #endif
     for (int h = 0; h < 16; h++) memcpy(dst + h * g_ple_rb, addrs[h], g_ple_rb);
   }
+  // pre0/pre1 = the two tokens preceding the window (pad_id at stream start).
+  // D2-S1c: takes the history explicitly so a non-bound slot's chist works.
+  void ple_pre01(const std::vector<int64_t>& ch, int64_t& pre0, int64_t& pre1) const {
+    pre0 = ch.empty() ? pad_id : ch.back();
+    pre1 = ch.size() < 2 ? pad_id : ch[ch.size() - 2];
+  }
   // Spawn the disk gather for toks (global position base) into staging fp8.
   // Same three pipelines as the old inline gather (IOCP/io_uring, madvise
   // two-phase, NOSORT per-token); the flight owns all worker-visible state so
@@ -5403,8 +5436,8 @@ struct GpuModel {
           ple_join();
           ple_fl.valid = false;
         }
-        const int64_t pre0 = chist.empty() ? pad_id : chist.back();
-        const int64_t pre1 = chist.size() < 2 ? pad_id : chist[chist.size() - 2];
+        int64_t pre0, pre1;
+        ple_pre01(chist, pre0, pre1);
         ple_spawn(std::vector<int>(tokens), base, pre0, pre1,
                   (uint8_t*)(ple_par ? ple_eb2 : ple_eb), ple_par);
       }
@@ -5479,8 +5512,8 @@ struct GpuModel {
     // QWENOX_PLE_NOPREFETCH disables for A/B.
     static const bool ple_noprefetch = getenv("QWENOX_PLE_NOPREFETCH") != nullptr;
     if (ple_on && nxt && !nxt->empty() && !ple_fl.valid && !ple_noprefetch) {
-      const int64_t pre0 = chist.empty() ? pad_id : chist.back();
-      const int64_t pre1 = chist.size() < 2 ? pad_id : chist[chist.size() - 2];
+      int64_t pre0, pre1;
+      ple_pre01(chist, pre0, pre1);
       ple_spawn(std::vector<int>(*nxt), base + P, pre0, pre1,
                 (uint8_t*)(ple_par ? ple_eb2 : ple_eb), ple_par);
     }
@@ -8420,8 +8453,8 @@ struct GpuModel {
         ple_join();
         ple_fl.valid = false;
       }
-      const int64_t pre0 = chist.empty() ? pad_id : chist.back();
-      const int64_t pre1 = chist.size() < 2 ? pad_id : chist[chist.size() - 2];
+      int64_t pre0, pre1;
+      ple_pre01(chist, pre0, pre1);
       // fixed staging buffer 0: seg 0's dequant reads ple_eb_dev
       ple_spawn(std::vector<int>(tokens), base, pre0, pre1, (uint8_t*)ple_eb, 0);
       for (int t : tokens) chist.push_back(t);
@@ -8588,6 +8621,19 @@ struct GpuModel {
     ropecs_base_ = -1;   // rope cos/sin table belongs to the previous slot
     xf16_src = nullptr;  // so does the bf16 conversion cache
   }
+
+  // D2-S1c: per-slot state accessors for multi-segment verify. The bound
+  // slot's state lives in the members (bind() swaps it in), every other
+  // slot's in slots_[s]. slot_f(bound_) reads the member, so code written
+  // against these accessors behaves exactly like the member path whenever
+  // the segment's slot is the bound one.
+#define QWENOX_SLOT_ACC(f)                                                     \
+  auto& slot_##f(int s) { return s == bound_ ? f : slots_[(size_t)s].f; }      \
+  const auto& slot_##f(int s) const {                                         \
+    return s == bound_ ? f : slots_[(size_t)s].f;                              \
+  }
+  QWENOX_SLOT_FIELDS(QWENOX_SLOT_ACC)
+#undef QWENOX_SLOT_ACC
 
   // ---- D1b borrow workspace ----------------------------------------------
   // Second, small copy of every maxbatch_cap-sized row buffer a borrower can
