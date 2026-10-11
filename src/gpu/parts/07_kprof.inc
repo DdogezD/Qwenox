@@ -41,10 +41,12 @@ struct KProfRing {
     n++;
   }
   // 每 chunk 一次（此刻主流已被 argmax D2H 排空；非 final chunk 则在此同步）。
-  // quiet（spec verify 的小 chunk）只重置不打印，避免 decode 阶段刷屏。
+  // quiet（spec verify 的小 chunk）只重置不打印，避免 decode 阶段刷屏；
+  // QWENOX_KPROF_V=1 时 quiet 也打印（S3b：verify 路径逐算子分解用）。
   void flush(int base, int P, bool quiet) {
     if (!ready || n == 0) return;
-    if (quiet) {
+    static const bool kpv = getenv("QWENOX_KPROF_V") != nullptr;
+    if (quiet && !kpv) {
       n = 0;
       overflow = false;
       return;

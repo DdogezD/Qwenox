@@ -1276,9 +1276,9 @@ int main() {
   }
 
   // ---- 1h. gemv_multi 全 P 行不变性（D2-S1b）--------------------------------
-  // 性质：同一 x 行内容，在批 P=1..24 的任意行位 / 分块下，y 行必须逐位
-  // 相同。参考 = 每行单独跑 P=1；P=2..24 全量逐位比对（P>8 走 le8 的 8 行
-  // 分块，顺带锁定分块路径）。覆盖生产 v2 的 ht 全形状族（ks 分裂 / tpc
+  // 性质：同一 x 行内容，在批 P=1..48 的任意行位 / 分块下，y 行必须逐位
+  // 相同。参考 = 每行单独跑 P=1；P=2..48 全量逐位比对（P>8 走 le8 的 8 行
+  // 分块，顺带锁定分块路径；S3b 把 PMAX 锁到 gemvmr_maxp 上限 48）。覆盖生产 v2 的 ht 全形状族（ks 分裂 / tpc
   // 分级）与 q6g64 的 LPR=8 / LPR=32 / split-K 门控（C>=4096 && R<=2048）
   // 分支；q4cp / q8g32 / bf16-rowfast 抽查分块路径。
   {
@@ -1291,7 +1291,7 @@ int main() {
       TCK(hipMemset(g_ht_cnt, 0, 4096 * 4));
     }
     if (!g_q6g_part) TCK(hipMalloc(&g_q6g_part, (size_t)16 * 8 * 2048 * 4));
-    constexpr int PMAX = 24;
+    constexpr int PMAX = 48;  // S3b: 锁到 gemvmr_maxp 上限（6 个 8 行块组合）
     // runP(P, r0, dy)：x 第 r0 行起的 P 行过 gemv_multi_q4cp（ys = N）。
     auto audit_full = [&](const char* name, uint64_t N, auto runP, float* dy) {
       std::vector<float> yref((size_t)PMAX * N);
