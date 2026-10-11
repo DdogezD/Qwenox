@@ -2053,8 +2053,10 @@ static int g_vr_wait_ms = 50;  // QWENOX_VR_WAIT_MS
 
 // Membership counting. Every exit path (eos, cancel, KvOverflow unwind) must
 // decrement, else the all-arrived trigger never fires and the pool stalls to
-// the timeout each round. S2a counts a whole greedy spec_loop call (VrActive
-// at the call site); S2b counts one chain MTP round (callbacks, model side).
+// the timeout each round. Both spec_loop (VrActive) and spec_loop_chain
+// (VrLoop, via the callbacks) count the WHOLE decode loop — the round body
+// runs only while holding the GPU turn, so any finer scope never sees a
+// peer. Chain ngram rounds excuse themselves per round (they never submit).
 static void vseg_round_enter() {
   std::lock_guard<std::mutex> lk(g_vr.mu);
   g_vr.active++;
@@ -3257,8 +3259,8 @@ static int run(GpuModel& m, const std::string& host, int port) {
     if (!no_vr) {
       m.vseg_pool_fn = &vseg_pool;
       m.vseg_active_fn = &vseg_active;
-      // D2-S2b: chain MTP rounds join the pool per round (ngram rounds never
-      // count and never submit — they would stall the all-arrived trigger).
+      // D2-S2b/c: chain loops join the pool per loop (ngram rounds excuse
+      // themselves — they never submit and would stall the trigger).
       m.vseg_round_enter_fn = &vseg_round_enter;
       m.vseg_round_exit_fn = &vseg_round_exit;
     }

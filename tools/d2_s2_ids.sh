@@ -8,8 +8,8 @@
 #     c4    4 并发同 prompt，四客户端 ids md5 均须 ≡ base
 #   mix   2×drafter4 + 2×drafter3 并发（drafter=3=ngram 轮，永不入会合）：
 #         各客户端 ≡ 自己 drafter 的基线（base_d3 单跑基线）
-# 硬门槛：drafter=1 相位引擎日志须出现多段 [vr] batch（防假 PASS）；
-# chain 相位多段数为软指标（ngram 表命中率决定 MTP 轮占比）。
+# 硬门槛：drafter=1 与 drafter=4 的并发相位均须新增多段 [vr] batch
+# （防假 PASS；chain 相位若退回 solo/串行说明会合接入失效）。
 # 可选：D2_GAMMA=N 强制 γ=N（active=4 时触发 24 行预算 clamp/丢弃路径）。
 #       注意 γ≤7：γ=8 输出偏离 γ≤7 基线（同配置 NO_VR 单跑亦偏离），属既有
 #       引擎行为、与会合无关，超出本测试范围，故 γ>7 直接拒绝。
@@ -99,8 +99,13 @@ check() {  # $1=标签 $2=期望 md5
   fi
 }
 
+multi_batches() {  # 引擎日志里多段 [vr] batch 的累计行数
+  grep -a '\[vr\] batch' "$ELOG" 2>/dev/null | grep -avc 'batch: 1 segs' || true
+}
+
 for dr in ${D2_DRAFTERS:-1 4}; do
   echo "-- drafter=$dr"
+  nm0=$(multi_batches)
   run_client "base_d$dr" "$dr" || { echo "FAIL: base_d$dr rc=$?"; tail -3 "logs/d2s2_base_d$dr.err"; exit 1; }
   b=$(ids_md5 "base_d$dr")
   [[ -n "$b" ]] || { echo "FAIL: base_d$dr 无 ids"; cat "logs/d2s2_base_d$dr.json"; exit 1; }
@@ -111,6 +116,15 @@ for dr in ${D2_DRAFTERS:-1 4}; do
     for p in "${pids[@]}"; do wait "$p"; done
     for ((i = 0; i < conc; i++)); do check "d${dr}c${conc}_$i" "$b"; done
   done
+  # 硬门槛（drafter 1 与 4 都适用）：本 drafter 的并发相位须形成新的多段
+  # batch——chain 若退回 solo/串行说明会合接入失效（S2c 修复前即为 0）。
+  if [[ "${D2_NOVR:-0}" != 1 && "$dr" != 3 ]]; then
+    nm1=$(multi_batches)
+    echo "  .. drafter=$dr 相位新增多段 batch: $((nm1 - nm0))"
+    if [[ $((nm1 - nm0)) -eq 0 ]]; then
+      echo "FAIL: drafter=$dr 并发相位未形成多段 batch（会合未生效？）"; ok=0
+    fi
+  fi
 done
 
 # 混合相位：2×chain(drafter=4) + 2×ngram(drafter=3) 并发。ngram 客户端永不
@@ -131,13 +145,10 @@ if [[ " ${D2_DRAFTERS:-1 4} " == *" 4 "* ]]; then
 fi
 
 nb=$(grep -c '\[vr\] batch' "$ELOG" 2>/dev/null || true)
-nm=$(grep -a '\[vr\] batch' "$ELOG" 2>/dev/null | grep -avc 'batch: 1 segs' || true)
-mtr=$(grep -a 'rounds=' "$ELOG" 2>/dev/null | grep -a 'ngram=' | tail -20 || true)
+nm=$(multi_batches)
 echo "  .. [vr] batch 行: $nb（其中多段: $nm）"
-if [[ "${D2_NOVR:-0}" = 1 ]]; then
-  if [[ "$nb" -ne 0 ]]; then echo "FAIL: NO_VR=1 下不应出现 [vr] batch"; ok=0; fi
-elif [[ " ${D2_DRAFTERS:-1 4} " == *" 1 "* && "$nm" -eq 0 ]]; then
-  echo "FAIL: 会合从未形成多段 batch（vseg_pool 未生效？）"; ok=0
+if [[ "${D2_NOVR:-0}" = 1 && "$nb" -ne 0 ]]; then
+  echo "FAIL: NO_VR=1 下不应出现 [vr] batch"; ok=0
 fi
 echo "S2 IDS ACCEPT: $([ $ok = 1 ] && echo PASS || echo FAIL)"
 [[ $ok = 1 ]]

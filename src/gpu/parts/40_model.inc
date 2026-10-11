@@ -181,9 +181,9 @@ struct GpuModel {
   struct VSeg;
   bool (*vseg_pool_fn)(GpuModel&, const VSeg&, int*) = nullptr;
   int (*vseg_active_fn)() = nullptr;
-  // D2-S2b: chain-mode MTP rounds join/leave the rendezvous per round via
-  // these (ngram rounds never count — they never submit, so counting them
-  // would stall the all-arrived trigger until every timeout).
+  // D2-S2b/c: chain mode joins/leaves the rendezvous membership via these
+  // (loop-scope count; ngram rounds excuse themselves per round — they never
+  // submit, so counting them would stall the all-arrived trigger).
   void (*vseg_round_enter_fn)() = nullptr;
   void (*vseg_round_exit_fn)() = nullptr;
   void vseg_round_enter() { if (vseg_round_enter_fn) vseg_round_enter_fn(); }
@@ -7457,6 +7457,8 @@ struct GpuModel {
     int depth_hits[8] = {0}, depth_tot[8] = {0};
     int accepted = 0, ng_rounds = 0, mtp_rounds = 0, ng_roll = 0, mtp_roll = 0;
     double verify_ms = 0, replay_ms = 0;
+    // D2-S2c 瓶颈分析：MTP 轮三段耗时（verify 段含会合等待）。
+    double mtp_draft_ms = 0, mtp_vrfy_ms = 0, mtp_commit_ms = 0;
     // ngram verify chunking: QWENOX_NGRAM_CHUNK=0 keeps the legacy single-pass
     // 65-row verify; N pins the chunk size; unset adapts within [8,64]
     // (init 16), doubling after fully-accepted rounds, halving after rejects.
@@ -7474,6 +7476,22 @@ struct GpuModel {
       if (!ple_on) chist.insert(chist.end(), tokens.begin(), tokens.end());
     };
     auto T0 = std::chrono::steady_clock::now();
+    // D2-S2c: count this worker for the WHOLE chain loop (same shape as
+    // spec_loop's VrActive). Per-MTP-round counting was dead: the round body
+    // runs only while holding the GPU turn, so the count never exceeded 1 and
+    // chain rounds never joined the rendezvous. ngram rounds excuse
+    // themselves per round (VrExcuse) — they never submit, so counting them
+    // would stall the all-arrived trigger until every timeout.
+    struct VrLoop {
+      GpuModel& m;
+      VrLoop(GpuModel& m) : m(m) { m.vseg_round_enter(); }
+      ~VrLoop() { m.vseg_round_exit(); }
+    } vr_loop(*this);
+    struct VrExcuse {
+      GpuModel& m;
+      VrExcuse(GpuModel& m) : m(m) { m.vseg_round_exit(); }
+      ~VrExcuse() { m.vseg_round_enter(); }
+    };
     while ((int)out.size() < gen && pos < maxctx) {
       yield_point();  // round top: only persistent slot state is live
       if (chist.size() != (size_t)pos)
@@ -7493,6 +7511,8 @@ struct GpuModel {
       bool stop = false;
       if (!draft.empty() && ng_legacy) {
         // ---- ngram round: long draft, whole-state checkpoint + replay ----
+        // Never submits to the rendezvous: excuse this worker for the round.
+        VrExcuse vr_x(*this);
         const int base = pos;
         const size_t history_size = chist.size();
         // Stash h_{base-1} (d_R) for the MTP patch below: prefill_batch
@@ -7565,6 +7585,8 @@ struct GpuModel {
         // chunk while its d_Rb rows are still live; d_mtap row 0 carries the
         // h_{base-1} stash for the chunk about to verify (verify/replay never
         // touch d_mtap — mtp_tap_capture is off outside prefill).
+        // Never submits to the rendezvous: excuse this worker for the round.
+        VrExcuse vr_x(*this);
         CK(hipMemcpyAsync(d_mtap, d_R, 10240 * 4, hipMemcpyDeviceToDevice,
                           g_str));
         int cur_c = cur, keep_round = 0;
@@ -7653,20 +7675,11 @@ struct GpuModel {
         }
       } else {
         // ---- MTP round (ngram table missed): short draft, snapshot rollback
-        // ---- (same machinery as spec_loop)
+        // ---- (same machinery as spec_loop). This worker is counted by the
+        // ---- loop-scope VrLoop; the rendezvous happens at the verify below.
         int q = pos - 1;
         int g = std::min({gctl.cur, gen - (int)out.size(), maxctx - pos - 1});
         if (g < 1) break;  // context edge: no room for even one draft
-        // D2-S2b: this MTP round joins the verify rendezvous — counted from
-        // here (before drafting, so peers' trigger waits for our submit) to
-        // the end of the block, on every exit path. ngram rounds never join:
-        // they never submit, so counting them would stall the all-arrived
-        // trigger until every timeout.
-        struct VrRound {
-          GpuModel& m;
-          VrRound(GpuModel& m) : m(m) { m.vseg_round_enter(); }
-          ~VrRound() { m.vseg_round_exit(); }
-        } vr_(*this);
         // Same shared row budget as spec_loop: cap this round so the batched
         // verify stays within kVSnapRows (the executor re-checks hard).
         if (vseg_active_fn) {
@@ -7696,6 +7709,8 @@ struct GpuModel {
         vt.reserve(g + 1);
         vt.push_back(cur);
         for (int j = 0; j < g; j++) vt.push_back(drafts[j]);
+        auto t1 = std::chrono::steady_clock::now();
+        mtp_draft_ms += elapsed(t0);
         spec_snap = true;  // capture per-row rollback snapshots during verify
         vsnap_row0_ = 0;  // D2-S2a: serial verify always packs at row 0
         if (!verify_graph_round_try(vt, q + 1, v.data())) {
@@ -7715,7 +7730,8 @@ struct GpuModel {
           }
         } else
           spec_snap = false;
-        verify_ms += elapsed(t0);
+        mtp_vrfy_ms += elapsed(t1);  // 含会合等待（池内等同伴到齐/超时）
+        auto t2 = std::chrono::steady_clock::now();
         int a = 0;
         while (a < g && drafts[a] == v[a]) a++;
         for (int j = 0; j < g; j++) {
@@ -7784,6 +7800,7 @@ struct GpuModel {
           mtp_pos = q + 1;
           CK(hipMemcpyAsync(d_mpos, &mtp_pos, 4, hipMemcpyHostToDevice, g_str));
         }
+        mtp_commit_ms += elapsed(t2);
       }
       ++last_spec_rounds;
       live_spec_rounds = last_spec_rounds;
@@ -7808,6 +7825,16 @@ struct GpuModel {
       for (int j = 0; j < 8 && depth_tot[j]; j++)
         fprintf(stderr, " %d:%.3f", j + 1, (double)depth_hits[j] / depth_tot[j]);
       fprintf(stderr, "\n");
+      // D2-S2c: per-phase ms/round (verify 段含会合等待；残差 = 轮转等待 +
+      // ngram 轮 + emit)。
+      fprintf(stderr,
+              "chain mtp ms/round: draft=%.1f verify=%.1f commit=%.1f "
+              "other=%.1f\n",
+              mtp_draft_ms / mtp_rounds, mtp_vrfy_ms / mtp_rounds,
+              mtp_commit_ms / mtp_rounds,
+              (sec * 1000.0 - mtp_draft_ms - mtp_vrfy_ms - mtp_commit_ms -
+               verify_ms - replay_ms) /
+                  last_spec_rounds);
       gctl.report("chain");
     }
     return out;
