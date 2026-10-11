@@ -807,7 +807,7 @@ void check_vram_page(CheckLines& c, const PanelVals& v, bool service_running) {
     // 0 = 跟随 MAX_CONTEXT；std::max 与 windows.h 的 max 宏冲突，手写比较
     const double pool_tokens = (double)(kv_pool > maxctx ? kv_pool : maxctx);
     const double kv_bytes = pool_tokens * kKvBytesPerToken;
-    const double chunk = prefill > 0 ? (double)prefill : 8192.0;
+    const double chunk = prefill > 0 ? (double)prefill : 10240.0;
     const double ws_bytes = chunk / 8192.0 * 6.9 * 1073741824.0;  // 8192≈6.9 GiB 实测
     const double gdn_bytes = parallel * 0.12 * 1073741824.0;      // 每路 GDN 状态
     const double total = (double)weights + kv_bytes + ws_bytes + gdn_bytes;
@@ -1714,8 +1714,8 @@ PanelResult panel_run() {
     g_pc.prefill = pctl(1, h, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kEdX, y2, 120,
                         22, L"", kEdPrefill);
     set_edit(g_pc.prefill, init.prefill_chunk);
-    plabel(1, h, kHintX, y2, TR(L"0 = 默认 8192（≈6.9 GiB 工作区）",
-                                L"0 = default 8192 (≈6.9 GiB workspace)"),
+    plabel(1, h, kHintX, y2, TR(L"0 = 默认 10240（≈8.6 GiB 工作区）",
+                                L"0 = default 10240 (≈8.6 GiB workspace)"),
            kHintW);
     y2 += 26;
     {

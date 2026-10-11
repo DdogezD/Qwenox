@@ -57,7 +57,7 @@ OpenAI 接口）。Git Bash 下 `start_win.sh` 与 Linux `start.sh` 并列。
   装进进程第一笔分配。`devarena_estimate` 镜像 GpuModel 全部分配公式，
   预留 = 估算 + slack（`GDEC_ARENA_SLACK_GB`，默认 4 GiB），封顶
   `GDEC_ARENA_CAP_GB`（默认 **95.0**，对应 96 GiB BIOS 划分的实测上限）。
-  Windows 默认 prefill chunk 8192（`eff_maxbatch`；Linux 32768）。
+  Windows 默认 prefill chunk 10240（`eff_maxbatch`；Linux 32768）。
   **256K 下不要设 `GDEC_PREFILL_CHUNK=16384`**（会触发截断 + 溢出回退）；
   maxctx ≤ 40K 时 16384 放得下且 PP 快 ~6%（见验证矩阵实测）。
 - **新权重加载器**（`load_arena` Windows 分支）：CreateFile

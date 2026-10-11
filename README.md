@@ -335,7 +335,7 @@ bash build_win.sh launcher  # 根目录最小入口 start_win.exe
   weight arena +2.2 GiB,256K / chunk 8192 估算约 93.2 GiB(上限 95),
   尚未在 Windows 实测
 - 图片解码经 stb_image 支持 PNG/JPEG(WebP 未接)
-- prefill chunk 默认 8192
+- prefill chunk 默认 10240
 - 冷加载为整权重读盘(分钟级,进度见控制台/日志)
 - 启动器未开 `QWENOX_GEMM_WMMA` 与 `QWENOX_GDN_FUSED`(Linux 启动器已转正的
   自写 WMMA GEMM 与 GDN 融合 kernel,合计约 8-10% PP,TheRock 下未验证——

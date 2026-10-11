@@ -416,7 +416,7 @@ Differences from the Linux version:
   estimated ~93.2 GiB at 256K / chunk 8192 (limit 95); not yet measured
   on Windows
 - Image decoding supports PNG/JPEG via stb_image (WebP not wired up)
-- Prefill chunk defaults to 8192
+- Prefill chunk defaults to 10240
 - Cold loading reads the full weights from disk (minute-scale, progress
   shown in console/logs)
 - The launchers do not enable `QWENOX_GEMM_WMMA` or `QWENOX_GDN_FUSED` (the

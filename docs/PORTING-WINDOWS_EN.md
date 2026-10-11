@@ -68,7 +68,7 @@ Key implementation points (differences relative to the Linux version):
   of GpuModel's allocation formulas; reservation = estimate + slack
   (`GDEC_ARENA_SLACK_GB`, default 4 GiB), capped at `GDEC_ARENA_CAP_GB`
   (default **95.0**, matching the measured upper bound of the 96 GiB BIOS
-  split). Windows defaults to prefill chunk 8192 (`eff_maxbatch`; Linux
+  split). Windows defaults to prefill chunk 10240 (`eff_maxbatch`; Linux
   32768). **Do not set `GDEC_PREFILL_CHUNK=16384` at 256K** (it triggers
   truncation + overflow fallback); with maxctx ≤ 40K, 16384 fits and PP is
   ~6% faster (see the measurements in the verification matrix).
