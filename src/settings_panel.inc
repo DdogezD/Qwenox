@@ -1579,7 +1579,7 @@ PanelResult panel_run() {
         wc.cbSize = sizeof wc;
         wc.lpfnWndProc = panel_proc;
         wc.hInstance = hi;
-        wc.lpszClassName = L"gfx1151_setup_panel";
+        wc.lpszClassName = L"Qwenox_setup_panel";
         wc.hbrBackground = g_panel_bg;
         wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));  // IDC_ARROW
         // 窗口图标（任务栏按钮用）：内嵌 ICO，否则任务栏是空白默认图标
@@ -1598,8 +1598,8 @@ PanelResult panel_run() {
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     const int wx = work.left + (work.right - work.left - win_w) / 2;
     const int wy = work.top + (work.bottom - work.top - win_h) / 2;
-    HWND h = CreateWindowExW(0, L"gfx1151_setup_panel",
-                             TR(L"gfx1151-engine 设置", L"gfx1151-engine Settings"),
+    HWND h = CreateWindowExW(0, L"Qwenox_setup_panel",
+                             TR(L"Qwenox 设置", L"Qwenox Settings"),
                              WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, wx, wy, win_w, win_h,
                              nullptr, nullptr, hi, nullptr);
     if (!h) {
