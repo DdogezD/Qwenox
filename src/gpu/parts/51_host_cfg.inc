@@ -2042,29 +2042,33 @@ struct VerifyPool {
   std::mutex mu;
   std::condition_variable cv;
   std::vector<VrReq*> pend;    // current round's submissions
-  int active = 0;              // workers inside greedy spec_loop (under mu)
+  int active = 0;              // workers able to submit this round (under mu)
   bool executing = false;
   std::chrono::steady_clock::time_point first_submit;
   long batches = 0, solo = 0, timeouts = 0, fallbacks = 0;
+  long hist[9] = {};           // batch-size (segments) histogram
 };
 static VerifyPool g_vr;
 static int g_vr_wait_ms = 50;  // QWENOX_VR_WAIT_MS
 
-// Counts one worker inside a greedy spec loop. Every exit path (eos, cancel,
-// KvOverflow unwind) must decrement, else the all-arrived trigger never
-// fires and the pool stalls to the timeout each round.
-struct VrActive {
-  VrActive() {
+// Membership counting. Every exit path (eos, cancel, KvOverflow unwind) must
+// decrement, else the all-arrived trigger never fires and the pool stalls to
+// the timeout each round. S2a counts a whole greedy spec_loop call (VrActive
+// at the call site); S2b counts one chain MTP round (callbacks, model side).
+static void vseg_round_enter() {
+  std::lock_guard<std::mutex> lk(g_vr.mu);
+  g_vr.active++;
+}
+static void vseg_round_exit() {
+  {
     std::lock_guard<std::mutex> lk(g_vr.mu);
-    g_vr.active++;
+    g_vr.active--;
   }
-  ~VrActive() {
-    {
-      std::lock_guard<std::mutex> lk(g_vr.mu);
-      g_vr.active--;
-    }
-    g_vr.cv.notify_all();  // the round may now be complete without us
-  }
+  g_vr.cv.notify_all();  // the round may now be complete without us
+}
+struct VrActive {
+  VrActive() { vseg_round_enter(); }
+  ~VrActive() { vseg_round_exit(); }
 };
 
 static int vseg_active() {
@@ -2131,6 +2135,7 @@ static void vr_execute(GpuModel& m) {
     for (VrReq* r : mine) r->done = true;
     g_vr.executing = false;
     g_vr.batches++;
+    g_vr.hist[std::min(segs.size(), (size_t)8)]++;
     if (segs.size() <= 1) g_vr.solo++;
     if (vr_dbg)
       fprintf(stderr, "%s [vr] batch: %zu segs %d rows (batches %ld, solo %ld,"
@@ -2969,6 +2974,19 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
                 use_chain ? (chain_mtp ? "chain" : "ngram")
                           : (use_ngram ? "ngram" : "mtp"));
       }
+      // D2-S2: rendezvous pool snapshot + batch-size histogram (histogram
+      // buckets = segments per batch, 8 = 8+).
+      if (m.vseg_pool_fn && g_vr.batches) {
+        std::lock_guard<std::mutex> lk(g_vr.mu);
+        fprintf(stderr,
+                "%s [vr] batches=%ld multi=%ld solo=%ld timeouts=%ld "
+                "fallbacks=%ld | segs 1:%ld 2:%ld 3:%ld 4:%ld 5:%ld 6:%ld "
+                "7:%ld 8+:%ld\n",
+                log_ts(), g_vr.batches, g_vr.batches - g_vr.solo, g_vr.solo,
+                g_vr.timeouts, g_vr.fallbacks, g_vr.hist[1], g_vr.hist[2],
+                g_vr.hist[3], g_vr.hist[4], g_vr.hist[5], g_vr.hist[6],
+                g_vr.hist[7], g_vr.hist[8]);
+      }
     }
     perfsnap::write_idle();  // tooltip 下一轮轮询即回归纯地址
     // SSD prompt cache: capture the end-of-turn state, then commit it with
@@ -3239,6 +3257,10 @@ static int run(GpuModel& m, const std::string& host, int port) {
     if (!no_vr) {
       m.vseg_pool_fn = &vseg_pool;
       m.vseg_active_fn = &vseg_active;
+      // D2-S2b: chain MTP rounds join the pool per round (ngram rounds never
+      // count and never submit — they would stall the all-arrived trigger).
+      m.vseg_round_enter_fn = &vseg_round_enter;
+      m.vseg_round_exit_fn = &vseg_round_exit;
     }
     if (const char* v = getenv("QWENOX_VR_WAIT_MS")) {
       g_vr_wait_ms = atoi(v);

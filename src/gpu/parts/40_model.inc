@@ -174,13 +174,20 @@ struct GpuModel {
   void (*borrow_fn)(GpuModel&) = nullptr;   // release+reacquire under g_borrow_light
   void (*borrow_skip_fn)(GpuModel&) = nullptr;  // heavy chunk during borrow: requeue
   // D2-S2a: verify rendezvous pool (serve mode, nslots > 1). Non-null
-  // vseg_pool_fn reroutes the greedy spec loop's eager verify into the pool;
+  // vseg_pool_fn reroutes the spec loop's eager verify into the pool;
   // false = the pool is unavailable for this round, caller falls back to
   // single-segment verify_segments. vseg_active_fn reports how many workers
-  // are inside greedy spec loops (gamma clamp for the shared row budget).
+  // can submit a round now (gamma clamp for the shared row budget).
   struct VSeg;
   bool (*vseg_pool_fn)(GpuModel&, const VSeg&, int*) = nullptr;
   int (*vseg_active_fn)() = nullptr;
+  // D2-S2b: chain-mode MTP rounds join/leave the rendezvous per round via
+  // these (ngram rounds never count — they never submit, so counting them
+  // would stall the all-arrived trigger until every timeout).
+  void (*vseg_round_enter_fn)() = nullptr;
+  void (*vseg_round_exit_fn)() = nullptr;
+  void vseg_round_enter() { if (vseg_round_enter_fn) vseg_round_enter_fn(); }
+  void vseg_round_exit() { if (vseg_round_exit_fn) vseg_round_exit_fn(); }
   int conc_rmax_ = 32;                      // borrow round row cap (= small ws rows)
   float conc_quantum_ms_ = 300;             // min GPU-busy ms between lends
   int kv_nl = 0;                // layers in d_kc/d_vc/d_kcb/d_vcb/d_ik (+1 = MTP)
@@ -7650,6 +7657,22 @@ struct GpuModel {
         int q = pos - 1;
         int g = std::min({gctl.cur, gen - (int)out.size(), maxctx - pos - 1});
         if (g < 1) break;  // context edge: no room for even one draft
+        // D2-S2b: this MTP round joins the verify rendezvous — counted from
+        // here (before drafting, so peers' trigger waits for our submit) to
+        // the end of the block, on every exit path. ngram rounds never join:
+        // they never submit, so counting them would stall the all-arrived
+        // trigger until every timeout.
+        struct VrRound {
+          GpuModel& m;
+          VrRound(GpuModel& m) : m(m) { m.vseg_round_enter(); }
+          ~VrRound() { m.vseg_round_exit(); }
+        } vr_(*this);
+        // Same shared row budget as spec_loop: cap this round so the batched
+        // verify stays within kVSnapRows (the executor re-checks hard).
+        if (vseg_active_fn) {
+          const int va = vseg_active_fn();
+          if (va > 1) g = std::min(g, std::max(1, (int)kVSnapRows / va - 1));
+        }
         size_t chist_sz = chist.size();
         mtp_ckpt_save();
         auto t0 = std::chrono::steady_clock::now();
@@ -7676,9 +7699,20 @@ struct GpuModel {
         spec_snap = true;  // capture per-row rollback snapshots during verify
         vsnap_row0_ = 0;  // D2-S2a: serial verify always packs at row 0
         if (!verify_graph_round_try(vt, q + 1, v.data())) {
-          prefill_batch(vt, q + 1, false, true);
-          spec_snap = false;
-          batch_argmax(g + 1, v.data());
+          // D2-S2b: rendezvous verify (same shape as spec_loop); false ->
+          // this slot runs the serial verify itself.
+          const VSeg vseg{bound_, &vt, q + 1};
+          if (vseg_pool_fn && vseg_pool_fn(*this, vseg, v.data()))
+            spec_snap = false;
+          else {
+            static const bool no_vseg =
+                getenv("QWENOX_NO_VSEG") && !env_zero("QWENOX_NO_VSEG");
+            if (no_vseg || !verify_segments(&vseg, 1, v.data())) {
+              prefill_batch(vt, q + 1, false, true);
+              batch_argmax(g + 1, v.data());
+            }
+            spec_snap = false;
+          }
         } else
           spec_snap = false;
         verify_ms += elapsed(t0);
@@ -7731,7 +7765,9 @@ struct GpuModel {
           CK(hipMemcpyAsync(d_pos, &pos, 4, hipMemcpyHostToDevice, g_str));
           CK(hipMemcpyAsync(d_ringpos, &ple_ringpos, 4, hipMemcpyHostToDevice,
                             g_str));
-          restore_dR_row(d);
+          // vsnap_row0_ = this slot's d_Rb row base (D2-S2 rendezvous
+          // packing; 0 on the serial path).
+          restore_dR_row(d, vsnap_row0_);
           cur = v[d];
         }
         // Committed-token history: rebuild explicitly so it is right whether
@@ -7743,7 +7779,7 @@ struct GpuModel {
                           hipMemcpyDeviceToDevice, g_str));
         if (d > 0) {
           std::vector<int> mtoks(drafts.begin(), drafts.begin() + d);
-          mtp_ingest_b(spec_taps(d), mtoks, d, q + 1);
+          mtp_ingest_b(spec_taps(d, vsnap_row0_), mtoks, d, q + 1);
         } else {
           mtp_pos = q + 1;
           CK(hipMemcpyAsync(d_mpos, &mtp_pos, 4, hipMemcpyHostToDevice, g_str));
