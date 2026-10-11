@@ -429,7 +429,8 @@ int main(int argc, char** argv) {
     kvsnap::g_vision_file = vision_tower;
     return serve::run(m, engine_host, port);
   }
-  if (!kld_mode && tokens.size() < (ppl ? 2u : 1u)) {
+  const char* vseg_selftest_spec = getenv("QWENOX_VSEG_SELFTEST");
+  if (!kld_mode && !vseg_selftest_spec && tokens.size() < (ppl ? 2u : 1u)) {
     fprintf(stderr, ppl ? "--ppl needs at least two tokens\n" : "need --tokens\n");
     return 2;
   }
@@ -471,6 +472,8 @@ int main(int argc, char** argv) {
   gguf_dense_release(ckpt);
   m.ple_on = ple_on;
   m.build_graphs();
+  if (vseg_selftest_spec)  // D2-S1c: multi-segment verify selftest owns the run
+    return m.vseg_selftest(vseg_selftest_spec) ? 0 : 1;
   if (mtp_test > 0 || spec_gen > 0) {
     if (mtp_test > 0 && !mrope_grids.empty()) {
       fprintf(stderr, "mrope: mtp-test not supported (acceptance harness "
@@ -487,7 +490,7 @@ int main(int argc, char** argv) {
   std::vector<int> all = tokens;
   std::vector<float> logits;
 
-  if (!getenv("QWENOX_NOWARMUP") && mtp_test == 0 && spec_gen == 0) {
+  if (!getenv("QWENOX_NOWARMUP") && !vseg_selftest_spec && mtp_test == 0 && spec_gen == 0) {
     // warmup: one dummy chunk prefill, then reset (see serve path above).
     // Skipped for mtp/spec modes: tap capture would ingest warmup rows.
     std::vector<int> warm((size_t)m.maxbatch, 0);
