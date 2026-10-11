@@ -188,7 +188,10 @@ struct GpuModel {
   void (*vseg_round_exit_fn)() = nullptr;
   void vseg_round_enter() { if (vseg_round_enter_fn) vseg_round_enter_fn(); }
   void vseg_round_exit() { if (vseg_round_exit_fn) vseg_round_exit_fn(); }
-  int conc_rmax_ = 32;                      // borrow round row cap (= small ws rows)
+  // S3b: 48 = kVSnapRows。会合 verify 批作为 borrower 在借用窗口内直接跑
+  // verify_segments（不经 conc_rmax_ 闸门），S3a 把行预算升到 48 后 32 行的
+  // 小工作区会被越界写（B=8 下 "unspecified launch failure"）。
+  int conc_rmax_ = 48;                      // borrow round row cap (= small ws rows)
   float conc_quantum_ms_ = 300;             // min GPU-busy ms between lends
   int kv_nl = 0;                // layers in d_kc/d_vc/d_kcb/d_vcb/d_ik (+1 = MTP)
   size_t kv_layer_rows = 0;     // per-layer KV row stride (== maxctx unpaged)
@@ -9281,7 +9284,9 @@ struct GpuModel {
       if (const char* v = getenv("QWENOX_CONC_PREFILL_QUANTUM_MS"))
         conc_quantum_ms_ = (float)atof(v);
       if (const char* v = getenv("QWENOX_CONC_RMAX")) conc_rmax_ = atoi(v);
-      ws_alloc_small(conc_rmax_);
+      // 小工作区行数下限 kVSnapRows：会合 verify 批（<=48 行）作为 borrower
+      // 借用本工作区且不经 conc_rmax_ 闸门，env 调小也不能窄过它。
+      ws_alloc_small(conc_rmax_ < (int)kVSnapRows ? (int)kVSnapRows : conc_rmax_);
       if (ws_ok_)
         fprintf(stderr, "qwenox: prefill borrow armed (R<=%d rows, quantum %.0f ms)\n",
                 conc_rmax_, (double)conc_quantum_ms_);
