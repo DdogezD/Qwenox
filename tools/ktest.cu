@@ -1275,6 +1275,369 @@ int main() {
     }
   }
 
+  // ---- 1h. gemv_multi 全 P 行不变性（D2-S1b）--------------------------------
+  // 性质：同一 x 行内容，在批 P=1..24 的任意行位 / 分块下，y 行必须逐位
+  // 相同。参考 = 每行单独跑 P=1；P=2..24 全量逐位比对（P>8 走 le8 的 8 行
+  // 分块，顺带锁定分块路径）。覆盖生产 v2 的 ht 全形状族（ks 分裂 / tpc
+  // 分级）与 q6g64 的 LPR=8 / LPR=32 / split-K 门控（C>=4096 && R<=2048）
+  // 分支；q4cp / q8g32 / bf16-rowfast 抽查分块路径。
+  {
+    std::mt19937 rng(0x51b);
+    auto frand = [&] { return std::uniform_real_distribution<float>(-1.f, 1.f)(rng); };
+    if (!g_ht_zs) {  // ht / q6g64 split-K scratch（生产由 v2_init 分配）
+      TCK(hipMalloc(&g_ht_zs, kHtZs * 4));
+      TCK(hipMemset(g_ht_zs, 0, kHtZs * 4));
+      TCK(hipMalloc(&g_ht_cnt, 4096 * 4));
+      TCK(hipMemset(g_ht_cnt, 0, 4096 * 4));
+    }
+    if (!g_q6g_part) TCK(hipMalloc(&g_q6g_part, (size_t)16 * 8 * 2048 * 4));
+    constexpr int PMAX = 24;
+    // runP(P, r0, dy)：x 第 r0 行起的 P 行过 gemv_multi_q4cp（ys = N）。
+    auto audit_full = [&](const char* name, uint64_t N, auto runP, float* dy) {
+      std::vector<float> yref((size_t)PMAX * N);
+      for (int r = 0; r < PMAX; r++) {
+        runP(1, r, dy);
+        TCK(hipMemcpy(yref.data() + (size_t)r * N, dy, N * 4,
+                      hipMemcpyDeviceToHost));
+      }
+      size_t m = 0;
+      int firstbad = -1, badrow = -1;
+      for (int P = 2; P <= PMAX; P++) {
+        runP(P, 0, dy);
+        std::vector<float> yP = dget(dy, (size_t)P * N);
+        for (size_t i = 0; i < yP.size(); i++)
+          if (yP[i] != yref[i]) {
+            m++;
+            if (firstbad < 0) { firstbad = P; badrow = (int)(i / N); }
+          }
+      }
+      printf("ri_%-23s mism=%-9zu firstbad=P%d:row%d %s\n", name, m, firstbad,
+             badrow, m ? "FAIL" : "PASS");
+      if (m) fails++;
+    };
+
+    // ht (dtype 16)：生产形状族 {512x2560, 640x2560, 2560x640, 2560x6144,
+    // 6144x2560, 10240x2560, 12288x2560, 248320x2560}（ks = 20/10/4/4/2/1/1/1；
+    // 640x2560 是 shared_expert gate_proj（nty=5 的 split-K 档），248320x2560
+    // 是 lm_head 本体）。随机 bytes 对 ht 解码均合法。
+    for (int xbf = 0; xbf <= 1; xbf++) {
+      const int shapes[][2] = {{512, 2560},   {640, 2560},   {2560, 640},
+                               {2560, 6144},  {6144, 2560},  {10240, 2560},
+                               {12288, 2560}, {248320, 2560}};
+      for (const auto& sh : shapes) {
+        const int O = sh[0], K = sh[1];
+        std::vector<uint8_t> codes((size_t)(O / 128) * (K / 128) * 8192);
+        for (auto& v : codes) v = (uint8_t)rng();
+        std::vector<float> suh(K), svh(O);
+        for (auto& v : suh) v = 0.02f * frand();
+        for (auto& v : svh) v = 0.5f + 0.5f * frand();
+        std::vector<float> xf((size_t)PMAX * K);
+        for (auto& v : xf) v = frand();
+        std::vector<uint16_t> xb(xf.size());
+        for (size_t i = 0; i < xb.size(); i++) xb[i] = bf16_bits(xf[i]);
+        uint8_t* dw = dup(codes);
+        float *dsuh = dup(suh), *dsvh = dup(svh), *dxf = dup(xf);
+        uint16_t* dxb = dup(xb);
+        float* dy = dalloc((size_t)PMAX * O);
+        WView w;
+        w.dtype = 16;
+        w.data = dw;
+        w.rows = O;
+        w.cols = K;
+        w.scale_stride = 0;
+        w.suh = dsuh;
+        w.svh = dsvh;
+        auto runP = [&](int P, int r0, float* y) {
+          const void* xp = xbf ? (const void*)(dxb + (size_t)r0 * K)
+                               : (const void*)(dxf + (size_t)r0 * K);
+          if (!gemv_multi_q4cp(w, xp, y, P, K, xbf != 0)) {
+            printf("  ri_ht %dx%d: dispatch refused P=%d\n", O, K, P);
+            fails++;
+          }
+        };
+        char nm[64];
+        snprintf(nm, sizeof nm, "ht_%dx%d%s", O, K, xbf ? "_bx" : "");
+        audit_full(nm, O, runP, dy);
+        TCK(hipFree(dw)); TCK(hipFree(dsuh)); TCK(hipFree(dsvh));
+        TCK(hipFree(dxf)); TCK(hipFree(dxb)); TCK(hipFree(dy));
+      }
+    }
+
+    // q6g64 (dtype 24)：{320x10240, 4x10240} 命中 split-K 门控（生产 HC），
+    // {2048x2560} LPR=32，{10240x320} LPR=8。行布局：C/2 B 低 4 位 +
+    // C/4 B 高 2 位面 + C/64 x (f16 scale, f16 bias)，行距 align16(13C/16)。
+    for (int xbf = 0; xbf <= 1; xbf++) {
+      const int shapes[][2] = {{320, 10240}, {4, 10240}, {2048, 2560},
+                               {10240, 320}};
+      for (const auto& sh : shapes) {
+        const int R = sh[0], C = sh[1];
+        const uint64_t st = q6g64_stride(C);
+        std::vector<uint8_t> wbuf((size_t)R * st);
+        for (int r = 0; r < R; r++) {
+          uint8_t* rp = wbuf.data() + (size_t)r * st;
+          for (uint64_t i = 0; i < 3 * (uint64_t)C / 4; i++) rp[i] = (uint8_t)rng();
+          for (uint64_t g = 0; g < (uint64_t)C / 64; g++) {
+            __half hs = __float2half(0.01f + 0.005f * frand());
+            __half hb = __float2half(0.5f * frand());
+            memcpy(rp + 3 * (size_t)C / 4 + g * 4, &hs, 2);
+            memcpy(rp + 3 * (size_t)C / 4 + g * 4 + 2, &hb, 2);
+          }
+        }
+        std::vector<float> xf((size_t)PMAX * C);
+        for (auto& v : xf) v = frand();
+        std::vector<uint16_t> xb(xf.size());
+        for (size_t i = 0; i < xb.size(); i++) xb[i] = bf16_bits(xf[i]);
+        uint8_t* dw = dup(wbuf);
+        float* dxf = dup(xf);
+        uint16_t* dxb = dup(xb);
+        float* dy = dalloc((size_t)PMAX * R);
+        WView w;
+        w.dtype = 24;
+        w.data = dw;
+        w.rows = R;
+        w.cols = C;
+        w.scale_stride = st;
+        auto runP = [&](int P, int r0, float* y) {
+          const void* xp = xbf ? (const void*)(dxb + (size_t)r0 * C)
+                               : (const void*)(dxf + (size_t)r0 * C);
+          if (!gemv_multi_q4cp(w, xp, y, P, C, xbf != 0)) {
+            printf("  ri_q6g64 %dx%d: dispatch refused P=%d\n", R, C, P);
+            fails++;
+          }
+        };
+        char nm[64];
+        snprintf(nm, sizeof nm, "q6g64_%dx%d%s", R, C, xbf ? "_bx" : "");
+        audit_full(nm, R, runP, dy);
+        TCK(hipFree(dw)); TCK(hipFree(dxf)); TCK(hipFree(dxb)); TCK(hipFree(dy));
+      }
+    }
+
+    // P>8 分块抽查（le8 内无 host 侧 P 参数，分块只是模板切换）：
+    // q4cp {128x1024, 1x2560, 48x2560}（后两个是生产形状：shared_expert_gate
+    // R=1 与 in_proj_a/b R=48）、q8g32 64x2560 float（lpr=16）、
+    // q8g32 320x6144 bf16 x（brow/brow_r 家族，P 3..5 走 brow_r）、
+    // bf16 rowfast 48x2560 bf16 x（k_bf16_gemv_row_mp）。
+    for (const auto& qsh : {std::pair<uint64_t, uint64_t>{128, 1024},
+                            {1, 2560}, {48, 2560}}) {
+      const uint64_t rows = qsh.first, cols = qsh.second,
+                     ss = ((cols / 32 * 2) + 15) & ~15ull;
+      for (int xbf = 0; xbf <= 1; xbf++) {
+        std::vector<uint8_t> w(64 + rows * cols / 2 + rows * ss);
+        std::vector<float> cb(16);
+        for (auto& v : cb) v = frand() * 2.f;
+        memcpy(w.data(), cb.data(), 64);
+        for (uint64_t i = 0; i < rows * cols / 2; i++) w[64 + i] = (uint8_t)rng();
+        __half* hs = (__half*)(w.data() + 64 + rows * cols / 2);
+        for (uint64_t i = 0; i < rows * cols / 32; i++)
+          hs[i] = __float2half(0.01f + 0.005f * frand());
+        std::vector<float> xf((size_t)PMAX * cols);
+        for (auto& v : xf) v = frand();
+        std::vector<uint16_t> xb(xf.size());
+        for (size_t i = 0; i < xb.size(); i++) xb[i] = bf16_bits(xf[i]);
+        uint8_t* dw = dup(w);
+        float* dxf = dup(xf);
+        uint16_t* dxb = dup(xb);
+        float* dy = dalloc((size_t)PMAX * rows);
+        WView wv;
+        wv.dtype = 5;
+        wv.data = dw;
+        wv.rows = rows;
+        wv.cols = cols;
+        wv.scale_stride = ss;
+        auto runP = [&](int P, int r0, float* y) {
+          const void* xp = xbf ? (const void*)(dxb + (size_t)r0 * cols)
+                               : (const void*)(dxf + (size_t)r0 * cols);
+          if (!gemv_multi_q4cp(wv, xp, y, P, cols, xbf != 0)) {
+            printf("  ri_q4cp_chunk: dispatch refused P=%d\n", P);
+            fails++;
+          }
+        };
+        char qnm[64];
+        snprintf(qnm, sizeof qnm, "q4cp_chunk_%llux%llu%s",
+                 (unsigned long long)rows, (unsigned long long)cols,
+                 xbf ? "_bx" : "");
+        audit_full(qnm, rows, runP, dy);
+        TCK(hipFree(dw)); TCK(hipFree(dxf)); TCK(hipFree(dxb)); TCK(hipFree(dy));
+      }
+    }
+    for (int kind = 0; kind < 2; kind++) {  // 0 = multi lpr16 float x, 1 = brow 家族 bf16 x
+      const uint64_t rows = kind ? 320 : 64, cols = kind ? 6144 : 2560;
+      std::vector<uint8_t> w(rows * cols + rows * (cols / 32) * 2);
+      for (uint64_t i = 0; i < rows * cols; i++) w[i] = (uint8_t)rng();
+      __half* hs = (__half*)(w.data() + rows * cols);
+      for (uint64_t i = 0; i < rows * (cols / 32); i++)
+        hs[i] = __float2half(0.01f + 0.005f * frand());
+      std::vector<float> xf((size_t)PMAX * cols);
+      for (auto& v : xf) v = frand();
+      std::vector<uint16_t> xb(xf.size());
+      for (size_t i = 0; i < xb.size(); i++) xb[i] = bf16_bits(xf[i]);
+      uint8_t* dw = dup(w);
+      float* dxf = dup(xf);
+      uint16_t* dxb = dup(xb);
+      float* dy = dalloc((size_t)PMAX * rows);
+      WView wv;
+      wv.dtype = 8;
+      wv.data = dw;
+      wv.rows = rows;
+      wv.cols = cols;
+      wv.scale_stride = 0;
+      auto runP = [&](int P, int r0, float* y) {
+        const void* xp = kind ? (const void*)(dxb + (size_t)r0 * cols)
+                              : (const void*)(dxf + (size_t)r0 * cols);
+        if (!gemv_multi_q4cp(wv, xp, y, P, cols, kind != 0)) {
+          printf("  ri_q8g32_chunk kind=%d: dispatch refused P=%d\n", kind, P);
+          fails++;
+        }
+      };
+      audit_full(kind ? "q8g32_chunk_brow" : "q8g32_chunk_lpr16", rows, runP, dy);
+      TCK(hipFree(dw)); TCK(hipFree(dxf)); TCK(hipFree(dxb)); TCK(hipFree(dy));
+    }
+    // bf16 mr（dtype 0，fp32 x）：生产形状 512x2560（mlp.gate router，
+    // k_bf16_gemv_mr 路径；g_dense_rowfast 此时仍为 false，rows=512>=64
+    // 也不会误中 rowfast 档）。
+    {
+      const uint64_t rows = 512, cols = 2560;
+      std::vector<uint16_t> w(rows * cols);
+      for (auto& v : w) v = bf16_bits(frand());
+      std::vector<float> xf((size_t)PMAX * cols);
+      for (auto& v : xf) v = frand();
+      uint16_t* dw = dup(w);
+      float* dxf = dup(xf);
+      float* dy = dalloc((size_t)PMAX * rows);
+      WView wv;
+      wv.dtype = 0;
+      wv.data = (const uint8_t*)dw;
+      wv.rows = rows;
+      wv.cols = cols;
+      wv.scale_stride = 0;
+      auto runP = [&](int P, int r0, float* y) {
+        const void* xp = (const void*)(dxf + (size_t)r0 * cols);
+        if (!gemv_multi_q4cp(wv, xp, y, P, cols, false)) {
+          printf("  ri_bf16_mr_512x2560: dispatch refused P=%d\n", P);
+          fails++;
+        }
+      };
+      audit_full("bf16_mr_512x2560", rows, runP, dy);
+      TCK(hipFree(dw)); TCK(hipFree(dxf)); TCK(hipFree(dy));
+    }
+    {
+      const uint64_t rows = 48, cols = 2560;
+      g_dense_rowfast = true;  // 生产由 gguf_dense_apply 在加载时置位
+      std::vector<uint16_t> w(rows * cols);
+      for (auto& v : w) v = bf16_bits(frand());
+      std::vector<float> xf((size_t)PMAX * cols);
+      for (auto& v : xf) v = frand();
+      std::vector<uint16_t> xb(xf.size());
+      for (size_t i = 0; i < xb.size(); i++) xb[i] = bf16_bits(xf[i]);
+      uint16_t* dw = dup(w);
+      uint16_t* dxb = dup(xb);
+      float* dy = dalloc((size_t)PMAX * rows);
+      WView wv;
+      wv.dtype = 0;
+      wv.data = (const uint8_t*)dw;
+      wv.rows = rows;
+      wv.cols = cols;
+      wv.scale_stride = 0;
+      auto runP = [&](int P, int r0, float* y) {
+        const void* xp = (const void*)(dxb + (size_t)r0 * cols);
+        if (!gemv_multi_q4cp(wv, xp, y, P, cols, true)) {
+          printf("  ri_bf16_rowfast: dispatch refused P=%d\n", P);
+          fails++;
+        }
+      };
+      audit_full("bf16_rowfast_chunk", rows, runP, dy);
+      TCK(hipFree(dw)); TCK(hipFree(dxb)); TCK(hipFree(dy));
+    }
+  }
+
+  // ---- 1i. k_qsa_wmma<TransposedV> P=3 vs P=4 行不变性（D2-S1b 复现）--------
+  // 引擎 verify 场景：base=8192，尾块 2048 的 slot 3 在 P=3 时被
+  // k_f32_to_bf16_v4_bt 写 0、P=4 时是真实 V（位置 8195）。三轮：
+  //   A: P=3 + slot3=0（γ=2 场景）   B: P=4 + slot3=real（γ=3 场景）
+  //   C: P=3 + slot3=real（同输入仅 P 变，分离 vct 差异与 grid/P 差异）
+  {
+    std::mt19937 rng(0x51c);
+    auto frand = [&] { return std::uniform_real_distribution<float>(-1.f, 1.f)(rng); };
+    const int base = 8192, HQ = 24, HKV = 2, DH = 256;
+    const int rows = 8448, nblk = rows / 4;
+    std::vector<int> ptab(33);  // 恒等页表（33 页 x 256）
+    for (int i = 0; i < 33; i++) ptab[i] = i;
+    int* dptab = dup(ptab);
+    std::vector<float> q((size_t)4 * HQ * DH);
+    for (auto& v : q) v = frand();
+    std::vector<int> sel((size_t)4 * 512);
+    for (int r = 0; r < 4; r++)
+      for (int i = 0; i < 512; i++) sel[(size_t)r * 512 + i] = (i * 4 + r) % 2048;
+    std::vector<uint16_t> kc((size_t)rows * HKV * DH), vc(kc.size());
+    for (auto& v : kc) v = bf16_bits(frand());
+    for (auto& v : vc) v = bf16_bits(frand());
+    std::vector<uint16_t> vctB((size_t)nblk * HKV * DH * 4);
+    for (int t = 0; t < rows; t++)
+      for (int j = 0; j < HKV * DH; j++)
+        vctB[((size_t)(t / 4) * HKV * DH + j) * 4 + t % 4] =
+            vc[(size_t)t * HKV * DH + j];
+    std::vector<uint16_t> vctA = vctB;  // P=3 场景：尾块 2048 的 slot 3 写 0
+    for (int j = 0; j < HKV * DH; j++)
+      vctA[((size_t)2048 * HKV * DH + j) * 4 + 3] = 0;
+    float* dq = dup(q);
+    int* dsel = dup(sel);
+    uint16_t *dkc = dup(kc), *dvc = dup(vc);
+    uint16_t* dvct = dup(vctB);  // 同一设备缓冲：先写 A 内容跑 P=3，再写 B 内容
+    const size_t OB = (size_t)4 * HQ * DH;
+    float *oA = dalloc(OB), *oB = dalloc(OB), *oC = dalloc(OB);
+    TCK(hipMemcpy(dvct, vctA.data(), vctA.size() * 2, hipMemcpyHostToDevice));
+    k_qsa_wmma<true, true><<<dim3(3, HKV), 256>>>(dq, dkc, dvc, dvct, oA, 3,
+                                                  DH, HKV, HQ, dsel, base, base,
+                                                  dptab);
+    TCK(hipMemcpy(dvct, vctB.data(), vctB.size() * 2, hipMemcpyHostToDevice));
+    k_qsa_wmma<true, true><<<dim3(4, HKV), 256>>>(dq, dkc, dvc, dvct, oB, 4,
+                                                  DH, HKV, HQ, dsel, base, base,
+                                                  dptab);
+    k_qsa_wmma<true, true><<<dim3(3, HKV), 256>>>(dq, dkc, dvc, dvct, oC, 3,
+                                                  DH, HKV, HQ, dsel, base, base,
+                                                  dptab);
+    char nm[64];
+    auto biteq3 = [&](const char* name, float* a, float* b) {
+      std::vector<float> ha((size_t)3 * HQ * DH), hb((size_t)3 * HQ * DH);
+      TCK(hipMemcpy(ha.data(), a, ha.size() * 4, hipMemcpyDeviceToHost));
+      TCK(hipMemcpy(hb.data(), b, hb.size() * 4, hipMemcpyDeviceToHost));
+      int badrow = -1;
+      for (int r = 0; r < 3 && badrow < 0; r++)
+        if (memcmp(ha.data() + (size_t)r * HQ * DH, hb.data() + (size_t)r * HQ * DH,
+                   (size_t)HQ * DH * 4))
+          badrow = r;
+      printf("%-28s %s%s\n", name, badrow < 0 ? "PASS" : "FAIL",
+             badrow < 0 ? "" : " (first bad row printed)");
+      if (badrow >= 0) {
+        fails++;
+        const float* ra = ha.data() + (size_t)badrow * HQ * DH;
+        const float* rb = hb.data() + (size_t)badrow * HQ * DH;
+        int nd = 0, first = -1, last = -1;
+        uint32_t hdiff[24] = {};  // 每头差异计数（head = idx / 256）
+        for (int i = 0; i < HQ * DH; i++)
+          if (memcmp(ra + i, rb + i, 4)) {
+            nd++;
+            if (first < 0) first = i;
+            last = i;
+            hdiff[i / DH]++;
+          }
+        printf("  row%d ndiff=%d first=%d last=%d per-head:", badrow, nd, first,
+               last);
+        for (int h = 0; h < 24; h++)
+          if (hdiff[h]) printf(" h%d=%u", h, hdiff[h]);
+        printf("\n  A[first]=%a B[first]=%a\n", (double)ra[first],
+               (double)rb[first]);
+      }
+    };
+    biteq3("ri_qsa_wmma_A_vs_B", oA, oB);  // 引擎 γ=2 vs γ=3 复现
+    biteq3("ri_qsa_wmma_C_vs_B", oC, oB);  // 同 vct，仅 P/grid 变
+    biteq3("ri_qsa_wmma_A_vs_C", oA, oC);  // 同 P=3，仅 slot3 变
+    TCK(hipFree(dq)); TCK(hipFree(dsel));
+    TCK(hipFree(dkc)); TCK(hipFree(dvc)); TCK(hipFree(dvct));
+    TCK(hipFree(oA)); TCK(hipFree(oB)); TCK(hipFree(oC));
+    TCK(hipFree(dptab));
+  }
+
   // ---- 2. k_router_topk batched (P blocks, ids/ws rows of 16) ----
   {
     const int P = 3, N = 512, K = 10;
