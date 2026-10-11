@@ -20,8 +20,9 @@ export QWENOX_ROPE_FACTOR=1 QWENOX_ROPE_ORIGINAL_CTX=262144
 export QWENOX_ROPE_BETA_FAST=32 QWENOX_ROPE_BETA_SLOW=1 QWENOX_ROPE_ATTN_SCALE=0
 
 SPEC="${1:-3,4,5}"
-echo "== d2_s1c_selftest $(date '+%F %T')  QWENOX_VSEG_SELFTEST=$SPEC"
-QWENOX_VSEG_SELFTEST="$SPEC" "$BIN" "$M" "$NG" "$MTP" --maxctx 16384 \
+MAXCTX="${2:-16384}"  # 段数多/段落长时调大（共享 KV 池 = maxctx）
+echo "== d2_s1c_selftest $(date '+%F %T')  QWENOX_VSEG_SELFTEST=$SPEC maxctx=$MAXCTX"
+QWENOX_VSEG_SELFTEST="$SPEC" "$BIN" "$M" "$NG" "$MTP" --maxctx "$MAXCTX" \
     > logs/d2s1c_selftest.log 2>&1
 rc=$?
 tail -5 logs/d2s1c_selftest.log

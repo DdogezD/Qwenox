@@ -517,7 +517,10 @@ struct GpuModel {
   // verify chunk needs gamma+1 <= 9 rows (gamma <= 8); kVSnapRows reserves
   // extra rows so several slots' chunks can coexist (D2 rendezvous), each
   // slot addressing its segment via vsnap_row0_.
-  static constexpr int kVSnapRows = 24;
+  // 48 = 8 slots × (gamma 5 + 1): B=8 rendezvous no longer clamps gamma
+  // (24-row budget forced gamma<=2 there). Cost: +2.8 GiB arena (S0 的
+  // 9→24 为 +1.73 GiB)，devarena estimate 86.4→89.2 + 4 slack = 93.2 < 95。
+  static constexpr int kVSnapRows = 48;
   float* d_Ssnap = nullptr;    // [kVSnapRows][ngdn][48*128*128]
   float* d_csnap = nullptr;    // [kVSnapRows][ngdn][3*10240]
   float* d_iproj_snap = nullptr;  // [nqsa][kVSnapRows][128]
@@ -5852,7 +5855,8 @@ struct GpuModel {
   };
 
   // D2-S1c: the multi-segment verify chunk. Guards (any failure -> false, the
-  // caller falls back to serial): nseg in [1,8], P_s in [1,8], R <= 24 rows,
+  // caller falls back to serial): nseg in [1,8], P_s in [1,8], R <= kVSnapRows
+  // rows,
   // distinct live slots, no mrope / in-pass cut / progress / MTP tap on any
   // segment's slot, the loop debug paths off, no HC inject state in flight.
   bool prefill_chunk_vseg(const VSeg* segs, int nseg) {
@@ -5883,7 +5887,7 @@ struct GpuModel {
         return rej("vsnap window");  // snap rows [row0, row0+P) must fit
       Ps[s] = P; bases[s] = b; sl[s] = t; voffs[s] = R; R += P;
     }
-    if (R > 24 || R > maxbatch_cap) return rej("R cap");
+    if (R > kVSnapRows || R > maxbatch_cap) return rej("R cap");
     moe_dump_base_ = bases[0];
     xf16_src = nullptr;  // a new batch invalidates the bf16 conversion cache
     for (int s = 0; s < nseg; s++)  // back (and unshare) each segment's rows
@@ -9348,7 +9352,7 @@ struct GpuModel {
       }
       R += pv[s];
     }
-    if (R > 24 || R > maxbatch_cap) {
+    if (R > kVSnapRows || R > maxbatch_cap) {
       fprintf(stderr, "vseg-selftest: R=%d rows exceed the verify cap\n", R);
       return false;
     }
@@ -9418,8 +9422,8 @@ struct GpuModel {
       for (int t : dr) segt[(size_t)s].push_back(t);
     }
     // ---- phase A: serial single-segment verifies (production path) ----
-    // Snap windows pack at the batch row offsets (R <= 24 = kVSnapRows), not
-    // 8*s — 8*s overflows the 24-row snap buffers for nseg >= 4 (UB, and it
+    // Snap windows pack at the batch row offsets (R <= kVSnapRows), not
+    // 8*s — 8*s overflows the snap buffers for nseg >= 4 (UB, and it
     // corrupts adjacent slot state).
     std::vector<Snap> A((size_t)nseg);
     int voff = 0;

@@ -284,10 +284,10 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
     add(rb * 4 * 3 + (size_t)g_cfg.d * 4 * 5 + 8);  // mR mRhat mh me meo mt mnorm_*
     add(3 * BP * 10240 * 4);                        // mRb mRhatb mtap
     add(512 * 4);                                   // mring_ckpt
-    // kVSnapRows = 24（40_model.inc，D2 会合预留多槽段；单槽只用前 9 行）
-    add(24 * ngdn * 48 * 128 * 128 * 4);            // Ssnap
-    add(24 * ngdn * 3 * 10240 * 4);                 // csnap
-    add(nqsa * 24 * 128 * 4);                       // iproj_snap
+    // kVSnapRows = 48（40_model.inc，D2 会合预留多槽段；单槽只用前 9 行）
+    add(48 * ngdn * 48 * 128 * 128 * 4);            // Ssnap
+    add(48 * ngdn * 3 * 10240 * 4);                 // csnap
+    add(nqsa * 48 * 128 * 4);                       // iproj_snap
     if (!qsa_dense) {
       add(4 * 128 * 4 + 256 * 4);                   // miraw minorm
       if (index_f32) add((size_t)640 * 2560 * 4);   // miw
@@ -1115,13 +1115,19 @@ static void embed_rows(const WView& et, const int* d_tok, int P, void* out,
 // when the shape/layout is unsupported (caller falls back to the
 // dequant->bf16->hipBLASLt path).
 static int gemvmr_maxp() {
-  // 24: gfx1151 A/B crossover (logs/gemvmr_ps*.log, exact-P psweep vs MAXP=8):
+  // 48: kVSnapRows（40_model.inc，S3a）。会合合批 R≤48 必须与串行单段
+  // （P≤9）走同一 gemvmr 门，否则 P 门分叉破坏逐位一致。chunked 按行分块
+  // （每块独立 ≤8 行 pass），行结果与分块无关 → 任意 P 逐位 ≡ 串行。
+  // gfx1151 A/B crossover（logs/gemvmr_ps*.log, exact-P psweep vs MAXP=8）:
   // P=16 -21~-24% wall, P=24 -6.4%, P=32 +8% (chunked re-reads scale P/8).
+  // P>24 的 +8% 是相对 deq+WMMA 单遍；对会合场景真正照是串行 N 段
+  // （同样 N 遍权重读取），chunked 无掉崖。S3a VBENCH 复测 P=32/48 见
+  // logs/s3a_vbench_*.log。
   // Measured on v2 ht/q6g64; dtype 0/5/7/8 share the default pending their
   // own sweep (per-pass weight cost is the same 0.5-0.75 B/elem order).
   static const int v = [] {
     const char* e = getenv("QWENOX_GEMVMR_MAXP");
-    return e && *e ? atoi(e) : 24;
+    return e && *e ? atoi(e) : 48;
   }();
   return v;
 }

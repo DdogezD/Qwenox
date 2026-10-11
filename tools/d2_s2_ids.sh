@@ -10,7 +10,9 @@
 #         各客户端 ≡ 自己 drafter 的基线（base_d3 单跑基线）
 # 硬门槛：drafter=1 与 drafter=4 的并发相位均须新增多段 [vr] batch
 # （防假 PASS；chain 相位若退回 solo/串行说明会合接入失效）。
-# 可选：D2_GAMMA=N 强制 γ=N（active=4 时触发 24 行预算 clamp/丢弃路径）。
+# 可选：D2_GAMMA=N 强制 γ=N。S3a 起行预算 48：PARALLEL=4 下 active=4 的
+#       clamp 阈值为 48/4-1=11 > γ 上限 8，clamp/丢弃路径不再由本脚本触发
+#       （executor 硬预算仍兜底；S2b 已验 fallbacks 路径逐位正确）。
 #       注意 γ≤7：γ=8 输出偏离 γ≤7 基线（同配置 NO_VR 单跑亦偏离），属既有
 #       引擎行为、与会合无关，超出本测试范围，故 γ>7 直接拒绝。
 #       D2_NOVR=1 以 QWENOX_NO_VR=1 起引擎（分时旧路径对照，须 ≡ 基线且
