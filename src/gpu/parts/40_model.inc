@@ -5429,7 +5429,35 @@ struct GpuModel {
     return id;
   }
 
-  // =================== MTP draft head (Phase A) ==============================
+  // ---- D2 verify_segments --------------------------------------------------
+  // Multi-segment spec verify (S1a: single segment only). One segment = one
+  // slot's verify chunk: toks[0] is the last committed token, the rest are
+  // the drafts; base = absolute position of toks[0]. The kernel sequence is
+  // exactly prefill_batch(toks, base, final=false, quiet=true) +
+  // batch_argmax(P, vout): a verify chunk never exceeds maxbatch_cap, so
+  // prefill_batch degenerates to one prefill_chunk with no tap capture, no
+  // PLE next-chunk prefetch and no inter-chunk yield. S1a also requires the
+  // segment's slot to be the bound one — per-slot state (kv_seq/d_ptab, d_S,
+  // d_convst, d_iraw, d_ring, chist, pos mirrors) is still reached through
+  // the members. Multi-segment batching (S1b+) resolves state per segment per
+  // the inventory in dev-docs/D2-PLAN.md. Returns false -> caller falls back
+  // to the prefill_batch path (QWENOX_NO_VSEG=1 forces the fallback).
+  struct VSeg {
+    int slot;  // owner of the state this segment advances
+    const std::vector<int>* toks;
+    int base;
+  };
+  bool verify_segments(const VSeg* segs, int nseg, int* vout) {
+    if (!segs || nseg != 1 || !segs[0].toks) return false;
+    const VSeg& sg = segs[0];
+    if (sg.slot != bound_) return false;  // S1a: members are the bound slot's
+    const int P = (int)sg.toks->size();
+    if (P < 1 || P > maxbatch_cap) return false;
+    prefill_chunk(*sg.toks, sg.base, false, true, nullptr);
+    batch_argmax(P, vout);
+    return true;
+  }
+
   // Wiring: MTP stream position p takes (trunk h_p, emb(t_{p+1})) and predicts
   // t_{p+2}. Input: h = sum_b fc_hidden(norm_h(tap)[b]), e =
   // fc_embedding(norm_e(embed(tok))), stream = repeat4(h + e). Norm mode is
@@ -6697,9 +6725,16 @@ struct GpuModel {
       for (int j = 0; j < g; j++) vt.push_back(drafts[j]);
       spec_snap = true;  // capture per-row rollback snapshots during verify
       if (!verify_graph_round_try(vt, q + 1, v.data())) {
-        prefill_batch(vt, q + 1, false, true);
+        // D2-S1a: single-segment verify_segments (bit-identical); the env
+        // opt-out and any misfit (multi-slot, oversize) keep the old path.
+        static const bool no_vseg =
+            getenv("QWENOX_NO_VSEG") && !env_zero("QWENOX_NO_VSEG");
+        const VSeg vseg{bound_, &vt, q + 1};
+        if (no_vseg || !verify_segments(&vseg, 1, v.data())) {
+          prefill_batch(vt, q + 1, false, true);
+          batch_argmax(g + 1, v.data());
+        }
         spec_snap = false;
-        batch_argmax(g + 1, v.data());
       } else
         spec_snap = false;
       if (getenv("QWENOX_VGDUMP")) {  // P3-B bisect: whole-logits round hash
