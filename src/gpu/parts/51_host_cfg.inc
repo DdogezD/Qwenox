@@ -2196,6 +2196,147 @@ static bool vseg_pool(GpuModel& m, const GpuModel::VSeg& self, int* vout) {
   return !req.dropped;
 }
 
+// ---- D2-S3c: draft rendezvous pool (DraftPool) ----------------------------
+// Same rendezvous shape as the verify pool above: spec workers reach their
+// draft burst holding the GPU turn, submit the round (slot, gamma, tok0),
+// hand the turn over and wait; the last submitter (or a waiter whose window
+// elapsed) becomes the executor and runs ONE batched cross-slot draft for
+// the round (GpuModel::mtp_draft_batch, bit-identical to the serial per-slot
+// mtp_step bursts). Membership mirrors the verify pool: spec_loop joins at
+// the serve call site (DrActive), spec_loop_chain joins per loop and its
+// ngram rounds excuse themselves per round (they never submit).
+struct DrReq {
+  int slot;
+  int g;
+  int tok0;
+  int* drafts;                 // worker stack; room for g ints
+  bool done = false;
+  bool dropped = false;        // abort/guard refusal -> worker serial rerun
+};
+struct DraftPool {
+  std::mutex mu;
+  std::condition_variable cv;
+  std::vector<DrReq*> pend;    // current round's submissions
+  int active = 0;              // workers able to submit this round (under mu)
+  bool executing = false;
+  std::chrono::steady_clock::time_point first_submit;
+  long batches = 0, solo = 0, timeouts = 0, fallbacks = 0;
+  long hist[9] = {};           // batch-size (segments) histogram
+};
+static DraftPool g_dr;
+static int g_dr_wait_ms = 25;  // QWENOX_DR_WAIT_MS
+
+static void dr_round_enter() {
+  std::lock_guard<std::mutex> lk(g_dr.mu);
+  g_dr.active++;
+}
+static void dr_round_exit() {
+  {
+    std::lock_guard<std::mutex> lk(g_dr.mu);
+    g_dr.active--;
+  }
+  g_dr.cv.notify_all();  // the round may now be complete without us
+}
+// Loop-scope membership at the spec_loop call site. on=false when this
+// worker can never submit (GpuModel::dr_worker_ok): it must not be counted,
+// else the all-arrived trigger waits for it until every timeout.
+struct DrActive {
+  bool on;
+  explicit DrActive(bool on) : on(on) { if (on) dr_round_enter(); }
+  ~DrActive() { if (on) dr_round_exit(); }
+};
+
+// Executor half. Runs on the promoting worker's thread; acquires the GPU
+// turn (FIFO behind the peers, so their rounds land first), runs the batched
+// draft, and wakes everyone. Call with the turn NOT held; returns with it
+// released again.
+static void dr_execute(GpuModel& m) {
+  g_turn.acquire();
+  m.bind(tl_slot);
+  std::vector<DrReq*> mine;
+  {
+    std::lock_guard<std::mutex> lk(g_dr.mu);
+    mine.swap(g_dr.pend);
+  }
+  std::vector<GpuModel::DrSeg> segs;
+  for (DrReq* r : mine) {
+    {
+      std::lock_guard<std::mutex> lk(g_sm);
+      if (g_slots[(size_t)r->slot].abort) { r->dropped = true; continue; }
+    }
+    segs.push_back(GpuModel::DrSeg{r->slot, r->g, r->tok0, r->drafts});
+  }
+  // Guard refusal (incl. a borrow window being up: mtp_draft_batch rejects
+  // ws_lent_) -> every worker re-runs its own serial burst.
+  if (!segs.empty() && !m.mtp_draft_batch(segs.data(), (int)segs.size())) {
+    g_dr.fallbacks++;
+    for (DrReq* r : mine) r->dropped = true;
+  }
+  static const bool vr_dbg = getenv("QWENOX_VR_DBG") != nullptr;
+  {
+    std::lock_guard<std::mutex> lk(g_dr.mu);
+    for (DrReq* r : mine) r->done = true;
+    g_dr.executing = false;
+    g_dr.batches++;
+    g_dr.hist[std::min(segs.size(), (size_t)8)]++;
+    if (segs.size() <= 1) g_dr.solo++;
+    if (vr_dbg)
+      fprintf(stderr, "%s [dr] batch: %zu segs (batches %ld, solo %ld,"
+                      " timeouts %ld, fallbacks %ld)\n",
+              log_ts(), segs.size(), g_dr.batches, g_dr.solo, g_dr.timeouts,
+              g_dr.fallbacks);
+  }
+  g_dr.cv.notify_all();
+  g_turn.release();
+}
+
+// Worker half (GpuModel::dr_pool_fn), called from the spec loops holding the
+// GPU turn, checkpoint saved. Returns true with drafts filled, or false when
+// the pool could not run this round (caller runs the serial draft burst).
+static bool dr_pool(GpuModel& m, const GpuModel::DrSeg& self) {
+  {
+    std::lock_guard<std::mutex> lk(g_dr.mu);
+    if (g_dr.active <= 1) return false;  // sole decoder: keep the serial path
+  }
+  DrReq req{self.slot, self.g, self.tok0, self.drafts, false, false};
+  bool am_exec = false;
+  {
+    std::lock_guard<std::mutex> lk(g_dr.mu);
+    if (g_dr.pend.empty()) g_dr.first_submit = std::chrono::steady_clock::now();
+    g_dr.pend.push_back(&req);
+    if ((int)g_dr.pend.size() >= g_dr.active && !g_dr.executing)
+      am_exec = g_dr.executing = true;  // everyone is in: run the round
+  }
+  g_turn.release();  // let the peers' rounds run while we wait
+  if (!am_exec) {
+    std::unique_lock<std::mutex> lk(g_dr.mu);
+    for (;;) {
+      if (req.done) break;
+      if (!g_dr.executing) {
+        // The round completed without us (a peer left its loop), or the wait
+        // window elapsed: run what we have instead of waiting forever.
+        if ((int)g_dr.pend.size() >= g_dr.active ||
+            std::chrono::steady_clock::now() - g_dr.first_submit >=
+                std::chrono::milliseconds(g_dr_wait_ms)) {
+          am_exec = g_dr.executing = true;
+          if ((int)g_dr.pend.size() < g_dr.active) g_dr.timeouts++;
+          break;
+        }
+        g_dr.cv.wait_until(lk, g_dr.first_submit +
+                                   std::chrono::milliseconds(g_dr_wait_ms));
+      } else {
+        g_dr.cv.wait(lk);
+      }
+    }
+    lk.unlock();
+  }
+  if (am_exec) dr_execute(m);
+  g_turn.acquire();
+  m.bind(tl_slot);
+  borrow_abort_check();
+  return !req.dropped;
+}
+
 // GpuModel::kv_starve_fn (pool dry after rckpt eviction), GPU owner only.
 static bool starve(GpuModel& m) {
   const int cur = tl_slot;
@@ -2864,6 +3005,10 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
             };
             {
               VrActive vr_act;  // rendezvous membership; every exit counts
+              // D2-S3c: draft rendezvous membership, same scope and exit
+              // discipline. dr_worker_ok is the submit predicate too, so the
+              // count never includes a worker that cannot submit.
+              DrActive dr_act(m.dr_worker_ok());
               m.spec_loop(cur, g.max_tokens - 1, spec_gamma, emit);
             }
           }
@@ -3263,6 +3408,21 @@ static int run(GpuModel& m, const std::string& host, int port) {
       // themselves — they never submit and would stall the trigger).
       m.vseg_round_enter_fn = &vseg_round_enter;
       m.vseg_round_exit_fn = &vseg_round_exit;
+    }
+    // D2-S3c draft rendezvous: opt out with QWENOX_NO_DR=1 (serial per-slot
+    // draft bursts, the pre-S3c behavior). QWENOX_DR_WAIT_MS bounds how long
+    // a submitter waits for stragglers before running the round itself.
+    static const bool no_dr =
+        getenv("QWENOX_NO_DR") && !GpuModel::env_zero("QWENOX_NO_DR");
+    if (!no_dr) {
+      m.dr_pool_fn = &dr_pool;
+      m.dr_round_enter_fn = &dr_round_enter;
+      m.dr_round_exit_fn = &dr_round_exit;
+    }
+    if (const char* v = getenv("QWENOX_DR_WAIT_MS")) {
+      g_dr_wait_ms = atoi(v);
+      if (g_dr_wait_ms < 1) g_dr_wait_ms = 1;
+      if (g_dr_wait_ms > 5000) g_dr_wait_ms = 5000;
     }
     if (const char* v = getenv("QWENOX_VR_WAIT_MS")) {
       g_vr_wait_ms = atoi(v);
