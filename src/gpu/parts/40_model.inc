@@ -435,6 +435,9 @@ struct GpuModel {
   int mtp_pos = 0;             // host mirror of the MTP stream position
   float* d_mR = nullptr;       // MTP hyper stream (10240)
   float* d_mRhat = nullptr;    // MTP normed stream (10240)
+  // S3c: d_mR 入 SLOT_FIELDS 后指向本池的第 bound_ 行（[nslots][10240] 连续，
+  // 供 draft 跨槽合批按行直读）；nslots==1 时为空、d_mR 用构造器独立分配。
+  float* d_mRpool = nullptr;
   float* d_mh = nullptr;       // input h-path accumulator (2560)
   float* d_me = nullptr;       // input e-path normed embed (2560)
   float* d_meo = nullptr;      // input e-path fc_embedding out (2560)
@@ -563,7 +566,7 @@ struct GpuModel {
   X(mrope_active_) X(rope_delta_) X(mrope_pos_) X(mrope_grids_) X(d_rdelta)   \
   X(img_inj) X(img_hash_) X(d_img_emb) X(img_emb_rows) X(img_emb_cap)         \
   X(mtp_tap_capture) X(spec_snap) X(vsnap_row0_) X(ngram_verify_active)       \
-  X(cut_abs) X(cut_r_) X(cut_hit) X(cut_mtp_hit)                              \
+  X(cut_abs) X(cut_r_) X(cut_hit) X(cut_mtp_hit) X(d_mR)                      \
   X(prog_total) X(prog_base) X(prog_last_est) X(prog_req) X(prog_t0)          \
   X(prog_last) X(last_spec_rounds) X(last_spec_commit) X(last_spec_rollbacks) \
   X(last_spec_proposed) X(live_spec_rounds) X(live_spec_commits)              \
@@ -9234,6 +9237,13 @@ struct GpuModel {
     const size_t sS = ngdn * 48 * 128 * 128 * 4, sC = ngdn * 3 * 10240 * 4,
                  sRing = (size_t)9 * 10240 * 4, sIraw = nqsa * 4 * 128 * 4;
     slots_.resize((size_t)n);
+    if (mtp_avail) {
+      // S3c Stage 1: per-slot MTP 流（d_mR 加入 SLOT_FIELDS，bind 时换指针）。
+      // 连续池 [n][rb] 而非分散分配：Stage 2 的跨槽合批 draft 按行直读本池。
+      // 单槽路径（slots_init 不运行）仍用构造器的独立 d_mR。
+      DALLOC(&d_mRpool, (size_t)n * rb * 4);
+      d_mR = d_mRpool;  // 绑定槽 0 用第 0 行；构造器那份（rb*4）弃置
+    }
     for (int i = 1; i < n; i++) {
       SeqState& t = slots_[(size_t)i];
       DALLOC(&t.d_R, rb * 4);
@@ -9264,6 +9274,7 @@ struct GpuModel {
       if (mtp_avail) {
         DALLOC(&t.d_mpos, 4);
         CK(hipMemset(t.d_mpos, 0, 4));
+        t.d_mR = d_mRpool + (size_t)i * rb;  // S3c: 第 i 行
         // the MTP KV / keys live in the shared pool (layer nqsa, B0)
         if (d_miraw) {
           DALLOC(&t.d_miraw, 4 * 128 * 4);
