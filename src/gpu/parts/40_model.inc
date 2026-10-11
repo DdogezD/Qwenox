@@ -188,6 +188,17 @@ struct GpuModel {
   void (*vseg_round_exit_fn)() = nullptr;
   void vseg_round_enter() { if (vseg_round_enter_fn) vseg_round_enter_fn(); }
   void vseg_round_exit() { if (vseg_round_exit_fn) vseg_round_exit_fn(); }
+  // D2-S3c: draft rendezvous pool (serve mode). Non-null dr_pool_fn reroutes
+  // the spec loops' serial per-slot draft burst into the pool (one batched
+  // cross-slot pass per step, bit-identical); false = the caller runs the
+  // serial burst itself. dr_round_enter/exit_fn: loop-scope membership, same
+  // discipline as the verify pool.
+  struct DrSeg;
+  bool (*dr_pool_fn)(GpuModel&, const DrSeg&) = nullptr;
+  void (*dr_round_enter_fn)() = nullptr;
+  void (*dr_round_exit_fn)() = nullptr;
+  void dr_round_enter() { if (dr_round_enter_fn) dr_round_enter_fn(); }
+  void dr_round_exit() { if (dr_round_exit_fn) dr_round_exit_fn(); }
   // S3b: 48 = kVSnapRows。会合 verify 批作为 borrower 在借用窗口内直接跑
   // verify_segments（不经 conc_rmax_ 闸门），S3a 把行预算升到 48 后 32 行的
   // 小工作区会被越界写（B=8 下 "unspecified launch failure"）。
@@ -489,6 +500,7 @@ struct GpuModel {
   size_t ckpt_S = 0, ckpt_convst = 0, ckpt_ring = 0, ckpt_iraw = 0;
   float* d_mring_ckpt = nullptr;  // 512 floats
   int* d_argmax_arr = nullptr;    // per-row verify argmax (<= 65 rows)
+  int* d_tokmat = nullptr;  // D2-S3c: [8 step][8 row] batched draft argmax
   unsigned long long* d_amx_cand = nullptr;  // two-stage argmax scratch
   // GPU sampling prep (spec sampling fast path): correction lists, radix
   // top-k scratch and per-row candidate blocks. Rows are capped at 65 (ngram
@@ -5860,6 +5872,15 @@ struct GpuModel {
     int base;
   };
 
+  // D2-S3c: one worker's draft-round submission to the rendezvous pool:
+  // slot drafts g tokens from (slot d_R, tok0); drafts receives g ints.
+  struct DrSeg {
+    int slot;
+    int g;
+    int tok0;
+    int* drafts;  // worker stack
+  };
+
   // D2-S1c: the multi-segment verify chunk. Guards (any failure -> false, the
   // caller falls back to serial): nseg in [1,8], P_s in [1,8], R <= kVSnapRows
   // rows,
@@ -6133,6 +6154,78 @@ struct GpuModel {
     gemv(wview(ckpt.at(buf)), d_attn, y);
   }
 
+  // D2-S3c: mtp_qsa on an explicit (possibly unbound) slot -- the batched
+  // draft executor runs these serially per member without bind(). Identical
+  // launches to mtp_qsa with d_mpos/d_miraw/d_rdelta/kvpt() swapped for the
+  // slot's own state; d_mik/d_mkc{b,f}/d_mvc{b,f} are shared pool layer
+  // views, so they stay.
+  template <typename KVT>
+  void mtp_qsa_attn_slot(int s, const KVT* kc, const KVT* vc) {
+    auto* const mp = slot_d_mpos(s);
+    const auto* const pt = kv_paged ? slot_d_ptab(s) : nullptr;
+    k_qsa_flash<true, false, KVT, true>
+        <<<dim3(QSA_DEC_NSPLIT, 2), 128, 0, g_str>>>(
+            d_qs, kc, vc, d_attn, 1, 256, 2, 24,
+            qsa_dense ? nullptr : d_iselected, 0, mp, d_pacc, d_pml, 0, pt);
+    k_qsa_flash_combine<<<dim3(12, 2), 64, 0, g_str>>>(d_pml, d_pacc, d_attn,
+                                                       12, 256, mp);
+  }
+  void mtp_qsa_slot(int s, const float* x, float* y) {
+    const char* pfx = "mtp.layers.0.self_attn";
+    char buf[128];
+    auto* const mp = slot_d_mpos(s);
+    auto* const ir = slot_d_miraw(s);
+    const auto* const rd = slot_d_rdelta(s);
+    const auto* const pt = kv_paged ? slot_d_ptab(s) : nullptr;
+    ensure_rope_tab(g_cfg.rope_theta, g_cfg.rotary_dim);
+    if (!qsa_dense) {
+      snprintf(buf, sizeof buf, "%s.indexer.index_qk_proj.weight", pfx);
+      gemv(wview(ckpt.at(buf)), x, d_iproj);
+      k_index_q<<<dim3(1, 4), 128, 0, g_str>>>(d_iproj, d_minorm, d_iq, 1,
+                                               g_cfg.norm_eps, g_cfg.rope_theta,
+                                               mp, 0, nullptr, rd);
+      k_index_append<<<1, 128, 0, g_str>>>(d_iproj, d_minorm + 128, ir,
+                                           d_mik, mp, g_cfg.norm_eps,
+                                           g_cfg.rope_theta, rd, pt,
+                                           d_ikh ? d_ikh + (size_t)(g_cfg.layers / 4) *
+                                                       ik_layer_blocks * 128
+                                                 : nullptr);
+      k_index_scores<<<(index_blocks + 3) / 4, 128, 0, g_str>>>(
+          d_iq, d_mik, d_iscores, index_blocks, mp, pt);
+      index_select(d_iscores, index_blocks, d_iselected, 0, 1, mp);
+    }
+    snprintf(buf, sizeof buf, "%s.q_proj.weight", pfx);
+    gemv(wview(ckpt.at(buf)), x, d_qg);
+    snprintf(buf, sizeof buf, "%s.k_proj.weight", pfx);
+    gemv(wview(ckpt.at(buf)), x, d_kb);
+    snprintf(buf, sizeof buf, "%s.v_proj.weight", pfx);
+    gemv(wview(ckpt.at(buf)), x, d_vb);
+    snprintf(buf, sizeof buf, "%s.q_norm.weight", pfx);
+    float* qnw = ensure_norm256(buf);
+    snprintf(buf, sizeof buf, "%s.k_norm.weight", pfx);
+    float* knw = ensure_norm256(buf);
+    k_qsa_qsplit<<<dim3(24, 1), 256, 0, g_str>>>(d_qg, qnw, d_qs, d_gs, 256,
+                                                 g_cfg.norm_eps);
+    k_rmsnorm_zc_grouped<<<2, 256, 0, g_str>>>(d_kb, knw, d_kb, 256,
+                                               g_cfg.norm_eps, 1);
+    k_rope<<<(24 * 32 + 127) / 128, 128, 0, g_str>>>(d_qs, 24, 256, 64, mp,
+                                                     g_cfg.rope_theta, rd);
+    k_rope<<<(2 * 32 + 127) / 128, 128, 0, g_str>>>(d_kb, 2, 256, 64, mp,
+                                                    g_cfg.rope_theta, rd);
+    if (qsa_kv_fp32) {
+      k_store_kv<<<2, 256, 0, g_str>>>(d_kb, d_vb, d_mkcf, d_mvcf, mp, pt);
+      mtp_qsa_attn_slot(s, d_mkcf, d_mvcf);
+    } else {
+      k_store_kv_bf16<<<2, 256, 0, g_str>>>(d_kb, d_vb, d_mkcb, d_mvcb, mp,
+                                            nullptr, pt);
+      mtp_qsa_attn_slot(s, d_mkcb, d_mvcb);
+    }
+    k_sigmoid_gate<<<(24 * 256 + 255) / 256, 256, 0, g_str>>>(d_attn, d_gs,
+                                                              d_attn, 24 * 256);
+    snprintf(buf, sizeof buf, "%s.o_proj.weight", pfx);
+    gemv(wview(ckpt.at(buf)), d_attn, y);
+  }
+
   // MTP MoE step (mirrors moe()).
   void mtp_moe(const float* x, float* y) {
     const char* pfx = "mtp.layers.0.mlp";
@@ -6313,6 +6406,183 @@ struct GpuModel {
     k_gr_write_b<<<(P * 2560 + 255) / 256, 256, 0, g_str>>>(d_w4b, d_mRb, d_yb,
                                                             g_cfg.d,
                                                             g_cfg.branches, P);
+  }
+
+  // ---- D2-S3c: batched cross-slot draft (rendezvous executor) ----------
+  // mtp_gr_read_d/write_d are mtp_step's GR read/write lifted to P rows.
+  // Unlike mtp_gr_read_b/write_b (prefill ingest; bf16 gemm x), these stay
+  // on the fp32 multi-row gemv (P <= 8: k_q4cp_gemv_mr -- per-row
+  // bit-identical to the serial k_q4cp_gemv), so a batched draft round
+  // matches the serial per-slot mtp_step bursts bit for bit.
+  void mtp_gr_read_d(const std::string& prefix, int P) {
+    char buf[128];
+    float* hw = ensure_hcnorm(prefix);
+    k_rmsnorm_zc_grouped<<<4 * P, 1024, 0, g_str>>>(d_mRb, hw, d_mRhatb, 2560,
+                                                    g_cfg.norm_eps, 4);
+    snprintf(buf, sizeof buf, "%s.input_mix_weight_down.weight",
+             prefix.c_str());
+    gemm(wview(ckpt.at(buf)), d_mRhatb, d_t320b, P);
+    k_silu_scale<<<(P * 320 + 255) / 256, 256, 0, g_str>>>(d_t320b, 0.25f,
+                                                           P * 320);
+    snprintf(buf, sizeof buf, "%s.input_mix_weight_up.weight", prefix.c_str());
+    gemm(wview(ckpt.at(buf)), d_t320b, d_Gb, P);
+    k_sigmoid_inplace<<<(unsigned)(((size_t)P * 10240 + 255) / 256), 256, 0,
+                        g_str>>>(d_Gb, P * 10240);
+    k_gr_combine_b<<<(P * 2560 + 255) / 256, 256, 0, g_str>>>(
+        d_Gb, d_mRhatb, d_xb, g_cfg.d, g_cfg.branches, P);
+    if (xf16_src == d_xb) xf16_src = nullptr;  // d_xb clobbered
+  }
+  void mtp_gr_write_d(const std::string& prefix, int P) {
+    char buf[128];
+    snprintf(buf, sizeof buf, "%s.block_inject_weight.weight", prefix.c_str());
+    gemm(wview(ckpt.at(buf)), d_mRhatb, d_w4b, P);
+    k_gr_write_b<<<(P * 2560 + 255) / 256, 256, 0, g_str>>>(d_w4b, d_mRb, d_yb,
+                                                            g_cfg.d,
+                                                            g_cfg.branches, P);
+  }
+
+  // One-time gate: every gemm on the batched path must land on the fp32
+  // multi-row gemv, whose per-row results must be bit-identical to the
+  // serial single-row gemv. Established for q4cp (k_q4cp_gemv_mr shares the
+  // v3 fma order and reduction tree), q8g64 (same per-row math in
+  // k_q8g64_gemv_mr) and ht/q6g64 (ktest 1h locks gemv_multi row invariance
+  // for P=1..48 on the full production shape family). q8g32/bf16 multi-row
+  // kernels are NOT proven against their serial gemv -> keep the serial
+  // per-slot burst for those.
+  bool mtp_draft_batch_ok() {
+    if (dr_ok_ >= 0) return dr_ok_ > 0;
+    bool ok = !qsa_dense && draft_vocab <= 0 && !getenv("QWENOX_NO_GEMVMR") &&
+              gemvmr_maxp() >= 8;
+    const char* wts[] = {
+        "mtp.fc_embedding.weight",
+        "mtp.fc_hidden.weight",
+        "mtp.layers.0.attn_hyper_connection.input_mix_weight_down.weight",
+        "mtp.layers.0.attn_hyper_connection.input_mix_weight_up.weight",
+        "mtp.layers.0.attn_hyper_connection.block_inject_weight.weight",
+        "mtp.layers.0.mlp_hyper_connection.input_mix_weight_down.weight",
+        "mtp.layers.0.mlp_hyper_connection.input_mix_weight_up.weight",
+        "mtp.layers.0.mlp_hyper_connection.block_inject_weight.weight",
+        "mtp.hyper_connection_mixer.input_mix_weight_down.weight",
+        "mtp.hyper_connection_mixer.input_mix_weight_up.weight",
+    };
+    auto dr_dtype_ok = [](uint32_t dt) {
+      return dt == 5 || dt == 7 || dt == 16 || dt == 24;
+    };
+    for (const char* w : wts)
+      if (ok && !dr_dtype_ok(wview(ckpt.at(w)).dtype)) ok = false;
+    if (ok && !dr_dtype_ok((dlm_on ? w_dlm : wview(ckpt.at("lm_head.weight"))).dtype))
+      ok = false;
+    dr_ok_ = ok ? 1 : 0;
+    return ok;
+  }
+  int dr_ok_ = -1;
+  // Would this worker join the draft rendezvous for this request? The
+  // membership count (DrActive/DrLoop) and the submit checks must use this
+  // one predicate, else the all-arrived trigger stalls to the timeout.
+  bool dr_worker_ok() {
+    return dr_pool_fn && mtp_draft_batch_ok() && !mrope_active_;
+  }
+
+  // Run one draft round for n slots as a per-step batch. segs[i]: slot s_i
+  // drafts g_i tokens from (slot_d_R(s_i), tok0_i). Step j batches the
+  // members {i : g_i > j} through the P-row buffers; QSA/MoE run serially
+  // per member on its own slot state via the slot accessors (no bind).
+  // Every kernel is per-row identical to the serial mtp_step chain, so the
+  // drafts -- and therefore the accept stats -- match the serial burst bit
+  // for bit. Guards run before any GPU work; a refusal (false) leaves every
+  // slot untouched and the callers fall back to their serial bursts.
+  bool mtp_draft_batch(const DrSeg* segs, int n) {
+    if (!segs || n < 1 || n > 8 || n > maxbatch || ws_lent_) return false;
+    if (!mtp_draft_batch_ok()) return false;
+    int gmax = 0;
+    for (int i = 0; i < n; i++) {
+      const int s = segs[i].slot;
+      if (s < 0 || s >= nslots || segs[i].g < 1 || segs[i].g > 8 ||
+          !segs[i].drafts)
+        return false;
+      if (slot_mrope_active_(s) || slot_mtp_tap_capture(s) ||
+          slot_prog_total(s) > 0)
+        return false;
+      gmax = std::max(gmax, segs[i].g);
+    }
+    if (!d_tokmat) DALLOC(&d_tokmat, 64 * sizeof(int));
+    const int rb = g_cfg.branches * g_cfg.d;
+    int lists[8][8];  // step j's member seg indices (submission order)
+    int ln[8];
+    for (int j = 0; j < gmax; j++) {
+      int cur[8], prow[8], B = 0;
+      if (j == 0) {
+        for (int i = 0; i < n; i++) { cur[B] = i; prow[B] = -1; B++; }
+      } else {
+        for (int r = 0; r < ln[j - 1]; r++)
+          if (segs[lists[j - 1][r]].g > j) {
+            cur[B] = lists[j - 1][r];
+            prow[B] = r;
+            B++;
+          }
+      }
+      for (int r = 0; r < B; r++) lists[j][r] = cur[r];
+      ln[j] = B;
+      // mtp_step's per-slot prologue: map the MTP KV row, upload the position
+      for (int r = 0; r < B; r++) {
+        const int s = segs[cur[r]].slot;
+        const int mp = slot_mtp_pos(s);
+        kv_prepare_seq(slot_kv_seq(s), slot_d_ptab(s), mp, mp + 1);
+        CK(hipMemcpyAsync(slot_d_mpos(s), &mp, 4, hipMemcpyHostToDevice,
+                          g_str));
+      }
+      // tokens: step 0 takes the committed token from the host; later steps
+      // gather each member's own previous argmax out of the token matrix
+      if (j == 0) {
+        int t0[8];
+        for (int r = 0; r < B; r++) t0[r] = segs[cur[r]].tok0;
+        CK(hipMemcpyAsync(d_tokarr, t0, (size_t)B * 4, hipMemcpyHostToDevice,
+                          g_str));
+      } else {
+        for (int r = 0; r < B; r++)
+          CK(hipMemcpyAsync(d_tokarr + r, d_tokmat + (j - 1) * 8 + prow[r], 4,
+                            hipMemcpyDeviceToDevice, g_str));
+      }
+      // taps: step 0 reads the trunk h (slot d_R), later steps the slot's
+      // own draft R (scattered back to its home row at each step's end)
+      for (int r = 0; r < B; r++) {
+        const float* src = j == 0 ? slot_d_R(segs[cur[r]].slot)
+                                  : slot_d_mR(segs[cur[r]].slot);
+        CK(hipMemcpyAsync(d_mtap + (size_t)r * rb, src, (size_t)rb * 4,
+                          hipMemcpyDeviceToDevice, g_str));
+      }
+      mtp_input_b(d_mtap, B);
+      mtp_gr_read_d("mtp.layers.0.attn_hyper_connection", B);
+      for (int r = 0; r < B; r++)
+        mtp_qsa_slot(segs[cur[r]].slot, d_xb + (size_t)r * 2560,
+                     d_yb + (size_t)r * 2560);
+      mtp_gr_write_d("mtp.layers.0.attn_hyper_connection", B);
+      mtp_gr_read_d("mtp.layers.0.mlp_hyper_connection", B);
+      for (int r = 0; r < B; r++)
+        mtp_moe(d_xb + (size_t)r * 2560, d_yb + (size_t)r * 2560);
+      mtp_gr_write_d("mtp.layers.0.mlp_hyper_connection", B);
+      mtp_gr_read_d("mtp.hyper_connection_mixer", B);
+      WView lm = dlm_on ? w_dlm : wview(ckpt.at("lm_head.weight"));
+      gemm(lm, d_xb, d_logits_b, B);
+      argmax_rows(d_logits_b, g_cfg.vocab, B, d_amx_cand, d_tokmat + j * 8,
+                  g_str);
+      for (int r = 0; r < B; r++) {
+        const int s = segs[cur[r]].slot;
+        CK(hipMemcpyAsync(slot_d_mR(s), d_mRb + (size_t)r * rb, (size_t)rb * 4,
+                          hipMemcpyDeviceToDevice, g_str));
+        slot_mtp_pos(s)++;
+        // draft 1's indexer ring rows are truth; later steps pollute them
+        if (j == 0)
+          CK(hipMemcpyAsync(slot_d_mring_ckpt(s), slot_d_miraw(s), 512 * 4,
+                            hipMemcpyDeviceToDevice, g_str));
+      }
+    }
+    int host[64];
+    CK(hipMemcpy(host, d_tokmat, sizeof host, hipMemcpyDeviceToHost));
+    for (int j = 0; j < gmax; j++)
+      for (int r = 0; r < ln[j]; r++)
+        segs[lists[j][r]].drafts[j] = host[j * 8 + r];
+    return true;
   }
 
   // Batch QSA for the MTP layer (mirrors qsa_b flash path).
@@ -7238,6 +7508,10 @@ struct GpuModel {
     out.reserve(gen + 1);
     GammaCtl gctl(gamma, false);
     std::vector<int> drafts(8), v(9);
+    // D2-S3c: submit this loop's draft bursts to the rendezvous pool when
+    // wired and batch-safe (the serve call site counts membership with the
+    // same predicate -- see dr_worker_ok).
+    const bool dr_join = dr_worker_ok();
     int depth_hits[8] = {0}, depth_tot[8] = {0};
     int rounds = 0, rollbacks = 0;
     double t_draft = 0, t_verify = 0, t_roll = 0, t_ingest = 0;
@@ -7261,6 +7535,12 @@ struct GpuModel {
       mtp_ckpt_save();
       if (d_iraw) vg_dump_buf("irC", 2, d_iraw, 512 * 4);  // P3-B bisect
       auto t0 = std::chrono::steady_clock::now();
+      // D2-S3c: hand the whole draft burst to the rendezvous pool (one
+      // batched cross-slot pass per step, bit-identical to the serial burst
+      // below); false = this round keeps the serial burst.
+      const bool dr_done =
+          dr_join && dr_pool_fn(*this, DrSeg{bound_, g, cur, drafts.data()});
+      if (!dr_done) {
       // draft 1 used the committed (h_q, cur): its indexer ring rows are
       // truth. Later drafts pollute the ring; save/restore around them.
       if (draft_desync) {
@@ -7277,6 +7557,7 @@ struct GpuModel {
         CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4, hipMemcpyDeviceToDevice,
                           g_str));
         for (int j = 1; j < g; j++) drafts[j] = mtp_step(d_mR, drafts[j - 1]);
+      }
       }
       auto t1 = std::chrono::steady_clock::now();
       if (d_iraw) vg_dump_buf("irD", 2, d_iraw, 512 * 4);  // P3-B bisect
@@ -7502,6 +7783,25 @@ struct GpuModel {
       VrExcuse(GpuModel& m) : m(m) { m.vseg_round_exit(); }
       ~VrExcuse() { m.vseg_round_enter(); }
     };
+    // D2-S3c: draft rendezvous membership mirrors the verify one -- ngram
+    // rounds never submit an MTP draft, so they excuse themselves per round.
+    const bool dr_on = dr_round_enter_fn && dr_worker_ok();
+    struct DrLoop {
+      GpuModel& m;
+      bool on;
+      DrLoop(GpuModel& m, bool on) : m(m), on(on) {
+        if (on) m.dr_round_enter();
+      }
+      ~DrLoop() { if (on) m.dr_round_exit(); }
+    } dr_loop(*this, dr_on);
+    struct DrExcuse {
+      GpuModel& m;
+      bool on;
+      DrExcuse(GpuModel& m, bool on) : m(m), on(on) {
+        if (on) m.dr_round_exit();
+      }
+      ~DrExcuse() { if (on) m.dr_round_enter(); }
+    };
     while ((int)out.size() < gen && pos < maxctx) {
       yield_point();  // round top: only persistent slot state is live
       if (chist.size() != (size_t)pos)
@@ -7523,6 +7823,7 @@ struct GpuModel {
         // ---- ngram round: long draft, whole-state checkpoint + replay ----
         // Never submits to the rendezvous: excuse this worker for the round.
         VrExcuse vr_x(*this);
+        DrExcuse dr_x(*this, dr_on);
         const int base = pos;
         const size_t history_size = chist.size();
         // Stash h_{base-1} (d_R) for the MTP patch below: prefill_batch
@@ -7597,6 +7898,7 @@ struct GpuModel {
         // touch d_mtap — mtp_tap_capture is off outside prefill).
         // Never submits to the rendezvous: excuse this worker for the round.
         VrExcuse vr_x(*this);
+        DrExcuse dr_x(*this, dr_on);
         CK(hipMemcpyAsync(d_mtap, d_R, 10240 * 4, hipMemcpyDeviceToDevice,
                           g_str));
         int cur_c = cur, keep_round = 0;
@@ -7699,6 +8001,10 @@ struct GpuModel {
         size_t chist_sz = chist.size();
         mtp_ckpt_save();
         auto t0 = std::chrono::steady_clock::now();
+        // D2-S3c: rendezvous draft (see spec_loop); false -> serial burst.
+        const bool dr_done =
+            dr_on && dr_pool_fn(*this, DrSeg{bound_, g, cur, drafts.data()});
+        if (!dr_done) {
         // draft 1's indexer ring rows are truth; later drafts pollute them.
         if (draft_desync) {
           mtp_step(d_R, cur, nullptr, true, nullptr, d_argmax_arr);
@@ -7714,6 +8020,7 @@ struct GpuModel {
           CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4,
                             hipMemcpyDeviceToDevice, g_str));
           for (int j = 1; j < g; j++) drafts[j] = mtp_step(d_mR, drafts[j - 1]);
+        }
         }
         std::vector<int> vt;
         vt.reserve(g + 1);
