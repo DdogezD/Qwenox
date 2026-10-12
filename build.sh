@@ -48,7 +48,7 @@ mkdir -p build
 exec 9>build/.build.lock
 flock -n 9 || { echo '本目录已有编译任务在运行' >&2; exit 1; }
 exec 8>"${XDG_RUNTIME_DIR:-/run/user/$UID}/hgn-work.lock"
-flock -n 8 || { echo '另一个 gfx1151-engine 编译或启动任务正在运行' >&2; exit 1; }
+flock -n 8 || { echo '另一个 Qwenox 编译或启动任务正在运行' >&2; exit 1; }
 
 GPU_ARCH="${GPU_ARCH:-gfx1151}"
 if [[ "$TARGET" != api ]]; then

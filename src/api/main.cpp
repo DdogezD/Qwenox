@@ -3490,7 +3490,7 @@ int main(int argc, char** argv) {
     if (g_tray_mode) {
         // 防多开（--console 不受限：脚本场景由端口占用兜底）。必须在 listen 之前：
         // Windows 的 SO_REUSEADDR 允许后启动的实例抢绑同一端口。句柄不关，退出回收。
-        CreateMutexW(nullptr, FALSE, L"Local\\gfx1151-qwenox-api");
+        CreateMutexW(nullptr, FALSE, L"Local\\Qwenox-api");
         if (GetLastError() == ERROR_ALREADY_EXISTS) {
             mb_qwenox("Qwenox is already running (check the tray icon in the "
                       "taskbar corner, possibly under the ^ overflow).\n"
