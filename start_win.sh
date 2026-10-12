@@ -33,11 +33,25 @@ esac
 # 无需 TheRock/ROCm 运行库，也不需要 HIP_PATH/ROCM_PATH（已断根实测）。
 
 MODEL_DIR="${MODEL_DIR:-./models}"
+# 权重版本：service.conf 的 "# start_win: weights=gguf" 标记（设置页/网页选 GGUF
+# 时写入）或环境变量 WEIGHTS=gguf → 用 GGUF_FILE 首分片纯 GGUF 启动，与托盘
+# qwenox-win 的 enginesup::start 同一语义。
+WEIGHTS="${WEIGHTS:-$(sed -n 's/^# start_win: weights=\([a-z0-9]*\).*/\1/p' service.conf 2>/dev/null | head -1)}"
+if [[ "$WEIGHTS" == gguf ]]; then
+  [[ -n "${GGUF_FILE:-}" ]] || fail 'weights=gguf 但 GGUF_FILE 未设置（填第 1 个分片 *-00001-of-0000N.gguf）'
+  MODEL_FILE="$GGUF_FILE"
+  NGRAM_FILE="$GGUF_FILE"
+  OVERLAY_FILE=
+  GGUF_MTP_FILE="${GGUF_MTP_FILE-}"
+  VISION_FILE="${GGUF_VISION_FILE-}"
+  MTP_FILE=
+else
 MODEL_FILE="${MODEL_FILE:-$MODEL_DIR/heretic.hgn}"
 # PLE n-gram 表所在文件：默认同 MODEL_FILE（w4b 单文件）；v2 指向独立的 *-ngram.hgn。
 NGRAM_FILE="${NGRAM_FILE:-$MODEL_FILE}"
 MTP_FILE="${MTP_FILE-$MODEL_DIR/heretic-mtp.hgn}"
 VISION_FILE="${VISION_FILE-$MODEL_DIR/heretic-vision.hgn}"
+fi
 # 覆盖层（可选的高精度替换张量）：默认空=不叠加；非空但文件不存在则警告并跳过。
 OVERLAY_FILE="${OVERLAY_FILE-}"
 TOKENIZER_DIR="${TOKENIZER_DIR:-$MODEL_DIR/tokenizer}"
@@ -100,6 +114,9 @@ awk "BEGIN { exit !($ROPE_FACTOR > 1 || $MAX_CONTEXT <= $ROPE_ORIGINAL_CTX) }" |
 [[ -r "$MODEL_FILE" ]] || fail "找不到模型：$MODEL_FILE"
 [[ -r "$NGRAM_FILE" ]] || fail "找不到 n-gram 表：$NGRAM_FILE（w4b 与 MODEL_FILE 相同）"
 [[ -z "$MTP_FILE" || -r "$MTP_FILE" ]] || fail "找不到 MTP 权重：$MTP_FILE"
+if [[ "$WEIGHTS" == gguf ]]; then
+  [[ -z "$GGUF_MTP_FILE" || -r "$GGUF_MTP_FILE" ]] || fail "找不到 GGUF MTP sidecar：$GGUF_MTP_FILE"
+fi
 [[ -z "$VISION_FILE" || -r "$VISION_FILE" ]] || fail "找不到视觉塔：$VISION_FILE（纯文本可设 VISION_FILE=\"\"）"
 if [[ -n "$OVERLAY_FILE" && ! -r "$OVERLAY_FILE" ]]; then  # 可选：只警告并跳过
   echo "警告：找不到 overlay：$OVERLAY_FILE，已跳过（v2 权重不用 overlay；不想看到这条可设 OVERLAY_FILE=\"\"）" >&2
@@ -113,7 +130,7 @@ for port in "$ENGINE_PORT" "$API_PORT"; do
   fi
 done
 echo "项目：$ROOT"
-echo "模型：$MODEL_FILE"
+echo "模型：$MODEL_FILE$([[ "$WEIGHTS" == gguf ]] && echo "（GGUF，MTP：${GGUF_MTP_FILE:-不使用}）")"
 echo "配置：${MAX_CONTEXT} 上下文，MTP gamma=$([[ $MTP_GAMMA == 0 ]] && echo 'auto（greedy 4 / 采样自适应）' || echo "$MTP_GAMMA")，engine ${ENGINE_HOST}:${ENGINE_PORT}，API ${API_HOST}:${API_PORT}"
 if (( KV_PAGED )); then
   echo "KV：分页，页池 $(( (KV_POOL_TOKENS > MAX_CONTEXT ? KV_POOL_TOKENS : MAX_CONTEXT) )) token（${PARALLEL} 路并发共享），RAM 检查点 ${RCKPT_MAX} 个"
@@ -151,6 +168,11 @@ export QWENOX_ROPE_ORIGINAL_CTX="$ROPE_ORIGINAL_CTX"
 export QWENOX_ROPE_BETA_FAST="$ROPE_BETA_FAST"
 export QWENOX_ROPE_BETA_SLOW="$ROPE_BETA_SLOW"
 export QWENOX_ROPE_ATTN_SCALE="$ROPE_ATTN_SCALE"
+unset QWENOX_GGUF QWENOX_GGUF_DENSE QWENOX_GGUF_PLE QWENOX_GGUF_EXPERTS QWENOX_GGUF_MTP
+if [[ "$WEIGHTS" == gguf ]]; then
+  # MTP sidecar 由环境给出：空 = none（不投机，也不自动找 mtp-*.gguf）
+  export QWENOX_GGUF_MTP="${GGUF_MTP_FILE:-none}"
+fi
 
 mkdir -p logs
 ENGINE_LOG="logs/engine-win-$(date +%Y%m%d-%H%M%S).log"

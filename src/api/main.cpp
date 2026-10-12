@@ -1353,7 +1353,7 @@ void handle_overrides_post(const http::Request& q, http::Response* r, http::Stre
 // 版本选择持久化为注释行 "# start_win: weights=v1|v2|gguf"；无标记时按
 // NGRAM_FILE 是否跟随 MODEL_FILE 推断 V1/V2（GGUF 只能来自标记）。
 // 保存语义：V1 强制 NGRAM_FILE=$MODEL_FILE；V2 强制 OVERLAY_FILE 置空；
-// GGUF 只写 GGUF_*（Windows 启停只吃 hgn 键，GGUF 配置供 Linux 脚本用）。
+// GGUF 只写 GGUF_*（Windows 启停按标记 weights=gguf 改用 GGUF_* 键，enginesup::start）。
 
 const char* kWeightsMarker = "# start_win: weights=";
 
@@ -1618,6 +1618,7 @@ void handle_engine_start(const http::Request& q, http::Response* r, http::Stream
         std::lock_guard<std::mutex> lk(g_svc_conf_mtx);
         conf = g_svc_conf;
     }
+    conf[enginesup::kWeightsVerKey] = svcconf::conf_marker(g_conf_path, kWeightsMarker);
     std::string err;
     if (!svcconf::validate_conf(conf, &err)) http::fail(400, err);
     if (!enginesup::start(g_conf_root, conf, &err)) http::fail(400, err);
@@ -3603,7 +3604,9 @@ int main(int argc, char** argv) {
         hooks.api_log = g_api_log_abs;
         hooks.conf_snapshot = [] {
             std::lock_guard<std::mutex> lk(g_svc_conf_mtx);
-            return g_svc_conf;
+            svcconf::Conf c = g_svc_conf;
+            c[enginesup::kWeightsVerKey] = svcconf::conf_marker(g_conf_path, kWeightsMarker);
+            return c;
         };
         hooks.engine_endpoint = [] {
             return std::make_pair(eff_engine_host(), eff_engine_port());
