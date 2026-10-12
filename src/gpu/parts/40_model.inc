@@ -7259,6 +7259,11 @@ struct GpuModel {
   void batch_logits_device(int P) {
     gr_read_b("hyper_connection_mixer", P);
     const WView& lw = wview(ckpt.at("lm_head.weight"));
+    // QWENOX_DENSE_WMMA: k_ht_wmma takes all P <= 48 rows in one weight
+    // stream (rows are independent, so == the 8-row groups bit for bit).
+    if (lw.dtype == 16 && dense_wmma_on() &&
+        gemv_multi_q4cp(lw, d_xb, d_logits_b, P, 2560))
+      return;
     // The multi-row kernel is specialized for up to eight rows. Chunk larger
     // ngram proposals into groups of eight so lm_head weights are streamed
     // once per group instead of once per row.

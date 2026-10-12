@@ -399,7 +399,7 @@ __global__ __launch_bounds__(256) void k_ht_gemv(const uint8_t* __restrict__ cod
 // (gfx1151 B(k,c): lane c and lane 16+c both hold col c) -> one permlanex16
 // swap completes it. A(r,k) (r<8: lane 2r, r>=8: lane 17+2(r-8)) is read
 // from the f16 x^ chunk in LDS. C(r,c) = lane c + 16*(r>=8), elem r%8.
-// LDS: max(16*NPT*(tpc*128+8) f16 x^ chunk, P*128 f32 z).
+// LDS: max(P*(tpc*128+8) f16 x^ chunk, P*128 f32 z).
 typedef _Float16 htw_v16h __attribute__((ext_vector_type(16)));
 typedef float htw_v8f __attribute__((ext_vector_type(8)));
 namespace hv2 {
@@ -424,10 +424,9 @@ __global__ __launch_bounds__(256) void k_ht_wmma(const uint8_t* __restrict__ cod
                                                  int K, int nrows, int tpb, int tpc, int P,
                                                  float* __restrict__ zs, int* __restrict__ cnt) {
   extern __shared__ __align__(16) unsigned char hw_lds[];
-  __half* xh = (__half*)hw_lds;  // [16*NPT][RS] rotated x chunk (f16)
+  __half* xh = (__half*)hw_lds;  // [P][RS] rotated x chunk (f16), rows >= P not stored
   float* zl = (float*)hw_lds;    // after the loop: z [P][128]
   __shared__ int s_last;
-  constexpr int R16 = 16 * NPT;
   const int RS = tpc * 128 + 8;  // row stride (halves), +16 B against bank aliasing
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
   const int ty = blockIdx.x, kz = blockIdx.y;
@@ -453,25 +452,20 @@ __global__ __launch_bounds__(256) void k_ht_wmma(const uint8_t* __restrict__ cod
     if (tc == 0) {  // rotate the next chunk of x into LDS (t is block-uniform)
       const int nc = min(tpc, nt - t);
       if (t) __syncthreads();
-      for (int c = w; c < R16 * nc; c += 8) {
+      for (int c = w; c < P * nc; c += 8) {
         const int p = c / nc, u = c - p * nc;
         __half* dst = xh + (size_t)p * RS + u * 128;
-        if (p < P) {
-          const int col0 = (tx0 + t + u) * 128;
-          const TX* xr = x + (size_t)p * xs;
-          float v[4];
+        const int col0 = (tx0 + t + u) * 128;
+        const TX* xr = x + (size_t)p * xs;
+        float v[4];
 #pragma unroll
-          for (int j = 0; j < 4; j++) {
-            const int i = col0 + j * 32 + lane;
-            v[j] = hv2::ldx(xr, i) * suh[i];
-          }
-          hv2::fwht128(v[0], v[1], v[2], v[3], lane);
-#pragma unroll
-          for (int j = 0; j < 4; j++) dst[j * 32 + lane] = __float2half(v[j] * hv2::kRs128);
-        } else {
-#pragma unroll
-          for (int j = 0; j < 4; j++) dst[j * 32 + lane] = __float2half(0.f);
+        for (int j = 0; j < 4; j++) {
+          const int i = col0 + j * 32 + lane;
+          v[j] = hv2::ldx(xr, i) * suh[i];
         }
+        hv2::fwht128(v[0], v[1], v[2], v[3], lane);
+#pragma unroll
+        for (int j = 0; j < 4; j++) dst[j * 32 + lane] = __float2half(v[j] * hv2::kRs128);
       }
       __syncthreads();
     }
@@ -512,10 +506,12 @@ __global__ __launch_bounds__(256) void k_ht_wmma(const uint8_t* __restrict__ cod
       memcpy(&bf, bw, 32);
 #pragma unroll
       for (int pt = 0; pt < NPT; pt++) {
-        const __half* ap = xa + (size_t)pt * 16 * RS + g * 16;
-        uint4 a2[2];
-        a2[0] = *(const uint4*)ap;
-        a2[1] = *(const uint4*)(ap + 8);
+        uint4 a2[2] = {make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};  // rows >= P: zero
+        if (pt * 16 + qrowA < P) {
+          const __half* ap = xa + (size_t)pt * 16 * RS + g * 16;
+          a2[0] = *(const uint4*)ap;
+          a2[1] = *(const uint4*)(ap + 8);
+        }
         htw_v16h af;
         memcpy(&af, a2, 32);
         acc[pt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf, acc[pt]);
@@ -773,6 +769,173 @@ __global__ __launch_bounds__(256) void k_q6g64_gemv_sk(const uint8_t* __restrict
 template <int P>
 __global__ void k_q6g64_skred(const float* __restrict__ part, float* __restrict__ y,
                               uint64_t ys, int R, int ns) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= P * R) return;
+  const int p = i / R, r = i % R;
+  float v = part[(size_t)p * R + r];
+  for (int s = 1; s < ns; s++) v += part[((size_t)s * P + p) * R + r];
+  y[(size_t)p * ys + r] = v;
+}
+
+// --- k_q6g64_wmma: row-invariant WMMA q6g64 GEMV (dense WMMA, 10-12) -------
+// y[p][r] = sum_g sc_g[r] * (sum_k c_k x_pk) + bi_g[r] * (sum_k x_pk), 64-col
+// groups g. The 6-bit codes c (0..63) are exact in f16, so W is never rounded:
+// the per-group dot runs on v_wmma_f32_16x16x16_f16 (x -> f16 is the only new
+// rounding), scale / bias are applied per group in f32, and the bias term uses
+// the f32 group sum of the ORIGINAL x (fixed 8-lane tree). Block = 8 waves as
+// RW (16-row tiles) x KW (groups interleaved g = g0+kw, g0+kw+KW, ...), one K
+// slice of gps groups per blockIdx.y; KW partials summed in kw order in LDS,
+// slices summed in s order by k_q6g64_wred. RW/KW/gps/ns are functions of the
+// shape only and every output (p, r) only reads x row p -> row-invariant for
+// P = 1..16*NPT (any P, any position in the batch).
+// WMMA operands as k_ht_wmma: A = x rows (A(r,k): r<8 lane 2r, r>=8 lane
+// 17+2(r-8)), B = weight rows (lane c / 16+c: row c, each decodes 8 of the 16
+// cols, one permlanex16 swap), C(r,c) = lane c + 16*(r>=8), elem r%8.
+template <int NPT, int RW, int KW, typename TX>
+__global__ __launch_bounds__(256) void k_q6g64_wmma(const uint8_t* __restrict__ wq,
+                                                    const TX* __restrict__ x, uint64_t xs,
+                                                    float* __restrict__ out, uint64_t ys, int R,
+                                                    int C, int st, int gps, int P) {
+  static_assert(RW * KW == 8, "8 waves");
+  __shared__ float sxs[48 * 64];              // [p][gl] f32 group sums, gps <= 64
+  __shared__ float red[8][16 * NPT][16];      // per-wave partial tiles
+  const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+  const int rw = w / KW, kw = w % KW;
+  const int s = blockIdx.y;
+  const int ng = C >> 6;
+  const int g0 = s * gps, g1 = min(ng, g0 + gps), nsl = g1 - g0;
+  const int n = lane & 15, h = lane >> 4;
+  const int r0 = (blockIdx.x * RW + rw) * 16;
+  const uint8_t* row = wq + (size_t)(r0 + n) * st;  // R % (16*RW) == 0 (host)
+  // weight group data, double-buffered: group g+KW is loaded while g computes;
+  // the first group is issued before the x group-sum prologue
+  uint4 cl0, cl1, chp, nl0, nl1, nhp;
+  uint32_t csb = 0, nsb = 0;
+  int g = g0 + kw;
+  if (g < g1) {
+    cl0 = *(const uint4*)(row + g * 32);
+    cl1 = *(const uint4*)(row + g * 32 + 16);
+    chp = *(const uint4*)(row + C / 2 + g * 16);
+    csb = *(const uint32_t*)(row + 3 * C / 4 + g * 4);
+  }
+  for (int i = tid; i < P * nsl * 8; i += 256) {  // 8-lane groups stay whole
+    const int sub = i & 7, pg = i >> 3, p = pg / nsl, gl = pg - p * nsl;
+    float xv[8];
+    hv2::ldx8(x + (size_t)p * xs + (size_t)(g0 + gl) * 64 + sub * 8, xv);
+    float t = ((xv[0] + xv[1]) + (xv[2] + xv[3])) + ((xv[4] + xv[5]) + (xv[6] + xv[7]));
+    t += __shfl_xor(t, 1, 8);
+    t += __shfl_xor(t, 2, 8);
+    t += __shfl_xor(t, 4, 8);
+    if (sub == 0) sxs[p * nsl + gl] = t;
+  }
+  __syncthreads();
+  const int b_ = lane >> 1;
+  const int qrowA = (lane & 1) ? ((lane & 16) ? b_ : ((b_ + 4) & 7))
+                               : ((lane & 16) ? 8 + ((b_ + 4) & 7) : b_);
+  htw_v8f acc[NPT];
+#pragma unroll
+  for (int i = 0; i < NPT; i++)
+#pragma unroll
+    for (int e = 0; e < 8; e++) acc[i][e] = 0.f;
+  const __half2 k1024 = __half2half2(__float2half(1024.f));
+  for (; g < g1; g += KW) {
+    if (g + KW < g1) {
+      const int gn = g + KW;
+      nl0 = *(const uint4*)(row + gn * 32);
+      nl1 = *(const uint4*)(row + gn * 32 + 16);
+      nhp = *(const uint4*)(row + C / 2 + gn * 16);
+      nsb = *(const uint32_t*)(row + 3 * C / 4 + gn * 4);
+    }
+    const uint4 l0 = cl0, l1 = cl1, hp = chp;
+    const uint32_t sb = csb;
+    cl0 = nl0;
+    cl1 = nl1;
+    chp = nhp;
+    csb = nsb;
+    const float sc = __half2float(__ushort_as_half((unsigned short)(sb & 0xffffu)));
+    const float bi = __half2float(__ushort_as_half((unsigned short)(sb >> 16)));
+    const uint32_t lw[8] = {l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w};
+    const uint32_t hw[4] = {hp.x, hp.y, hp.z, hp.w};
+    htw_v8f d[NPT];
+#pragma unroll
+    for (int i = 0; i < NPT; i++)
+#pragma unroll
+      for (int e = 0; e < 8; e++) d[i][e] = 0.f;
+#pragma unroll
+    for (int ks = 0; ks < 4; ks++) {
+      // this lane: weight row n, cols 16ks + 8h .. +7 of the group
+      const uint32_t lo = h ? lw[2 * ks + 1] : lw[2 * ks];
+      const uint32_t hi = hw[ks] >> (16 * h);
+      uint32_t own[4], oth[4];
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const uint32_t c0 = ((lo >> (8 * j)) & 15u) | (((hi >> (4 * j)) & 3u) << 4);
+        const uint32_t c1 = ((lo >> (8 * j + 4)) & 15u) | (((hi >> (4 * j + 2)) & 3u) << 4);
+        const uint32_t u = (0x6400u | c0) | ((0x6400u | c1) << 16);  // f16 1024 + c, exact
+        const __half2 v = __hsub2(*(const __half2*)&u, k1024);       // c, exact
+        own[j] = *(const uint32_t*)&v;
+      }
+#pragma unroll
+      for (int j = 0; j < 4; j++)
+        oth[j] = (uint32_t)__builtin_amdgcn_permlanex16((int)own[j], (int)own[j], 0x76543210,
+                                                        (int)0xfedcba98, false, false);
+      uint32_t bw[8];
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        bw[j] = h ? oth[j] : own[j];
+        bw[4 + j] = h ? own[j] : oth[j];
+      }
+      htw_v16h bf;
+      memcpy(&bf, bw, 32);
+#pragma unroll
+      for (int pt = 0; pt < NPT; pt++) {
+        const int p = pt * 16 + qrowA;
+        uint32_t aw[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        if (p < P) {
+          const TX* xp = x + (size_t)p * xs + (size_t)g * 64 + ks * 16;
+          float xv[16];
+          hv2::ldx8(xp, xv);
+          hv2::ldx8(xp + 8, xv + 8);
+#pragma unroll
+          for (int j = 0; j < 8; j++) {
+            const __half2 hv = __floats2half2_rn(xv[2 * j], xv[2 * j + 1]);
+            aw[j] = *(const uint32_t*)&hv;
+          }
+        }
+        htw_v16h af;
+        memcpy(&af, aw, 32);
+        d[pt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf, d[pt]);
+      }
+    }
+#pragma unroll
+    for (int pt = 0; pt < NPT; pt++)
+#pragma unroll
+      for (int e = 0; e < 8; e++) {
+        const int p = pt * 16 + h * 8 + e;
+        const float sxv = p < P ? sxs[p * nsl + (g - g0)] : 0.f;
+        acc[pt][e] = fmaf(bi, sxv, fmaf(sc, d[pt][e], acc[pt][e]));
+      }
+  }
+#pragma unroll
+  for (int pt = 0; pt < NPT; pt++)
+#pragma unroll
+    for (int e = 0; e < 8; e++) red[w][pt * 16 + h * 8 + e][n] = acc[pt][e];
+  __syncthreads();
+  for (int i = tid; i < RW * P * 16; i += 256) {
+    const int nn = i & 15, rest = i >> 4, p = rest % P, rwi = rest / P;
+    float v = red[rwi * KW][p][nn];
+#pragma unroll
+    for (int k = 1; k < KW; k++) v += red[rwi * KW + k][p][nn];
+    const int r = (blockIdx.x * RW + rwi) * 16 + nn;
+    if (gridDim.y > 1)
+      out[((size_t)s * P + p) * R + r] = v;
+    else
+      out[(size_t)p * ys + r] = v;
+  }
+}
+// split-K slices of k_q6g64_wmma summed in s order (runtime P)
+__global__ void k_q6g64_wred(const float* __restrict__ part, float* __restrict__ y, uint64_t ys,
+                             int R, int ns, int P) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= P * R) return;
   const int p = i / R, r = i % R;
