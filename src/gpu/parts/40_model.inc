@@ -7928,8 +7928,18 @@ struct GpuModel {
         const char* e = getenv("QWENOX_OCC_FORCE");
         return e && *e ? std::max(0, std::min(8, atoi(e))) : -1;
       }();
-      static const float eA = env_f("QWENOX_OCC_A", 10.f), eS = env_f("QWENOX_OCC_SEQ", 5.5f),
-                         eR = env_f("QWENOX_OCC_ROW", 10.f), eD = env_f("QWENOX_OCC_DRAFT", 0.f),
+      // QWENOX_DENSE_WMMA (10-12 refit): a verify row costs ~5 ms instead of ~10
+      // (VSEG: T ≈ 26 + 5.1·R ms for R = 6..40) while the per-round fixed part
+      // (host enqueue, worker, PLE) stays, so the optimum γ moves deeper.
+      // Serving sweep, forced γ1/2/3/4 (tok/s): C2 greedy 62.4/67.8/70.2/68.6,
+      // C2 sampled 57.6/63.7/63.9/62.0, C8 greedy 92.8/96.6/96.8/92.0 — the
+      // fp32-era constants picked γ≈2 at C2. Batched draft ≈ 3 ms per step
+      // (TURN_PROF draft-exec 8 ms per C2 round).
+      static const bool dw = dense_wmma_on();
+      static const float eA = env_f("QWENOX_OCC_A", dw ? 40.f : 10.f),
+                         eS = env_f("QWENOX_OCC_SEQ", dw ? 2.f : 5.5f),
+                         eR = env_f("QWENOX_OCC_ROW", dw ? 5.f : 10.f),
+                         eD = env_f("QWENOX_OCC_DRAFT", dw ? 3.f : 0.f),
                          eD1 = env_f("QWENOX_OCC_DRAFT1", 3.f),
                          eH = env_f("QWENOX_OCC_HYST", 0.01f);
       on = !off && (!sample || mode_sample() != 0);
