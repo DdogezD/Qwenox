@@ -7810,6 +7810,129 @@ struct GpuModel {
     }
   };
 
+  // D2 阶段 3（10-12）：按会合路数选 γ。B 路同时 verify 时一轮的成本近似
+  //   T(B, γ) = A + B·(SEQ + ROW·(γ+1)) + DRAFT(B)·max(γ, 1)
+  // 常数按服务端实测拟合（conc_bench 代码题，强制 γ=0/1/2 与旧逻辑 γ=4，
+  // 每轮墙钟 = B·E(γ)/吞吐：C8 ≈ 135 + 81γ ms，C4 ≈ 75 + 43γ ms；合批 draft
+  // 每步的增量测不出来，DRAFT 取 0），
+  // 所以每多投机一步的边际成本随 B 增大，而 GammaCtl 的单序列最优是按 B = 1
+  // 算的。实测 C8：γ0 59.3 / γ1 69.9 / γ2 71.1 / γ4 65.7 tok/s——纯合批 AR
+  // 最差（每路私有状态成本合不掉），γ1/γ2 近乎打平。这里另记一份逐深度接受率（GammaCtl 只在自适应模式、且只在未被截断
+  // 的轮次上学习），在 [0, base] 里选 E(γ)/T(B, γ) 最大的 γ。B ≤ 1 时原样
+  // 返回 base：单用户行为不变。
+  // γ = 0 仍跑第 1 步 MTP draft（它写入位置 q 的 MTP KV，即轮首不变量），
+  // 但 verify 只送 cur 一行，等于一次合批 AR。
+  // greedy 输出与 γ 无关（d2_s1b_gamma），用实时会合人数。采样请求的 γ 会改变
+  // RNG 消耗：客户端显式给了 seed（协议 SEEDED）的请求用确定的 B = nslots，
+  // 只依赖本请求自己的接受历史，同 seed 在并发下仍可复现（代价：单用户时也按
+  // 满并发选 γ，实测 C1 慢约 11%）；未给 seed 的请求输出本来就随机，用实时人数。
+  // QWENOX_OCC_SAMPLE：auto【默认，按 SEEDED】/ fixed / live / off。
+  // 开关：QWENOX_OCC=0 关闭（退回旧的行预算截断）；QWENOX_OCC_FORCE=G 校准 /
+  // 对拍用，任何 B 下都把 γ 钉在 min(G, 预算)；成本常数 QWENOX_OCC_A / _SEQ /
+  // _ROW / _DRAFT（合批 draft 每步）/ _DRAFT1（串行 draft 每路每步），单位 ms。
+  struct OccGamma {
+    static float env_f(const char* k, float def) {
+      const char* e = getenv(k);
+      return e && *e ? (float)atof(e) : def;
+    }
+    static int mode_sample() {  // 0 off, 1 fixed (nslots), 2 live, 3 auto
+      static const int m = [] {
+        const char* e = getenv("QWENOX_OCC_SAMPLE");
+        if (!e || !*e || !strcmp(e, "auto")) return 3;
+        if (!strcmp(e, "fixed")) return 1;
+        if (!strcmp(e, "live")) return 2;
+        return 0;
+      }();
+      return m;
+    }
+    bool on = true, sample = false, draft_batched = true, fixed = false;
+    int force = -1, fixed_b = 1, last = -1;
+    float A = 10.f, SEQ = 5.5f, ROW = 10.f, DRAFT = 0.f, DRAFT1 = 3.f, hyst = 0.01f;
+    float p[8], n[8];
+    long rounds = 0, hist[9] = {0};
+    OccGamma(bool sample_, int nslots_, bool draft_batched_, bool seeded = false)
+        : sample(sample_), draft_batched(draft_batched_) {
+      static const bool off = env_zero("QWENOX_OCC");
+      static const int env_force = [] {
+        const char* e = getenv("QWENOX_OCC_FORCE");
+        return e && *e ? std::max(0, std::min(8, atoi(e))) : -1;
+      }();
+      static const float eA = env_f("QWENOX_OCC_A", 10.f), eS = env_f("QWENOX_OCC_SEQ", 5.5f),
+                         eR = env_f("QWENOX_OCC_ROW", 10.f), eD = env_f("QWENOX_OCC_DRAFT", 0.f),
+                         eD1 = env_f("QWENOX_OCC_DRAFT1", 3.f),
+                         eH = env_f("QWENOX_OCC_HYST", 0.01f);
+      on = !off && (!sample || mode_sample() != 0);
+      fixed = sample && (mode_sample() == 1 || (mode_sample() == 3 && seeded));
+      force = env_force;
+      fixed_b = std::max(1, nslots_);
+      A = eA, SEQ = eS, ROW = std::max(0.01f, eR), DRAFT = eD, DRAFT1 = eD1;
+      hyst = std::max(0.f, eH);
+      // Prior 0.85 (measured conditional acceptance on code ≈ 0.90 / 0.82 /
+      // 0.82 / 0.81 by depth): slightly optimistic so a deeper γ gets tried —
+      // a γ1 round never observes depth 2, a low prior would lock γ1 in.
+      for (int j = 0; j < 8; j++) p[j] = 0.85f, n[j] = 4.f;
+    }
+    // B the policy sees: live members, or nslots for a fixed (seeded sampled)
+    // request (QWENOX_OCC=0 / QWENOX_OCC_SAMPLE=off: the old live-member clamp).
+    int eff_b(int live) const {
+      if (!on || !fixed) return live;
+      return live > 0 ? fixed_b : 1;  // live 0 = not in the rendezvous at all
+    }
+    double cost(int B, int G) const {
+      const double dr = draft_batched ? DRAFT : DRAFT1 * B;
+      return A + B * (SEQ + ROW * (G + 1)) + dr * std::max(G, 1);
+    }
+    double gain(int G) const {
+      double e = 1.0, pr = 1.0;
+      for (int k = 0; k < G; k++) e += (pr *= p[k]);
+      return e;
+    }
+    // g: γ after the gen/ctx bounds; live: rendezvous members (1 = alone);
+    // rows: the batched verify's row budget (kVSnapRows). Returns γ ≥ 0.
+    int pick(int g, int live, int rows) {
+      const int B = eff_b(live);
+      // Shared row budget of the batched verify (the executor re-checks the
+      // hard cap per segment and drops overflow to the serial path).
+      if (B > 1) g = std::min(g, std::max(1, rows / B - 1));
+      if (force >= 0) return std::min(g, force);
+      if (!on || B <= 1) return g;
+      int best = g;
+      double sb = gain(g) / cost(B, g);
+      for (int G = 0; G < g; G++) {
+        const double s = gain(G) / cost(B, G);
+        if (s > sb) best = G, sb = s;
+      }
+      // Hysteresis: keep the previous choice unless the new one wins clearly.
+      if (last >= 0 && last <= g && best != last &&
+          sb <= (1.0 + hyst) * gain(last) / cost(B, last))
+        best = last;
+      last = best;
+      rounds++;
+      // Probe one step deeper every 8th capped round: depth best+1 is never
+      // observed otherwise, and a noisy low estimate there would lock the
+      // policy in. Depends only on this request's own round count.
+      const int out = (best < g && (rounds & 7) == 0) ? best + 1 : best;
+      hist[out]++;
+      return out;
+    }
+    // g = drafts verified this round, a = accepted prefix length.
+    void update(int g, int a) {
+      for (int j = 0; j < g && j <= a; j++) {
+        n[j] += 1.f;
+        p[j] += std::max(0.02f, 1.f / n[j]) * ((j < a ? 1.f : 0.f) - p[j]);
+      }
+    }
+    void report(const char* tag) const {
+      if (!rounds) return;
+      fprintf(stderr, "%s occ-gamma: %ld rounds at B>1, γ", tag, rounds);
+      for (int G = 0; G <= 8; G++)
+        if (hist[G]) fprintf(stderr, " %d:%ld", G, hist[G]);
+      fprintf(stderr, " | p:");
+      for (int j = 0; j < 6; j++) fprintf(stderr, " %.2f", p[j]);
+      fprintf(stderr, "\n");
+    }
+  };
+
   // Speculative decode driver. cur = emitted token for position pos (trunk
   // state processed through pos-1, MTP KV covers 0..pos-2). Greedy accept:
   // draft j committed iff it equals the trunk argmax at its verify row; the
@@ -7828,6 +7951,7 @@ struct GpuModel {
     // wired and batch-safe (the serve call site counts membership with the
     // same predicate -- see dr_worker_ok).
     const bool dr_join = dr_worker_ok();
+    OccGamma occ(false, nslots, dr_join);
     int depth_hits[8] = {0}, depth_tot[8] = {0};
     int rounds = 0, rollbacks = 0;
     double t_draft = 0, t_verify = 0, t_roll = 0, t_ingest = 0;
@@ -7840,13 +7964,10 @@ struct GpuModel {
       int q = pos - 1;  // trunk processed through q
       if (d_iraw) vg_dump_buf("irT", 2, d_iraw, 512 * 4);  // P3-B bisect
       int g = std::min(gctl.cur, gen - (int)out.size());
-      // D2-S2a: cap the round so a rendezvous batch stays within the
-      // kVSnapRows verify budget (round-top snapshot; the pool executor
-      // re-checks the hard cap per segment and drops overflow).
-      if (vseg_active_fn) {
-        const int va = vseg_active_fn();
-        if (va > 1) g = std::min(g, std::max(1, (int)kVSnapRows / va - 1));
-      }
+      // D2-S2a row budget + D2 阶段 3 occupancy γ (round-top snapshot of the
+      // rendezvous membership; may return 0 = batched AR round).
+      g = occ.pick(g, vseg_active_fn ? vseg_active_fn() : 1, (int)kVSnapRows);
+      const int gd = std::max(1, g);  // draft steps: γ = 0 still writes MTP KV at q
       size_t chist_sz = chist.size();
       mtp_ckpt_save();
       if (d_iraw) vg_dump_buf("irC", 2, d_iraw, 512 * 4);  // P3-B bisect
@@ -7855,7 +7976,7 @@ struct GpuModel {
       // batched cross-slot pass per step, bit-identical to the serial burst
       // below); false = this round keeps the serial burst.
       const bool dr_done =
-          dr_join && dr_pool_fn(*this, DrSeg{bound_, g, cur, drafts.data()});
+          dr_join && dr_pool_fn(*this, DrSeg{bound_, gd, cur, drafts.data()});
       if (!dr_done) {
       // draft 1 used the committed (h_q, cur): its indexer ring rows are
       // truth. Later drafts pollute the ring; save/restore around them.
@@ -7863,16 +7984,16 @@ struct GpuModel {
         mtp_step(d_R, cur, nullptr, true, nullptr, d_argmax_arr);
         CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4, hipMemcpyDeviceToDevice,
                           g_str));
-        for (int j = 1; j < g; j++)
+        for (int j = 1; j < gd; j++)
           mtp_step(d_mR, 0, nullptr, true, d_argmax_arr + j - 1,
                    d_argmax_arr + j);
-        CK(hipMemcpy(drafts.data(), d_argmax_arr, (size_t)g * sizeof(int),
+        CK(hipMemcpy(drafts.data(), d_argmax_arr, (size_t)gd * sizeof(int),
                      hipMemcpyDeviceToHost));
       } else {
         drafts[0] = mtp_step(d_R, cur);
         CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4, hipMemcpyDeviceToDevice,
                           g_str));
-        for (int j = 1; j < g; j++) drafts[j] = mtp_step(d_mR, drafts[j - 1]);
+        for (int j = 1; j < gd; j++) drafts[j] = mtp_step(d_mR, drafts[j - 1]);
       }
       }
       auto t1 = std::chrono::steady_clock::now();
@@ -7939,7 +8060,8 @@ struct GpuModel {
         depth_tot[j]++;
         if (j < a) depth_hits[j]++;
       }
-      gctl.update(g, a);
+      if (g > 0) gctl.update(g, a);  // γ = 0 rounds carry no draft evidence
+      occ.update(g, a);
       rounds++;
       live_spec_rounds = rounds;
       live_spec_proposed += g;
@@ -8035,6 +8157,7 @@ struct GpuModel {
               t_draft, t_verify, t_roll, t_ingest);
     }
     gctl.report("spec");
+    occ.report("spec");
     last_spec_rounds = rounds;
     last_spec_commit = (int)out.size();
     last_spec_proposed = live_spec_proposed;
@@ -8099,6 +8222,7 @@ struct GpuModel {
     // D2-S3c: draft rendezvous membership mirrors the verify one -- ngram
     // rounds never submit an MTP draft, so they excuse themselves per round.
     const bool dr_on = dr_round_enter_fn && dr_worker_ok();
+    OccGamma occ(false, nslots, dr_on);
     struct DrLoop {
       GpuModel& m;
       bool on;
@@ -8305,34 +8429,32 @@ struct GpuModel {
         int q = pos - 1;
         int g = std::min({gctl.cur, gen - (int)out.size(), maxctx - pos - 1});
         if (g < 1) break;  // context edge: no room for even one draft
-        // Same shared row budget as spec_loop: cap this round so the batched
-        // verify stays within kVSnapRows (the executor re-checks hard).
-        if (vseg_active_fn) {
-          const int va = vseg_active_fn();
-          if (va > 1) g = std::min(g, std::max(1, (int)kVSnapRows / va - 1));
-        }
+        // Shared row budget + occupancy γ, as spec_loop (may return 0: the
+        // round still drafts one step to keep the MTP KV, verifies cur only).
+        g = occ.pick(g, vseg_active_fn ? vseg_active_fn() : 1, (int)kVSnapRows);
+        const int gd = std::max(1, g);
         size_t chist_sz = chist.size();
         mtp_ckpt_save();
         auto t0 = std::chrono::steady_clock::now();
         // D2-S3c: rendezvous draft (see spec_loop); false -> serial burst.
         const bool dr_done =
-            dr_on && dr_pool_fn(*this, DrSeg{bound_, g, cur, drafts.data()});
+            dr_on && dr_pool_fn(*this, DrSeg{bound_, gd, cur, drafts.data()});
         if (!dr_done) {
         // draft 1's indexer ring rows are truth; later drafts pollute them.
         if (draft_desync) {
           mtp_step(d_R, cur, nullptr, true, nullptr, d_argmax_arr);
           CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4,
                             hipMemcpyDeviceToDevice, g_str));
-          for (int j = 1; j < g; j++)
+          for (int j = 1; j < gd; j++)
             mtp_step(d_mR, 0, nullptr, true, d_argmax_arr + j - 1,
                      d_argmax_arr + j);
-          CK(hipMemcpy(drafts.data(), d_argmax_arr, (size_t)g * sizeof(int),
+          CK(hipMemcpy(drafts.data(), d_argmax_arr, (size_t)gd * sizeof(int),
                        hipMemcpyDeviceToHost));
         } else {
           drafts[0] = mtp_step(d_R, cur);
           CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4,
                             hipMemcpyDeviceToDevice, g_str));
-          for (int j = 1; j < g; j++) drafts[j] = mtp_step(d_mR, drafts[j - 1]);
+          for (int j = 1; j < gd; j++) drafts[j] = mtp_step(d_mR, drafts[j - 1]);
         }
         }
         std::vector<int> vt;
@@ -8368,7 +8490,8 @@ struct GpuModel {
           depth_tot[j]++;
           if (j < a) depth_hits[j]++;
         }
-        gctl.update(g, a);
+        if (g > 0) gctl.update(g, a);  // γ = 0 rounds carry no draft evidence
+        occ.update(g, a);
         ++mtp_rounds;
         last_spec_proposed += g;
         int d = a;
@@ -8463,6 +8586,7 @@ struct GpuModel {
                verify_ms - replay_ms) /
                   last_spec_rounds);
       gctl.report("chain");
+      occ.report("chain");
     }
     return out;
   }
@@ -8746,7 +8870,7 @@ struct GpuModel {
   template <typename Sampler>
   std::vector<int> spec_loop_chain_sample(
       int cur, int gen, int gamma, Sampler& sampler, bool mtp_ok,
-      const std::function<bool(int, float)>& emit = nullptr) {
+      const std::function<bool(int, float)>& emit = nullptr, bool seeded = false) {
     last_spec_rounds = last_spec_commit = last_spec_rollbacks =
         last_spec_proposed = 0;
     live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
@@ -8781,6 +8905,7 @@ struct GpuModel {
     // QWENOX_VR_SAMPLE=0 keeps sampled requests out of the rendezvous.
     static const bool vr_sample = !env_zero("QWENOX_VR_SAMPLE");
     const bool vr_on = vr_sample && mtp_ok && vseg_pool_fn != nullptr;
+    OccGamma occ(true, nslots, false, seeded);  // sampled drafts: serial per slot
     struct VrLoopS {
       GpuModel& m;
       bool on;
@@ -9056,11 +9181,15 @@ struct GpuModel {
         int q = pos - 1;
         int g = std::min({gctl.cur, gen - (int)out.size(), maxctx - pos - 1});
         if (g < 1) break;  // context edge: no room for even one draft
-        // Shared row budget of the batched verify (as the greedy loops).
-        if (vr_on && vseg_active_fn) {
-          const int va = vseg_active_fn();
-          if (va > 1) g = std::min(g, std::max(1, (int)kVSnapRows / va - 1));
-        }
+        // Row budget + occupancy γ. A sampled round's γ shapes its RNG draws:
+        // for a client-seeded request OccGamma sees a deterministic B (nslots)
+        // so the output does not depend on peers (the old live-member clamp
+        // here let C7/C8 peers change it: 48/8 - 1 = 5 < adaptive γ max 7);
+        // unseeded requests use the live B. γ = 0 still drafts one step (MTP
+        // KV at q; the draft stream is forked per position) and verifies cur.
+        g = occ.pick(g, vr_on ? (vseg_active_fn ? vseg_active_fn() : 1) : 0,
+                     (int)kVSnapRows);
+        const int gd = std::max(1, g);
         size_t chist_sz = chist.size();
         mtp_ckpt_save();
         Sampler draft_sampler = sampler.fork_stream(
@@ -9069,9 +9198,9 @@ struct GpuModel {
             0x3c6ef372fe94f82aull ^ (uint64_t)(q + 1));
         auto t = std::chrono::steady_clock::now();
         // GPU sampling prep (direction A), as in spec_loop_sample.
-        std::vector<typename Sampler::SDist> q_sd(smg ? g : 0);
-        std::vector<char> q_sparse(g, 0);
-        for (int j = 0; j < g; j++) {
+        std::vector<typename Sampler::SDist> q_sd(smg ? gd : 0);
+        std::vector<char> q_sparse(gd, 0);
+        for (int j = 0; j < gd; j++) {
           bool dense = true;
           if (smg) {
             mtp_step(j ? d_mR : d_R, j ? drafts[j - 1] : cur, nullptr, false);
@@ -9225,7 +9354,8 @@ struct GpuModel {
           depth_tot[j]++;
           if (j < a) depth_hits[j]++;
         }
-        gctl.update(g, a);
+        if (g > 0) gctl.update(g, a);  // γ = 0 rounds carry no draft evidence
+        occ.update(g, a);
         ++mtp_rounds;
         last_spec_proposed += g;
         int d = a, stopped_token = -1;
@@ -9336,6 +9466,7 @@ struct GpuModel {
                 (double)depth_hits[j] / depth_tot[j]);
       fprintf(stderr, "\n");
       gctl.report("chain-sample");
+      occ.report("chain-sample");
     }
     return out;
   }

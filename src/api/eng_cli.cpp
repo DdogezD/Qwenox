@@ -45,6 +45,7 @@ static qwenox::GenParams params_from_json(const json& q, qwenox::Tokenizer* tok)
         p.top_p = q.value("top_p", 0.95f);
         p.min_p = q.value("min_p", 0.0f);
         p.seed = q.value("seed", 0ULL);
+        p.seeded = q.contains("seed");
     }
     p.presence = q.value("presence_penalty", 0.0f);
     p.frequency = q.value("frequency_penalty", 0.0f);

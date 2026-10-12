@@ -651,6 +651,7 @@ struct GenSpec {
     float top_p = 0.95f;
     float min_p = 0.0f;
     unsigned long long seed = 0;
+    bool seeded = false;  // client-supplied seed (engine SEEDED flag)
     float presence = 0.0f;
     float frequency = 0.0f;
     std::vector<std::pair<int, float>> bias;
@@ -722,6 +723,7 @@ GenOutcome run_generation(GenSpec& spec,
     p.top_p = spec.top_p;
     p.min_p = spec.min_p;
     p.seed = spec.seed;
+    p.seeded = spec.seeded;
     p.presence = spec.presence;
     p.frequency = spec.frequency;
     p.bias = spec.bias;
@@ -1000,6 +1002,7 @@ void apply_sampling(const json& body, GenSpec* spec) {
         } else {
             http::fail(400, "seed must be an integer or decimal integer string");
         }
+        spec->seeded = true;
     } else {
         static thread_local std::mt19937_64 rng{std::random_device{}()};
         spec->seed = rng();  // the engine's RNG is counter-based: a seed is required

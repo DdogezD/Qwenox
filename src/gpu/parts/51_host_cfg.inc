@@ -1299,6 +1299,11 @@ struct GenReq {
   bool sample = false;
   float temp = 1.0f, top_p = 0.0f, min_p = 0.0f;  int top_k = 0;
   uint64_t seed = 0;
+  // SEEDED: the client gave this seed explicitly (the API otherwise draws a
+  // random one). Seeded sampled requests pick their MTP γ from a fixed
+  // occupancy (PARALLEL) so the output is reproducible under concurrency;
+  // unseeded ones follow the live rendezvous size (Model::OccGamma).
+  bool seeded = false;
   // PENALTY (presence, frequency) / BIAS (tid,val pairs) / LOGPROBS: sampler-only.
   float presence = 0.0f, frequency = 0.0f;
   std::vector<std::pair<int, float>> bias;
@@ -1687,6 +1692,8 @@ static GenReq parse_gen(std::istringstream& ss) {
       }
     } else if (tok == "LOGPROBS") {
       g.logprobs = true;
+    } else if (tok == "SEEDED") {
+      g.seeded = true;
     } else if (tok == "MROPE") {
       int k;
       // One grid per image: same ceiling as VIMG (was 64, a hidden 2nd cap).
@@ -3022,7 +3029,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
           pause_tok = -1;
           if (g.sample)
             m.spec_loop_chain_sample(cur, g.max_tokens - 1, spec_gamma, smp,
-                                     chain_mtp, emit_ng_smp);
+                                     chain_mtp, emit_ng_smp, g.seeded);
           else if (chain) m.spec_loop_chain(cur, g.max_tokens - 1, spec_gamma, emit_ng);
           else m.spec_loop_ngram(cur, g.max_tokens - 1, m.ngram.n_max, emit_ng);
           spec_r += m.last_spec_rounds;
