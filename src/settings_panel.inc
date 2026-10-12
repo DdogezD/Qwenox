@@ -538,11 +538,13 @@ void check_weights_page(CheckLines& c, const PanelVals& v) {
                           "GGUF shards: the first shard is entered; keep the rest in the same "
                           "directory"));
         else
-            check_line(c, kLvWarn,
-                       TR("GGUF_FILE 文件名不含 -00001-of-XXXXX 分片命名；多分片模型请填第 1 "
-                          "个分片",
-                          "GGUF_FILE name lacks the -00001-of-XXXXX pattern; for multi-shard "
-                          "models enter the first shard"));
+            // 单文件 GGUF（未分片，或 llama-gguf-split --merge 合并后）是合法的：
+            // 引擎只在文件名形如 -0000i-of-0000N.gguf 时按分片打开，否则按单文件打开
+            check_line(c, kLvHint,
+                       TR("GGUF_FILE 按单文件加载（文件名不含 -00001-of-XXXXX）；若是多分片模型，"
+                          "请填第 1 个分片",
+                          "GGUF_FILE is loaded as a single file (no -00001-of-XXXXX in the name); "
+                          "for a multi-shard model enter the first shard"));
         if (v.no_gguf_mtp)
             check_line(c, kLvPass, TR("GGUF MTP：不使用", "GGUF MTP: not used"));
         else

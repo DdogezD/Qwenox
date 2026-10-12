@@ -284,6 +284,31 @@ GGUF 投机输出与普通 greedy（`--gen 256`，25.2 tok/s）前 256 个 token
 1.86×。草稿头接受率不低于 v2，剩下的差距来自每轮验证的 dense 字节（同上）。服务端带 sidecar 启动
 （`mtp: draft head enabled`）对话正常。
 
+并发 / 显存 / prefill 分段（`tools/iq4xs_conc_win.sh`，Windows，2026-10-13）：
+
+- **并发功能正常**：生产配置（256K、`PARALLEL=8`、MTP、视觉塔）8 路同时跑 `conc_verify.py` 的 10 个请求
+  （MTP 投机、采样、多轮续写、3K prompt）全部正常结束；INFO 槽数、负载下 PING（0 ms）、排队/运行中取消、
+  断连全部通过。和单路相比逐 token 不完全相同（5/10 个请求在第 5–45 个 token 分叉，之后是通顺的同义改写）：
+  GGUF 的 dense / 多行专家 kernel 不是行无关的，批大小不同舍入就不同。v2 的 `k_ht_wmma` 专门做成了行无关。
+- **合批吞吐有台阶**（`QWENOX_VBENCH`，同一步算 P 行，ms）：
+
+  | P | 1 | 4 | 8 | 10 | 24 | 40（8 段） |
+  |---|---|---|---|---|---|---|
+  | GGUF | 37.9 | 54.0 | 72.6 | 103.0 | 184.2 | 239.5 |
+  | v2 | 33.4 | 48.3 | 65.7 | 77.8 | 113.1 | 136.5 |
+
+  P≤8 只比 v2 慢约 10%；P>8 时 dense q8g32 改走"整块反量化成 bf16 + GEMM"，这一项占了台阶的大头（专家改走
+  GEMV 的消融 `QWENOX_GG_GEMV=64`：P=10 103→94.5，P=40 反而更慢 313）。不开 MTP 的 8 路 decode（每步 8 行）
+  不受影响；8 路 + MTP（每步 16–40 行）比 v2 慢 30–75%。修法：给 q8g32 做 P≤48 的多行 kernel（同 v2 `k_ht_wmma`）。
+- **显存**（生产配置，引擎 `memory[ready]`）：chunk 8192 → device **89.3 GiB**（arena 估算 85.3 + 4 slack，
+  权重 63.0 含 MTP 草稿头），HIP 剩 17.5 / 107.9 GiB；chunk 16384 → arena 估算 92.5 GiB，加 slack 后被 95 GiB
+  上限截断，device 95.0 GiB，HIP 剩 11.4 GiB。arena 启动时一次性预留，运行中不再增长。
+- **prefill 分段**（32K 单请求，去掉预热）：chunk 4096 / 8192 / 16384 = 1399 / 1436 / 1419 tok/s。稳态
+  chunk 8192 → 16384 只快约 2.5%（5.51 → 10.75 s / 块），第一块有 PLE 冷读。Windows 默认 8192 就合适；
+  `PARALLEL>1` 时实际分段是 min(`CONC_PREFILL_CHUNK`, `PREFILL_CHUNK`)。
+- **单文件 GGUF**：文件名形如 `…-0000i-of-0000N.gguf` 时按分片打开全部 N 个，否则按单文件打开（MTP sidecar
+  一直走这条路）。`llama-gguf-split --merge` 合并后的文件可以直接填进 `GGUF_FILE`。
+
 注：验证中 v2 + mtp.hgn 在 2048 prompt 上偶发过一次段错误（`verify graphs captured` 之后，崩在 HIP 运行时
 `hipEventSynchronize` 内部）。同一命令用 6eb7c9e 基线与新二进制各重跑 2 次都正常，输出逐 token 相同，
 因此与本次改动无关，原因待查。
@@ -302,6 +327,7 @@ GGUF 投机输出与普通 greedy（`--gen 256`，25.2 tok/s）前 256 个 token
 - `tools/lut_verify.sh` — hgn LUT MoE kernel：开关关闭与旧二进制逐位相同、decode 不变、KLD、
   prefill/decode PPL、MTP、速度（`BIN=` 新二进制，`REF=` 旧提交二进制）
 - `tools/moe_lut_test.cu` — LUT kernel（q4cp 真实权重 `--hgn` / 合成 IQ4_NL、IQ4_XS `--synth`）vs CPU 参考
+- `tools/iq4xs_conc_win.sh` — UD-IQ4_XS（Windows）：并发（conc_verify 单路 vs 8 路 + 控制面）、生产配置显存、prefill 分段
 - `tools/iq4xs_verify_win.sh` — UD-IQ4_XS（Windows）：kernel 对拍、v2 逐位不变、PPL 一致性/质量、服务端到端、速度
 - `tools/gguf_dequant_ref_check.cpp` — gguf.h CPU 解码（IQ3_S、Q6_K）vs ggml 原函数逐位
 - `tools/moe_gguf_test.cu` — MoE kernel（含 IQ 类型，经 `moe_ggx_*`）vs CPU 参考

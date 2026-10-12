@@ -88,12 +88,13 @@ def _split(text):
 
 class Tokenizer:
     def __init__(self, dir=DIR):
-        tj = json.load(open(dir + "/tokenizer.json"))
+        tj = json.load(open(dir + "/tokenizer.json", encoding="utf-8"))
         self.vocab = tj["model"]["vocab"]
         self.id2tok = {v: k for k, v in self.vocab.items()}
         self.ranks = {}
         for i, mg in enumerate(tj["model"]["merges"]):
-            a, b = mg.split(" ")
+            # tokenizers 旧格式 "a b"，新格式 ["a", "b"]
+            a, b = mg if isinstance(mg, list) else mg.split(" ")
             self.ranks[(a, b)] = i
         self.special = {}
         for t in tj["added_tokens"]:
