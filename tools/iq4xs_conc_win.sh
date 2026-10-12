@@ -58,7 +58,10 @@ serve() {
   local tag=$1 mc=$2; shift 2
   for e in "$@"; do export "$e"; done
   local log=$ROOT/$L/iq4xs_conc_$tag.log
-  (cd build && exec ./qwenox-engine-win.exe "$GW" --serve --host 127.0.0.1 --port 8732 \
+  # MODEL_ARGS="<hgn args>" (debug): serve another model with the same harness
+  local margs=("$GW")
+  [[ -n "${MODEL_ARGS:-}" ]] && read -r -a margs <<< "$MODEL_ARGS"
+  (cd build && exec ./qwenox-engine-win.exe "${margs[@]}" --serve --host 127.0.0.1 --port 8732 \
       --maxctx "$mc" --vision-tower "$(cygpath -m "$VIS")" > "$log" 2>&1) &
   ENG_PID=$!
   local t0=$(date +%s)
@@ -88,16 +91,20 @@ if step conc; then
   stamp "1 并发：单路串行 → 8 路并发（同一组 flow）→ 控制面"
   rm -f logs/conc/iq1.json logs/conc/iq8.json
   prod_env
-  if serve single 32768 QWENOX_PARALLEL=1 QWENOX_PREFILL_CHUNK=8192 QWENOX_KVSNAP=0 QWENOX_NGRAM_CHUNK=16; then
+  # SEQ_PAR=8: run the serial reference on an 8-slot engine too (separates
+  # concurrency effects from PARALLEL-dependent engine configuration)
+  SP=${SEQ_PAR:-1}
+  if serve single 32768 QWENOX_PARALLEL=$SP QWENOX_PREFILL_CHUNK=8192 QWENOX_CONC_PREFILL_CHUNK=8192 QWENOX_KVSNAP=0 QWENOX_NGRAM_CHUNK=16; then
     python tools/conc_verify.py seq --tag iq1 > $L/iq4xs_conc_seq.txt 2>&1 \
       && pass "单路串行 8 组 flow 正常结束" || { fail "单路串行"; tail -5 $L/iq4xs_conc_seq.txt; }
     grep -E "requests|FAIL" $L/iq4xs_conc_seq.txt | sed 's/^/    /'
   else fail "单路引擎没起来"; fi
   stop_eng
   prod_env
-  if serve par8 262144 QWENOX_PARALLEL=8 QWENOX_CONC_PREFILL_CHUNK=8192 QWENOX_KVSNAP=0 QWENOX_NGRAM_CHUNK=16; then
+  CP=${CPAR:-8}  # concurrent slots / client threads (debug)
+  if serve par8 262144 QWENOX_PARALLEL=$CP QWENOX_CONC_PREFILL_CHUNK=8192 QWENOX_KVSNAP=0 QWENOX_NGRAM_CHUNK=16; then
     memline par8
-    python tools/conc_verify.py conc --tag iq8 --slots 8 > $L/iq4xs_conc_conc.txt 2>&1 \
+    python tools/conc_verify.py conc --tag iq8 --slots $CP > $L/iq4xs_conc_conc.txt 2>&1 \
       && pass "8 路并发 8 组 flow 正常结束" || { fail "8 路并发"; tail -5 $L/iq4xs_conc_conc.txt; }
     grep -E "requests|FAIL" $L/iq4xs_conc_conc.txt | sed 's/^/    /'
     if [[ -f logs/conc/iq1.json && -f logs/conc/iq8.json ]]; then
@@ -115,7 +122,7 @@ for k in ('nat-d0', 'code-d3', 'conv-T3'):
         print(f'[{k}] 并发: ' + tk.decode(B[k]['tokens'])[:110].replace('\n', ' '))
 PY
     fi
-    python tools/conc_verify.py ctl --slots 8 > $L/iq4xs_conc_ctl.txt 2>&1 \
+    python tools/conc_verify.py ctl --slots $CP > $L/iq4xs_conc_ctl.txt 2>&1 \
       && pass "8 路控制面（INFO/PING/取消/断连）" || { fail "8 路控制面"; tail -8 $L/iq4xs_conc_ctl.txt; }
     tr '\r' '\n' < $L/iq4xs_conc_par8.log | grep -E "hipError|HIP error|Exception Code|FATAL|abort" | head -3 \
       | while read -r ln; do fail "引擎日志异常：$ln"; done

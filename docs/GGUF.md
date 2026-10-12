@@ -299,7 +299,54 @@ GGUF 投机输出与普通 greedy（`--gen 256`，25.2 tok/s）前 256 个 token
 
   P≤8 只比 v2 慢约 10%；P>8 时 dense q8g32 改走"整块反量化成 bf16 + GEMM"，这一项占了台阶的大头（专家改走
   GEMV 的消融 `QWENOX_GG_GEMV=64`：P=10 103→94.5，P=40 反而更慢 313）。不开 MTP 的 8 路 decode（每步 8 行）
-  不受影响；8 路 + MTP（每步 16–40 行）比 v2 慢 30–75%。修法：给 q8g32 做 P≤48 的多行 kernel（同 v2 `k_ht_wmma`）。
+  不受影响；8 路 + MTP（每步 16–40 行）比 v2 慢 30–75%。→ 已按 gufo 的思路修，见下一节。
+
+### 多行 dense + 专家 GEMV（2026-10-13，参考 gufo 0.11）
+
+gufo（同机同模型，MIT，已致谢）在 9–48 行用一个多行 kernel 直接读 Q8_0 权重（整数 WMMA），并让它与单行
+kernel 的运算顺序一致。这里按 v2 `k_ht_wmma` 的做法实现（f16 WMMA，不量化激活）：
+
+- **`k_q8g32_wmma`**（28_kernels_hgn_v2.inc / `q8g32_wmma`）：q8g32 码是 int8，转 f16 无误差，只有 x→f16 一次
+  舍入；每 32 列一个 scale 在 f32 里乘。波次布局（KW）和 K 切分（gps / ns）只由张量形状决定，与 P、行切片、
+  行在批里的位置都无关 → **P=1..48 同一行逐位相同**（`tools/q8_wmma_test.cu`：对 CPU double 相对误差 ≤1e-6，
+  移位/倒序/切片逐位）。所有 P≤48 的多行调用（verify、合批 verify / draft、小 prefill 尾块、lm_head）都走它；
+  P=1 的 decode 前向仍用带宽调优的 GEMV（WMMA 在 P=1 慢 15–20%）。开关 `QWENOX_DENSE_WMMA_Q8=0`（默认跟随
+  `QWENOX_DENSE_WMMA`），调参 `QWENOX_Q8W_KW / _BLOCKS / _U`（只影响速度），调试 `QWENOX_Q8W_SKIP=RxC,...`
+  （按形状退回旧 kernel）、`QWENOX_Q8W_XSTAT=N`（打印 x 的量级 / f16 次正规比例）。
+- **专家去重 GEMV 扩到 48 行**（26：`kUqMaxP` 8→48，成员按 8 个一组在寄存器里算）：`moe_gguf` 在 P≤48 时
+  都走 GEMV 族（`QWENOX_GG_GEMV`，默认 48），每个 (token, slot) 的运算与 P 无关，与普通 GEMV 逐位相同。
+
+实测（Windows，`tools/gguf_batch_verify_win.sh`，同一二进制新 / 旧 = `QWENOX_DENSE_WMMA_Q8=0 QWENOX_GG_GEMV=8`）：
+
+| 同一步算 P 行（ms） | 1 | 5 | 8 | 9 | 16 | 24 | 40 | 40（8 段） | 48 |
+|---|---|---|---|---|---|---|---|---|---|
+| 旧 | 37.9 | 61.3 | 74.1 | 96.3 | 133.5 | 183.5 | 270.3 | 238.3 | 296.7 |
+| 新 | 44.2¹ | 61.9 | 73.7 | 80.4 | 105.3 | 136.2 | 204.4 | 188.7 | 225.2 |
+
+¹ vbench 的 P=1 走的是 prefill 路径（多行 kernel）；真正的 decode 前向仍用旧 GEMV，AR decode 27.9 = 旧 27.8 tok/s。
+
+- 9–48 行快 17–25%；8 路 + MTP 每轮 16–40 行正好落在这个区间。
+- **API 端到端并发吞吐**（`tools/gguf_serve_bench_win.sh`：conc_bench 代码题，greedy，每路 2 × 1200 token，
+  PARALLEL=8、MTP 开、64K 上下文，聚合 tok/s）：
+
+  | 并发 | GGUF 旧 | **GGUF 新** | v2 hgn |
+  |---|---|---|---|
+  | 1 | 48.0 | 47.0 | 55.3 |
+  | 4 | 57.1 | **70.7（+24%）** | 83.2 |
+  | 8 | 65.3 | **82.4（+26%）** | 97.0 |
+
+  草稿接受率三者相同（0.66–0.69），差距全在每轮 verify 的耗时上。和 v2 剩下的差距（8 路 −15%，1 路 −15%）
+  是 dense 字节数：Q8_0 每个权重 1.06 字节，v2 是 4-bit 加旋转（约 0.5 字节）。
+- 单用户 MTP（γ4，2048 / 8192 prompt）46.4 / 45.9 vs 旧 47.8 / 47.5 tok/s（verify 5 行持平，差异主要是接受率
+  4.02→3.94 的文本噪声）。
+- 质量：以旧路径 chunk 512 为基准的相对 KLD（16×512 token）——chunk 24（每块都走 ≤48 行路径）旧 0.0252 /
+  新 0.0268，chunk 4 旧 0.0272 / 新 0.0258，相互在误差条内；chunk 2048 PPL 新 39.6154 = 旧 39.6159。
+  （小 chunk 的 PPL 本身是混沌的：只把某一个形状换成新 kernel，PPL 就在 35.7–44.3 之间跳，不能当门槛。）
+- 逐位：`QWENOX_VSEG_SELFTEST` 3,4,5 与 8×5（批 verify == 逐段 verify）PASS；γ1/3/4/7 的 greedy 投机输出相同
+  （γ2 在第 257 个 token 处差 1 个，新旧一样）。
+- 已知：Windows 上 `conc_verify` 的"4 / 8 路并发 == 单路串行"连 v2 生产模型也不成立（改动前就这样，分叉
+  在第 7–64 个 token，之后是通顺的同义文本），不是 GGUF 引入的；`vseg` 自检逐位说明合批 verify 本身没问题，
+  分叉来自调度路径的其他差异，待单独排查。
 - **显存**（生产配置，引擎 `memory[ready]`）：chunk 8192 → device **89.3 GiB**（arena 估算 85.3 + 4 slack，
   权重 63.0 含 MTP 草稿头），HIP 剩 17.5 / 107.9 GiB；chunk 16384 → arena 估算 92.5 GiB，加 slack 后被 95 GiB
   上限截断，device 95.0 GiB，HIP 剩 11.4 GiB。arena 启动时一次性预留，运行中不再增长。
@@ -327,6 +374,9 @@ GGUF 投机输出与普通 greedy（`--gen 256`，25.2 tok/s）前 256 个 token
 - `tools/lut_verify.sh` — hgn LUT MoE kernel：开关关闭与旧二进制逐位相同、decode 不变、KLD、
   prefill/decode PPL、MTP、速度（`BIN=` 新二进制，`REF=` 旧提交二进制）
 - `tools/moe_lut_test.cu` — LUT kernel（q4cp 真实权重 `--hgn` / 合成 IQ4_NL、IQ4_XS `--synth`）vs CPU 参考
+- `tools/gguf_batch_verify_win.sh` — GGUF 多行 dense + 专家 GEMV：kernel 单测、vbench、decode、PPL、vseg 逐位、并发
+- `tools/gguf_serve_bench_win.sh` — 经 API 的并发吞吐（conc_bench 1/4/8 路），GGUF 新 / 旧 / v2
+- `tools/q8_wmma_test.cu`（`bash tools/ht_wmma_test.sh q8`）— `k_q8g32_wmma` 精度 / 行无关 / 切片 / 速度
 - `tools/iq4xs_conc_win.sh` — UD-IQ4_XS（Windows）：并发（conc_verify 单路 vs 8 路 + 控制面）、生产配置显存、prefill 分段
 - `tools/iq4xs_verify_win.sh` — UD-IQ4_XS（Windows）：kernel 对拍、v2 逐位不变、PPL 一致性/质量、服务端到端、速度
 - `tools/gguf_dequant_ref_check.cpp` — gguf.h CPU 解码（IQ3_S、Q6_K）vs ggml 原函数逐位
