@@ -21,6 +21,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -3446,7 +3447,8 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
             _chdir(g_conf_root.c_str());
 #else
-            chdir(g_conf_root.c_str());
+            if (chdir(g_conf_root.c_str()) != 0)
+                fprintf(stderr, "[warn] chdir(%s) 失败: %s\n", g_conf_root.c_str(), strerror(errno));
 #endif
         }
         svcconf::load_conf(path, &g_svc_conf);

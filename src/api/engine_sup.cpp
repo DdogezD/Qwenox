@@ -27,7 +27,9 @@ namespace {
 
 std::mutex g_mtx;
 Status g_st;
+#ifdef _WIN32  // 仅 Windows 监管线程/stop() 使用；Linux 下未用会触发 -Werror=unused-variable
 bool g_stopping = false;  // stop() 主动停止：监管线程把退出记为 stopped 而非 exited
+#endif
 
 // 能连上 host:port 说明对端已在 LISTEN（跨平台探测，Linux 也用于 external 判定）。
 // 带 500ms 超时：阻塞 connect 对黑洞地址（防火墙丢包的远程 IP）会挂 ~20s，
