@@ -5,7 +5,9 @@
 #   bash tools/iq4xs_verify_win.sh                 # 全部（约 30 分钟）
 #   GGUF=/path/x-00001-of-00003.gguf bash tools/iq4xs_verify_win.sh
 #   SKIP_BUILD=1 SKIP_BENCH=1 bash tools/iq4xs_verify_win.sh   # 只做正确性（约 12 分钟）
-#   ONLY="svc bench" SKIP_BUILD=1 bash tools/iq4xs_verify_win.sh # 只跑指定步骤：build kt v2 gguf svc bench
+#   ONLY="svc bench" SKIP_BUILD=1 bash tools/iq4xs_verify_win.sh # 只跑指定步骤：build kt v2 gguf mtp svc bench
+#   MTPG=/path/mtp-*.gguf …   # MTP sidecar（默认 GGUF 同目录的 mtp-Qwen3.8-Flash-Next-Q8_0.gguf；
+#                             # 不存在则跳过 mtp 步骤，服务不带投机）
 #
 # 门槛（任何一项不过 => 末尾 FAIL）：
 #   1 编译：engine / bench / api / launcher / settings 全部产物
@@ -14,6 +16,8 @@
 #   3 v2 hgn 不受影响：新二进制 vs 基线 BASE_REV（默认 6eb7c9e）PPL 与 greedy ids 逐字相同
 #   4 GGUF 一致性：prefill（chunk 2048，WMMA）与小 chunk（4，GEMV+dedup）PPL 相差 < 1%
 #   5 GGUF 质量：同 tokens 上 PPL 低于 v2（参考：UD-IQ4_XS KLD ~0.084 vs v2 .107）
+#   M MTP（有 sidecar 时）：GGUF+sidecar 与 v2+mtp.hgn 同 prompt greedy γ=4 --spec-gen 256，
+#     草稿头已加载，commit/round ≥ 0.9×v2（只报告：tok/s、与普通 greedy 的前缀一致长度）
 #   6 服务端到端：临时 conf（weights=gguf，测试端口 18730/18731）起 qwenox-win，
 #     /admin/engine/start 拉起 GGUF 引擎，/v1/chat/completions 返回非空回复
 # 只报告不设门槛：decode tok/s（--gen 128，无 MTP）、prefill tok/s（qwenox-bench，≤128K）。
@@ -22,6 +26,8 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 ROOT="$(pwd)"
 GGUF="${GGUF:-/c/Users/Mark/Models/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf}"
+MTPG="${MTPG:-$(dirname "$GGUF")/mtp-Qwen3.8-Flash-Next-Q8_0.gguf}"
+V2MTP=./models/qwen38-flash-next-mtp.hgn
 V2=./models/qwen38-flash-next-v2.hgn
 NG=./models/qwen38-flash-next-ngram.hgn
 TOK=data/qsa-oracle/2048.tokens
@@ -35,7 +41,7 @@ fail() { FAILS+=("$1"); echo "  FAIL: $1"; }
 pass() { echo "  PASS: $1"; }
 info() { echo "  INFO: $1"; }
 stamp() { echo; echo "=== [$(date +%H:%M:%S)] $*"; }
-num() { sed -n "s/.*$1=\([0-9.e+-]*\).*/\1/p" | head -1; }
+num() { sed -n "s#.*$1=\([0-9.e+-]*\).*#\1#p" | head -1; }
 
 [[ -f "$GGUF" ]] || { echo "缺 GGUF 首分片：$GGUF"; echo "IQ4XS_VERIFY FAIL"; exit 1; }
 if tasklist 2>/dev/null | grep -qiE "qwenox-(engine-)?win"; then
@@ -153,6 +159,39 @@ nu=$(ids_of gguf_gen | tr ' ' '\n' | tail -n +2 | sort -u | wc -l)
 info "decode（均无 MTP）GGUF $(tps_of gguf_gen) tok/s | v2 $(tps_of v2_new_gen) tok/s"
 fi
 
+# ---------------------------------------------------------------- M MTP
+spec_of() { tr '\r' '\n' < "$L/iq4xs_$1.err" | grep -m1 '^spec:'; }
+if step mtp; then
+if [[ ! -f "$MTPG" ]]; then
+  info "无 MTP sidecar（$MTPG），跳过 MTP 步骤"
+else
+  stamp "M MTP：GGUF + $(basename "$MTPG") vs v2 + mtp.hgn（greedy γ=4，--spec-gen 256）"
+  MTPW=$(cygpath -m "$MTPG")
+  for T in 2048 8192; do
+    TF=$ROOT/data/qsa-oracle/$T.tokens
+    eng gguf_spec$T "$NEW" QWENOX_GGUF_MTP="$MTPW" -- "$GGUF" --tokens-file "$TF" --spec-gen 256 --gamma 4 --maxctx 16384 \
+      || fail "GGUF MTP spec-gen $T"
+    eng v2_spec$T "$NEW" -- "${V2A[@]}" "$ROOT/$V2MTP" --tokens-file "$TF" --spec-gen 256 --gamma 4 --maxctx 16384 \
+      || fail "v2 MTP spec-gen $T"
+    tr '\r' '\n' < $L/iq4xs_gguf_spec$T.err | grep -qE "^mtp: draft head enabled" \
+      || fail "GGUF $T：MTP 草稿头未启用（见 $L/iq4xs_gguf_spec$T.err）"
+    sg=$(spec_of gguf_spec$T); sv=$(spec_of v2_spec$T)
+    echo "  [$T] GGUF: ${sg:-（无 spec 行）}"
+    echo "  [$T] v2  : ${sv:-（无 spec 行）}"
+    cg=$(echo "$sg" | num commit/round); cv=$(echo "$sv" | num commit/round)
+    [[ -n "$cg" && -n "$cv" ]] && awk -v g="$cg" -v v="$cv" 'BEGIN { exit !(g >= 0.9 * v) }' \
+      && pass "[$T] GGUF commit/round $cg ≥ 0.9×v2 $cv" || fail "[$T] GGUF commit/round ${cg:-?} < 0.9×v2 ${cv:-?}"
+  done
+  # 与普通 greedy 的一致性（只报告）：同 2048 prompt --gen 256
+  eng gguf_gen256 "$NEW" -- "$GGUF" --tokens-file "$TOKA" --gen 256 --maxctx 16384
+  a=($(ids_of gguf_gen256)); b=($(grep '^ids:' $L/iq4xs_gguf_spec2048.out))
+  n=0; while [[ $n -lt ${#a[@]} && $n -lt ${#b[@]} && "${a[$n]}" == "${b[$n]}" ]]; do n=$((n+1)); done
+  plen=$(wc -w < "$TOKA")
+  info "GGUF spec 与普通 greedy：生成部分前 $(( n - plen - 1 )) 个 token 一致（共比 $(( ${#a[@]} - plen - 1 )) 个）"
+  info "GGUF 普通 decode $(tps_of gguf_gen256) tok/s（--gen 256）"
+fi
+fi
+
 # ---------------------------------------------------------------- 6 服务端到端
 GWIN=$(cygpath -m "$GGUF")
 if step svc; then
@@ -163,7 +202,7 @@ cat > "$CONF" <<EOF
 MODEL_DIR="./models"
 TOKENIZER_DIR="./models/tokenizer"
 GGUF_FILE="$GWIN"
-GGUF_MTP_FILE=""
+GGUF_MTP_FILE="$([[ -f "$MTPG" ]] && cygpath -m "$MTPG")"
 GGUF_VISION_FILE=""
 ENGINE_HOST="127.0.0.1"
 ENGINE_PORT="18730"
@@ -194,6 +233,8 @@ if [[ $ok_api == 1 ]]; then
     sleep 3
   done
   echo "  engine state: $st"
+  elog=$(ls -t logs/engine-api-*.log 2>/dev/null | head -1)
+  [[ -n "$elog" ]] && tr '\r' '\n' < "$elog" | grep -E "^gguf: pure|^mtp: " | sed 's/^/    /' 
   if [[ $st == running ]]; then
     # 请求体先落成 UTF-8 文件再 --data-binary：中文直接放进 curl 命令行参数会被
     # Windows 按 ANSI 代码页（GBK）转码，API 收到的就不是合法 UTF-8（JSON decode error）

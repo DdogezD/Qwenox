@@ -226,6 +226,12 @@ Unsloth `Qwen3.8-Flash-Next-UD-IQ4_XS`（3 个分片，87.2 GiB，第 1 个分�
 显存常驻 ≈60.4 GiB（专家 55.4 + dense 4.8 + norm 等），比 v2 hgn（62.1 GiB）还小，95 GiB arena 放 256K
 没有问题。分片里没有 MTP 头，MTP 用单独的 `mtp-*.gguf` sidecar（没有时不投机）。
 
+MTP sidecar 用 `mtp-Qwen3.8-Flash-Next-Q8_0.gguf`（4.1 GB，dense 全 Q8_0，路由专家 Q8_0）。它比 Linux 上
+用的 `…-shared-Q8_0.gguf` 多带了 `token_embd` / `output`，引擎不读这两个，草稿头沿用主干的 embed 和
+lm_head：`token_embd` 两边逐字节相同（md5 一致），说明出自同一个 checkpoint。`…-Q4_K_M.gguf` 版里有
+Q5_0 张量（hc_*_up），引擎还不支持，而且草稿头精度越低接受率越低，不推荐。分片目录里有多个 `mtp-*.gguf`
+时引擎不会自动挑，必须显式指定（`GGUF_MTP_FILE` 或 `QWENOX_GGUF_MTP`）。
+
 实现要点：
 
 - **IQ3_S 不需要新的解码框架**：`iq3s_grid` 的 512×4 个字节全部是 {1,3,…,15}，所以每 32 个元素等价于
@@ -267,7 +273,20 @@ kernel 对拍（混合类型层 0/2/30/47）、v2 路径与旧提交逐位相同
 
 结论：质量明显好于 v2（PPL −18%，KLD 待 Linux 上对 BF16 基准补测），显存更省。速度方面 decode 慢
 约 12%，32K 以上 prefill 慢约 8%，原因和 UD-Q4_K_XL 相同：dense 是 Q8_0，每 token 读的字节约为 v2 的 2 倍。
-MTP 投机要等 `mtp-*.gguf` sidecar 就位后实测。
+MTP（`tools/iq4xs_verify_win.sh` 的 mtp 步骤，greedy γ=4，`--spec-gen 256`，maxctx 16384）：
+
+| prompt | UD-IQ4_XS + mtp Q8_0 sidecar | v2 + mtp.hgn |
+|---|---|---|
+| 2048 | 46.8 tok/s，commit/round 4.02 | 58.5 tok/s，commit/round 4.02 |
+| 8192 | 47.1 tok/s，commit/round 4.02 | 49.8 tok/s，commit/round 3.67 |
+
+GGUF 投机输出与普通 greedy（`--gen 256`，25.2 tok/s）前 256 个 token 完全一致；投机约为普通 decode 的
+1.86×。草稿头接受率不低于 v2，剩下的差距来自每轮验证的 dense 字节（同上）。服务端带 sidecar 启动
+（`mtp: draft head enabled`）对话正常。
+
+注：验证中 v2 + mtp.hgn 在 2048 prompt 上偶发过一次段错误（`verify graphs captured` 之后，崩在 HIP 运行时
+`hipEventSynchronize` 内部）。同一命令用 6eb7c9e 基线与新二进制各重跑 2 次都正常，输出逐 token 相同，
+因此与本次改动无关，原因待查。
 
 ## 验证脚本
 
