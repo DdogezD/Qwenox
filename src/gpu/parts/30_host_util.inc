@@ -1007,22 +1007,24 @@ static void ht_wmma_p(const WView& w, const void* x, bool xbf16, uint64_t xs, fl
                                                      ys, nty * 128, K, (int)nrows, tpb, tpc, P,
                                                      g_ht_zs, g_ht_cnt);
 }
-// QWENOX_DENSE_WMMA=1: every v2 ht GEMV of P <= 48 rows (decode gemv, draft,
-// spec verify, batched verify, small prefill chunks) runs k_ht_wmma instead of
-// the fp32 k_ht_gemv. One row-invariant kernel for all P keeps concurrent ==
-// single-run bit for bit; numerics differ from the fp32 path (x^ -> f16),
-// KLD-gated. Default off.
+// QWENOX_DENSE_WMMA (default on; =0 restores the fp32 k_ht_gemv path): every
+// v2 ht GEMV of P <= 48 rows (decode gemv, draft, spec verify, batched verify,
+// small prefill chunks) runs k_ht_wmma instead of the fp32 k_ht_gemv. One
+// row-invariant kernel for all P keeps concurrent == single-run bit for bit;
+// numerics differ from the fp32 path (x^ -> f16). KLD 10-12 (Linux, v2,
+// BF16 ref ctx512x64, QWENOX_PREFILL_CHUNK=24): off 0.107830 -> on 0.106627,
+// top-1 88.96 -> 89.03 %.
 static bool dense_wmma_on() {
   static const bool v = [] {
     const char* e = getenv("QWENOX_DENSE_WMMA");
-    const bool on = e && *e && strcmp(e, "0") != 0;
+    const bool on = !(e && e[0] == '0' && e[1] == 0);
     if (on) fprintf(stderr, "dense wmma: v2 ht GEMV P<=%d on k_ht_wmma (QWENOX_DENSE_WMMA)\n", 48);
     return on;
   }();
   return v;
 }
 // QWENOX_DENSE_WMMA_HC=0: keep the q6g64 HC projections on the fp32 path while
-// QWENOX_DENSE_WMMA=1 (A/B; default follows QWENOX_DENSE_WMMA).
+// dense WMMA is on (A/B; default follows QWENOX_DENSE_WMMA).
 static bool dense_wmma_hc_on() {
   static const bool v = [] {
     const char* e = getenv("QWENOX_DENSE_WMMA_HC");
