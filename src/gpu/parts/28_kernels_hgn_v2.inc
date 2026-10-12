@@ -422,14 +422,32 @@ __global__ __launch_bounds__(256) void k_ht_wmma(const uint8_t* __restrict__ cod
                                                  const TX* __restrict__ x, uint64_t xs,
                                                  float* __restrict__ y, uint64_t ys, int O,
                                                  int K, int nrows, int tpb, int tpc, int P,
-                                                 float* __restrict__ zs, int* __restrict__ cnt) {
+                                                 float* __restrict__ zs, int* __restrict__ cnt,
+                                                 int nty0 = 1 << 30,
+                                                 const uint8_t* __restrict__ codes2 = nullptr,
+                                                 const float* __restrict__ suh2 = nullptr,
+                                                 const float* __restrict__ svh2 = nullptr,
+                                                 float* __restrict__ y2 = nullptr,
+                                                 int nrows2 = 0) {
   extern __shared__ __align__(16) unsigned char hw_lds[];
   __half* xh = (__half*)hw_lds;  // [P][RS] rotated x chunk (f16), rows >= P not stored
   float* zl = (float*)hw_lds;    // after the loop: z [P][128]
   __shared__ int s_last;
   const int RS = tpc * 128 + 8;  // row stride (halves), +16 B against bank aliasing
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
-  const int ty = blockIdx.x, kz = blockIdx.y;
+  const int ty = blockIdx.x, kz = blockIdx.y;  // ty: global tile row (split-K slots)
+  // Pair launch (shared-expert gate + up, same K and x): tile rows >= nty0
+  // belong to the second weight, with its own suh / svh / y. tyl = tile row
+  // within its weight.
+  const bool sec = ty >= nty0;
+  const int tyl = sec ? ty - nty0 : ty;
+  if (sec) {
+    codes = codes2;
+    suh = suh2;
+    svh = svh2;
+    y = y2;
+    nrows = nrows2;
+  }
   const int ntx = K >> 7;
   const int tx0 = kz * tpb;
   const int nt = min(ntx, tx0 + tpb) - tx0;
@@ -443,7 +461,7 @@ __global__ __launch_bounds__(256) void k_ht_wmma(const uint8_t* __restrict__ cod
   for (int i = 0; i < NPT; i++)
 #pragma unroll
     for (int e = 0; e < 8; e++) acc[i][e] = 0.f;
-  const uint8_t* base = codes + ((size_t)ty * ntx + tx0) * 8192 + w * 128 + lane * 4;
+  const uint8_t* base = codes + ((size_t)tyl * ntx + tx0) * 8192 + w * 128 + lane * 4;
   uint32_t nxt[8];
 #pragma unroll
   for (int g = 0; g < 8; g++) nxt[g] = *(const uint32_t*)(base + g * 1024);
@@ -553,7 +571,7 @@ __global__ __launch_bounds__(256) void k_ht_wmma(const uint8_t* __restrict__ cod
     hv2::fwht128(v[0], v[1], v[2], v[3], lane);
 #pragma unroll
     for (int j = 0; j < 4; j++) {
-      const int r = ty * 128 + j * 32 + lane;
+      const int r = tyl * 128 + j * 32 + lane;
       if (r < nrows) y[(size_t)p * ys + r] = v[j] * hv2::kRs128 * svh[r];
     }
   }

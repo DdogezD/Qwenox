@@ -430,6 +430,7 @@ struct GpuModel {
     uint8_t* fp8 = nullptr;      // staging this flight fills
     int base = -1, P = 0, buf = 0;
     bool valid = false;
+    bool inline_io = false;  // Windows small batch: reads posted, no threads (ple_join waits)
     std::chrono::steady_clock::time_point start, done;
     // Batched verify (prefill_chunk_vseg): toks = nseg concatenated segments
     // of different slots; segment s spans [seg_start[s], seg_start[s+1]) and
@@ -1983,10 +1984,12 @@ struct GpuModel {
       }
     }
     // shared expert
-    snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.gate_proj.weight", l);
-    gemv(wview(ckpt.at(buf)), x, d_guv);
-    snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.up_proj.weight", l);
-    gemv(wview(ckpt.at(buf)), x, d_guv + 640);
+    {
+      char ub[128];
+      snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.gate_proj.weight", l);
+      snprintf(ub, sizeof ub, "layers.%d.mlp.shared_expert.up_proj.weight", l);
+      se_gate_up(buf, ub, x, d_guv, d_guv + 640, 1, true);
+    }
     k_silu_mul<<<(640 + 255) / 256, 256, 0, g_str>>>(d_guv, d_guv + 640, d_hid, 640);
     snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.down_proj.weight", l);
     gemv(wview(ckpt.at(buf)), d_hid, d_ey);
@@ -5222,14 +5225,37 @@ struct GpuModel {
       CK(hipMemcpyAsync(d_yb, acc, (size_t)P * g_cfg.d * 4, hipMemcpyDeviceToDevice,
                         g_str));
   }
+  // Shared-expert gate + up projections: P rows of x (row stride K) -> yg / yu
+  // ([P][rows] each). QWENOX_DENSE_WMMA: one k_ht_wmma pair launch on every
+  // path (decode gemv, draft, verify -- the pair's numerics differ from two
+  // separate launches, so all P must take it); otherwise, or when the pair
+  // does not apply (non-ht weights), exactly the old two calls: gemv() at the
+  // single-row decode sites (one_row), gemm() at the batched ones.
+  void se_gate_up(const char* gname, const char* uname, const float* x, float* yg, float* yu,
+                  int P, bool one_row) {
+    const WView g = wview(ckpt.at(gname)), u = wview(ckpt.at(uname));
+    static const bool no_mr = getenv("QWENOX_NO_GEMVMR") != nullptr;
+    if (dense_wmma_on() && (one_row || (!no_mr && P <= gemvmr_maxp())) &&
+        ht_wmma_pair(g, u, x, false, g.cols, yg, yu, g.rows, P))
+      return;
+    if (one_row) {
+      gemv(g, x, yg);
+      gemv(u, x, yu);
+    } else {
+      gemm(g, x, yg, P);
+      gemm(u, x, yu, P);
+    }
+  }
   // Shared expert output d_eyb [P][d] and gate logit d_sgb [P].
   void moe_b_shared_ey(int l, int P) {
     char buf[128];
     // shared expert (gate/up scratch in d_guvb head, silu out in d_hidb head)
-    snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.gate_proj.weight", l);
-    gemm(wview(ckpt.at(buf)), d_xb, d_guvb, P);
-    snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.up_proj.weight", l);
-    gemm(wview(ckpt.at(buf)), d_xb, d_guvb + (size_t)P * 640, P);
+    {
+      char ub[128];
+      snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.gate_proj.weight", l);
+      snprintf(ub, sizeof ub, "layers.%d.mlp.shared_expert.up_proj.weight", l);
+      se_gate_up(buf, ub, d_xb, d_guvb, d_guvb + (size_t)P * 640, P, false);
+    }
     k_silu_mul<<<(P * 640 + 255) / 256, 256, 0, g_str>>>(d_guvb, d_guvb + (size_t)P * 640,
                                                          d_hidb, P * 640);
     snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.down_proj.weight", l);
@@ -5619,13 +5645,40 @@ struct GpuModel {
     }
     const int P = fl.P;
     PleFlight* f = &fl;
-    constexpr int nt = 16;
+    // Address shards: one thread per token up to 16 (a 5-row verify used to
+    // spawn 16 threads, 11 with no tokens; each token's rows are computed
+    // independently, so the staging bytes do not depend on nt).
+    const int nt = std::max(1, std::min(16, P));
     fl.workers.store(nt);
     fl.pool.clear();
     fl.pool.reserve(nt);
     if (!getenv("QWENOX_PLE_NOSORT")) {
       fl.barrier.store(0, std::memory_order_relaxed);
       if (ple_uring_ready()) {
+#ifdef _WIN32
+        // Small batch (decode / spec verify / batched verify, 16*P <= 512
+        // rows): row addresses on this thread, every read posted to the IOCP
+        // now, completions collected in ple_join -- no threads. Same rows, same
+        // staging bytes as the threaded pump below. QWENOX_PLE_INLINE=0: off.
+        static const bool ple_inline = !env_zero("QWENOX_PLE_INLINE");
+        if (ple_inline && (size_t)P * 16 <= PleWin::DEPTH) {
+          fl.addrs.resize((size_t)P * 16);
+          for (int t = 0; t < P; t++)
+            for (int h = 0; h < 16; h++) {
+              int64_t mix = ple_cat(*f, t, 0) * ple_mult[0] ^ (ple_cat(*f, t, 1) * ple_mult[1]);
+              if (h >= 8) mix ^= ple_cat(*f, t, 2) * ple_mult[2];
+              uint64_t row = (uint64_t)(ple_voff[h] + (int64_t)(mix % ple_vsz[h]));
+              fl.addrs[(size_t)t * 16 + h] =
+                  (uint64_t)(uintptr_t)(ple_table->data + row * g_ple_rb);
+            }
+          PLE_PUMP.issue(fl.addrs.data(), fl.fp8, (uint64_t)(uintptr_t)ple_table->data,
+                         (size_t)P * 16);
+          fl.inline_io = true;
+          fl.workers.store(0);
+          fl.valid = true;
+          return;
+        }
+#endif
         // IOCP/io_uring batch-pread gather: phase A is the same 16-thread row
         // address computation; the pump threads then push all 16*P rows in
         // token order through the deep rings straight into pinned staging
@@ -5634,7 +5687,7 @@ struct GpuModel {
         const int npump = P >= 64 ? std::min(nt, ple_pump_count()) : 1;
         fl.workers.store(npump);  // only the pump threads account for fl.done
         for (int w = 0; w < nt; w++)
-          fl.pool.emplace_back([this, f, w, npump] {
+          fl.pool.emplace_back([this, f, w, npump, nt] {
             const int t0 = (int)((size_t)w * f->P / nt),
                       t1 = (int)((size_t)(w + 1) * f->P / nt);
             for (int t = t0; t < t1; t++)
@@ -5666,7 +5719,7 @@ struct GpuModel {
         fl.addrs.resize((size_t)P * 16);
         fl.keys.resize((size_t)P * 16);
         for (int w = 0; w < nt; w++)
-          fl.pool.emplace_back([this, f, w] {
+          fl.pool.emplace_back([this, f, w, nt] {
             const int t0 = (int)((size_t)w * f->P / nt),
                       t1 = (int)((size_t)(w + 1) * f->P / nt);
             for (int t = t0; t < t1; t++)
@@ -5707,7 +5760,7 @@ struct GpuModel {
       }
     } else {
       for (int w = 0; w < nt; w++)
-        fl.pool.emplace_back([this, f, w] {
+        fl.pool.emplace_back([this, f, w, nt] {
           for (int t = w; t < f->P; t += nt)
             ple_rows_fp8_win(*f, t, f->fp8 + (size_t)t * 16 * g_ple_rb);
           if (f->workers.fetch_sub(1) == 1)
@@ -5717,6 +5770,13 @@ struct GpuModel {
     fl.valid = true;
   }
   void ple_join() {
+#ifdef _WIN32
+    if (ple_fl.inline_io) {
+      PLE_PUMP.wait_all();
+      ple_fl.done = std::chrono::steady_clock::now();
+      ple_fl.inline_io = false;
+    }
+#endif
     for (auto& th : ple_fl.pool) th.join();
     ple_fl.pool.clear();
   }
@@ -6211,6 +6271,8 @@ struct GpuModel {
       ple_join();
       g_vseg_ple_ms += std::chrono::duration<double, std::milli>(
                            std::chrono::steady_clock::now() - ple_t0).count();
+      g_vseg_pleh_ms +=
+          std::chrono::duration<double, std::milli>(ple_fl.done - ple_fl.start).count();
       ple_fl.valid = false;
       ple_fl.nseg = 0;  // later single-window flights must not see segments
       uint8_t* stg_dev = ple_buf ? ple_eb_dev2 : ple_eb_dev;
@@ -6540,10 +6602,12 @@ struct GpuModel {
           d_guv, d_hid, g_cfg.moe_mid, k);
       moe_down1(k, dn, topids);
     }
-    snprintf(buf, sizeof buf, "%s.shared_expert.gate_proj.weight", pfx);
-    gemv(wview(ckpt.at(buf)), x, d_guv);
-    snprintf(buf, sizeof buf, "%s.shared_expert.up_proj.weight", pfx);
-    gemv(wview(ckpt.at(buf)), x, d_guv + 640);
+    {
+      char ub[128];
+      snprintf(buf, sizeof buf, "%s.shared_expert.gate_proj.weight", pfx);
+      snprintf(ub, sizeof ub, "%s.shared_expert.up_proj.weight", pfx);
+      se_gate_up(buf, ub, x, d_guv, d_guv + 640, 1, true);
+    }
     k_silu_mul<<<(640 + 255) / 256, 256, 0, g_str>>>(d_guv, d_guv + 640, d_hid,
                                                      640);
     snprintf(buf, sizeof buf, "%s.shared_expert.down_proj.weight", pfx);
@@ -7103,10 +7167,12 @@ struct GpuModel {
   void mtp_moe_b_shared(int P) {
     const char* pfx = "mtp.layers.0.mlp";
     char buf[128];
-    snprintf(buf, sizeof buf, "%s.shared_expert.gate_proj.weight", pfx);
-    gemm(wview(ckpt.at(buf)), d_xb, d_guvb, P);
-    snprintf(buf, sizeof buf, "%s.shared_expert.up_proj.weight", pfx);
-    gemm(wview(ckpt.at(buf)), d_xb, d_guvb + (size_t)P * 640, P);
+    {
+      char ub[128];
+      snprintf(buf, sizeof buf, "%s.shared_expert.gate_proj.weight", pfx);
+      snprintf(ub, sizeof ub, "%s.shared_expert.up_proj.weight", pfx);
+      se_gate_up(buf, ub, d_xb, d_guvb, d_guvb + (size_t)P * 640, P, false);
+    }
     k_silu_mul<<<(P * 640 + 255) / 256, 256, 0, g_str>>>(
         d_guvb, d_guvb + (size_t)P * 640, d_hidb, P * 640);
     snprintf(buf, sizeof buf, "%s.shared_expert.down_proj.weight", pfx);

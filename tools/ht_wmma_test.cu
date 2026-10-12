@@ -252,6 +252,101 @@ int main() {
   printf("round-weighted ht total (S0 call mix, ms): P=1 old %.2f new %.2f | P=5 old %.2f new "
          "%.2f | P=40 old %.2f new %.2f\n",
          tot_old[0], tot_new[0], tot_old[1], tot_new[1], tot_old[2], tot_new[2]);
+
+  // ---- pair launch (shared expert gate + up, 2 x 640x2560): ht_wmma_pair vs
+  // two ht_wmma launches (close, not bitwise: ks differs), pair row
+  // invariance, timing pair vs 2 separate.
+  {
+    const int O = 640, K = 2560;
+    const size_t wbytes = (size_t)O * K / 2;
+    const int ncopy = 32;
+    uint8_t* dc[2];
+    float *dsuh[2], *dsvh[2];
+    for (int k = 0; k < 2; k++) {
+      std::vector<uint8_t> hc(wbytes * ncopy);
+      for (auto& b : hc) b = (uint8_t)(rng() & 0xff);
+      std::vector<float> hsuh(K), hsvh(O);
+      for (auto& v : hsuh) v = (rng() & 1 ? 1.f : -1.f) * (0.75f + 0.5f * ud(rng));
+      for (auto& v : hsvh) v = (rng() & 1 ? 1.f : -1.f) * (0.01f + 0.04f * ud(rng));
+      TCK(hipMalloc(&dc[k], hc.size()));
+      TCK(hipMemcpy(dc[k], hc.data(), hc.size(), hipMemcpyHostToDevice));
+      TCK(hipMalloc(&dsuh[k], K * 4));
+      TCK(hipMalloc(&dsvh[k], O * 4));
+      TCK(hipMemcpy(dsuh[k], hsuh.data(), K * 4, hipMemcpyHostToDevice));
+      TCK(hipMemcpy(dsvh[k], hsvh.data(), O * 4, hipMemcpyHostToDevice));
+    }
+    WView wa{16, dc[0], (uint64_t)O, (uint64_t)K, 0, dsuh[0], dsvh[0]};
+    WView wb{16, dc[1], (uint64_t)O, (uint64_t)K, 0, dsuh[1], dsvh[1]};
+    std::vector<float> hx((size_t)MAXP * K);
+    for (auto& v : hx) v = nd(rng);
+    float *dx, *ya, *yb, *ra, *rb, *ta, *tb;
+    TCK(hipMalloc(&dx, hx.size() * 4));
+    TCK(hipMemcpy(dx, hx.data(), hx.size() * 4, hipMemcpyHostToDevice));
+    for (float** p : {&ya, &yb, &ra, &rb, &ta, &tb}) TCK(hipMalloc(p, (size_t)MAXP * O * 4));
+    // accuracy: pair vs separate at P = 48
+    if (!ht_wmma_pair(wa, wb, dx, false, K, ya, yb, O, MAXP)) {
+      printf("pair refused FAIL\n");
+      fails++;
+    }
+    run_new(wa, dx, false, ra, MAXP);
+    run_new(wb, dx, false, rb, MAXP);
+    TCK(hipDeviceSynchronize());
+    double me = 0;
+    {
+      auto a = dget(ya, (size_t)MAXP * O), b = dget(yb, (size_t)MAXP * O);
+      auto c = dget(ra, (size_t)MAXP * O), d = dget(rb, (size_t)MAXP * O);
+      double ss = 0;
+      for (float v : c) ss += (double)v * v;
+      const double rms = sqrt(ss / c.size());
+      for (size_t i = 0; i < a.size(); i++)
+        me = std::max(me, std::max(fabs((double)a[i] - c[i]), fabs((double)b[i] - d[i])) / rms);
+    }
+    // row invariance of the pair
+    auto refa = dget(ya, (size_t)MAXP * O), refb = dget(yb, (size_t)MAXP * O);
+    long bad = 0;
+    for (auto [P, off] : std::vector<std::pair<int, int>>{
+             {1, 0}, {1, 29}, {5, 11}, {8, 40}, {9, 2}, {17, 7}, {33, 1}, {40, 8}}) {
+      ht_wmma_pair(wa, wb, dx + (size_t)off * K, false, K, ta, tb, O, P);
+      TCK(hipDeviceSynchronize());
+      auto a = dget(ta, (size_t)P * O), b = dget(tb, (size_t)P * O);
+      if (memcmp(a.data(), &refa[(size_t)off * O], (size_t)P * O * 4) ||
+          memcmp(b.data(), &refb[(size_t)off * O], (size_t)P * O * 4))
+        bad++;
+    }
+    const bool ok = me < 1e-4 && bad == 0;
+    printf("se.pair  2x%d %5d | pair-vs-separate maxerr/rms %.2e | inv %s\n", O, K, me,
+           bad ? "BAD" : "ok");
+    if (!ok) fails++;
+    auto tm = [&](bool pair, int P) {
+      std::vector<float> ts;
+      for (int r = 0; r < 43; r++) {
+        WView a = wa, b = wb;
+        a.data = dc[0] + wbytes * (r % ncopy);
+        b.data = dc[1] + wbytes * (r % ncopy);
+        TCK(hipEventRecord(e0, 0));
+        if (pair) {
+          ht_wmma_pair(a, b, dx, false, K, ya, yb, O, P);
+        } else {
+          run_new(a, dx, false, ra, P);
+          run_new(b, dx, false, rb, P);
+        }
+        TCK(hipEventRecord(e1, 0));
+        TCK(hipEventSynchronize(e1));
+        float ms;
+        TCK(hipEventElapsedTime(&ms, e0, e1));
+        if (r >= 3) ts.push_back(ms);
+      }
+      std::sort(ts.begin(), ts.end());
+      return ts[ts.size() / 2] * 1e3;
+    };
+    printf("   P:");
+    for (int P : {1, 5, 8, 16, 40}) printf(" %7d", P);
+    printf("\n  2x1:");
+    for (int P : {1, 5, 8, 16, 40}) printf(" %7.1f", tm(false, P));
+    printf("  us\n pair:");
+    for (int P : {1, 5, 8, 16, 40}) printf(" %7.1f", tm(true, P));
+    printf("  us\n");
+  }
   printf(fails ? "HT_WMMA TEST: FAIL (%d)\n" : "HT_WMMA TEST: PASS\n", fails);
   return fails ? 1 : 0;
 }

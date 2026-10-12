@@ -1032,6 +1032,45 @@ static bool dense_wmma_hc_on() {
   }();
   return v;
 }
+// Pair launch: two ht weights with the same K reading the same x (shared
+// expert gate + up) in one k_ht_wmma grid; split-K from the combined shape.
+// Row-invariant like ht_wmma (shape-only config), but NOT bit-identical to two
+// separate ht_wmma launches (ks differs) -- callers use it for every P.
+static bool ht_wmma_pair(const WView& a, const WView& b, const void* x, bool xbf16, uint64_t xs,
+                         float* ya, float* yb, uint64_t ys, int P) {
+  if (P < 1 || P > kHtWmmaMaxP || a.dtype != 16 || b.dtype != 16 || a.cols != b.cols)
+    return false;
+  if (a.rows % 128 || b.rows % 128) return false;
+  if (((uintptr_t)x | (uintptr_t)ya | (uintptr_t)yb) & 15) return false;
+  const int K = (int)a.cols, ntx = K / 128;
+  const int na = (int)(a.rows / 128), nb = (int)(b.rows / 128), nty = na + nb;
+  int ks, tpb;
+  ht_wmma_split(ntx, nty, ks, tpb);
+  if (ks > 1 && ((size_t)ks * P * nty * 128 > kHtZs || nty > 4096)) return false;
+  static const int ldskb = [] {
+    const char* e = getenv("QWENOX_HT_WMMA_LDS_KB");
+    return e && *e ? std::max(4, atoi(e)) : 24;
+  }();
+  const int tpc = std::max(1, std::min(tpb, ldskb * 1024 / (P * 128 * 2)));
+  const size_t lds = std::max((size_t)P * (tpc * 128 + 8) * 2, (size_t)P * 128 * 4);
+  const dim3 grid((unsigned)nty, (unsigned)ks);
+#define QWENOX_HTP(NPT)                                                                       \
+  do {                                                                                        \
+    if (xbf16)                                                                                \
+      k_ht_wmma<NPT, uint16_t><<<grid, 256, lds, g_str>>>(                                    \
+          a.data, a.suh, a.svh, (const uint16_t*)x, xs, ya, ys, nty * 128, K, (int)a.rows,     \
+          tpb, tpc, P, g_ht_zs, g_ht_cnt, na, b.data, b.suh, b.svh, yb, (int)b.rows);         \
+    else                                                                                      \
+      k_ht_wmma<NPT, float><<<grid, 256, lds, g_str>>>(                                       \
+          a.data, a.suh, a.svh, (const float*)x, xs, ya, ys, nty * 128, K, (int)a.rows, tpb,   \
+          tpc, P, g_ht_zs, g_ht_cnt, na, b.data, b.suh, b.svh, yb, (int)b.rows);              \
+  } while (0)
+  if (P <= 16) QWENOX_HTP(1);
+  else if (P <= 32) QWENOX_HTP(2);
+  else QWENOX_HTP(3);
+#undef QWENOX_HTP
+  return true;
+}
 static bool ht_wmma(const WView& w, const void* x, bool xbf16, uint64_t xs, float* y,
                     uint64_t ys, int P, uint64_t row_off, uint64_t nrows) {
   if (P < 1 || P > kHtWmmaMaxP) return false;

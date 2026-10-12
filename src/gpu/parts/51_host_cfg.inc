@@ -1817,11 +1817,12 @@ struct TurnProf {
       if (g_vseg_calls)
         fprintf(stderr,
                 "%s [turnprof] batched verify: %ld calls, %.1f rows avg, "
-                "PLE join wait %.1fms avg, host enqueue %.1fms avg\n",
+                "PLE join wait %.1fms avg (gather %.1fms), host enqueue %.1fms avg\n",
                 log_ts(), g_vseg_calls, (double)g_vseg_rows / g_vseg_calls,
-                g_vseg_ple_ms / g_vseg_calls, g_vseg_enq_ms / g_vseg_calls);
+                g_vseg_ple_ms / g_vseg_calls, g_vseg_pleh_ms / g_vseg_calls,
+                g_vseg_enq_ms / g_vseg_calls);
       g_vseg_calls = g_vseg_rows = 0;
-      g_vseg_ple_ms = g_vseg_enq_ms = 0;
+      g_vseg_ple_ms = g_vseg_pleh_ms = g_vseg_enq_ms = 0;
       for (int i = 0; i < TT_N; i++) held[i] = 0, holds[i] = 0;
       idle = 0;
       last_print = rel;

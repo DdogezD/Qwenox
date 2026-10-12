@@ -274,6 +274,44 @@ struct PleWin {
       done++;
     }
   }
+
+  // Split form of run() for one small batch (n <= DEPTH): issue() posts every
+  // read now, wait_all() collects the n completions later. Same bytes as
+  // run(). Lets the caller post the reads, enqueue GPU work, then wait, with
+  // no helper thread (10-12: spawning threads per verify cost ~2 ms under
+  // serving load). One batch in flight at a time.
+  std::vector<OVERLAPPED> b_ovs;
+  size_t b_n = 0;
+  void issue(const uint64_t* addrs, uint8_t* staging, uint64_t table_va, size_t n) {
+    b_ovs.assign(n, OVERLAPPED{});  // never reallocated while reads are pending
+    for (size_t i = 0; i < n; i++) {
+      OVERLAPPED* ov = &b_ovs[i];
+      const uint64_t off = g_ple_foff + (addrs[i] - table_va);
+      ov->Offset = (DWORD)(off & 0xffffffffu);
+      ov->OffsetHigh = (DWORD)(off >> 32);
+      BOOL r = ReadFile(fh, staging + i * g_ple_rb, g_ple_rb, nullptr, ov);
+      if (!r && GetLastError() != ERROR_IO_PENDING) {
+        fprintf(stderr, "ple_win: ReadFile row %zu failed: %lu\n", i, GetLastError());
+        abort();
+      }
+    }
+    b_n = n;
+  }
+  void wait_all() {
+    for (size_t done = 0; done < b_n; done++) {
+      DWORD got = 0;
+      ULONG_PTR key = 0;
+      OVERLAPPED* pov = nullptr;
+      BOOL okr = GetQueuedCompletionStatus(iocp, &got, &key, &pov, INFINITE);
+      if (!okr || got != g_ple_rb) {
+        fprintf(stderr, "ple_win: read completion failed (row=%zd, got=%lu, err=%lu)\n",
+                pov ? (ptrdiff_t)(pov - b_ovs.data()) : (ptrdiff_t)-1, (unsigned long)got,
+                (unsigned long)GetLastError());
+        abort();
+      }
+    }
+    b_n = 0;
+  }
 };
 
 static PleWin g_ple_win;
