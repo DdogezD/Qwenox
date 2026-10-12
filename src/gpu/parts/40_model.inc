@@ -15,9 +15,10 @@ struct GpuModel {
   int maxbatch_cap;
   int pos = 0;
   NgramMod ngram;
-  // Adaptive ngram verify chunk rows, shared by both chain loops and kept
-  // across requests (the content mix is a workload property, so warmup should
-  // not repeat per request). 0 = the QWENOX_NGRAM_CHUNK env is still unparsed.
+  // Adaptive ngram verify chunk rows, shared by both chain loops. Per slot
+  // and reset per request (ng_reset, 10-12): a value carried over from other
+  // requests (or concurrent peers) changes this request's round structure,
+  // so the same seed would not reproduce. 0 = re-parse QWENOX_NGRAM_CHUNK.
   int ng_cs = 0;
   bool ng_cs_fixed = false;
   bool ng_legacy = false;  // QWENOX_NGRAM_CHUNK=0: legacy single-pass verify
@@ -32,9 +33,9 @@ struct GpuModel {
   // Adaptive ngram gate (chain drafters): the ngram leg only pays on
   // repetitive content. Track the draft-token accept ratio with an EMA over
   // ngram rounds, close the leg for 32 rounds, then probe again. Like ng_cs
-  // the state is a Model member shared by both chain loops and kept across
-  // requests (the content mix is a workload property). QWENOX_NGRAM_GATE=0
-  // pins the leg open.
+  // it is per slot and reset per request, so a request's output depends only
+  // on its own prompt/seed (not on what ran before or alongside it).
+  // QWENOX_NGRAM_GATE=0 pins the leg open.
   struct NgGate {
     double ema = 1.0;  // decayed draft-token accept ratio (starts optimistic)
     int cd = 0;        // rounds the leg stays closed (probes when it hits 0)
@@ -61,6 +62,11 @@ struct GpuModel {
     }
   };
   NgGate ng_gate;
+  // Request start (serve): fresh gate and chunk level.
+  void ng_reset() {
+    ng_gate = NgGate{};
+    ng_cs = 0;
+  }
 
   // device state
   float *d_R, *d_Rhat, *d_x, *d_y, *d_emb;
@@ -592,7 +598,8 @@ struct GpuModel {
   // mrope_gen_ is NOT per slot: it is a global generation for the ropecs
   // cache key (bind also drops that cache).
 #define QWENOX_SLOT_FIELDS(X)                                                    \
-  X(pos) X(ple_ringpos) X(chist) X(ngram) X(mtp_pos) X(kv_seq) X(d_ptab)      \
+  X(pos) X(ple_ringpos) X(chist) X(ngram) X(ng_gate) X(ng_cs) X(mtp_pos)     \
+  X(kv_seq) X(d_ptab)                                                         \
   X(mrope_active_) X(rope_delta_) X(mrope_pos_) X(mrope_grids_) X(d_rdelta)   \
   X(img_inj) X(img_hash_) X(d_img_emb) X(img_emb_rows) X(img_emb_cap)         \
   X(mtp_tap_capture) X(spec_snap) X(vsnap_row0_) X(ngram_verify_active)       \
@@ -10218,6 +10225,17 @@ struct GpuModel {
       };
       std::vector<double> tb, ts, te;
       for (int it = 0; it < N + 1; it++) {  // first iteration = warm-up
+        // production state for the batched call: every slot verifies with
+        // rollback snapshots on (the serial loop below clears spec_snap, and
+        // a snap-off batch takes different kernels -- measured the wrong path)
+        {
+          int vo = 0;
+          for (int s = 0; s < nseg; s++) {
+            slot_spec_snap(s) = true;
+            slot_vsnap_row0_(s) = vo;
+            vo += pv[s];
+          }
+        }
         bind(0);
         CK(hipStreamSynchronize(g_str));
         g_vseg_enq_ms = 0;

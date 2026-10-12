@@ -2649,6 +2649,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // Ngram proposals are request-local. Clear learned suffixes so a
     // previous request cannot collide with this prompt's hash history.
     if (g.drafter == 3 || g.drafter == 4) m.ngram.reset();
+    m.ng_reset();  // gate + chunk level are per request too (reproducibility)
     // Vision requests expand their grids in-engine (validated against the
     // prompt's image token runs); plain requests drop stale mrope state
     // (a cont turn skips reset_state).
