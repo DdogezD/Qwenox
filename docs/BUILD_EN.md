@@ -25,7 +25,7 @@ architecture flags directly to other graphics cards.
 ```bash
 bash build.sh                 # all: build engine + benchmark + API in parallel (default)
 bash build.sh --bundle        # distribution build with all runtime dependencies
-bash build.sh engine [name]   # engine only → build/<name> (default qwenox)
+bash build.sh engine [name]   # engine only → build/<name> (default qwenox-engine)
 bash build.sh bench           # standalone performance benchmark only
 bash build.sh api             # API server + CLI tools only
 bash build.sh test            # build ktest and run kernel unit tests

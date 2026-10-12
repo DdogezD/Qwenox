@@ -23,7 +23,7 @@ ROCm 需要支持 `gfx1151` 的版本。不要把 GPU 架构参数直接套用�
 ```bash
 bash build.sh                 # all:引擎 + benchmark + API 并行编译(默认)
 bash build.sh --bundle        # 分发构建：同时打包全部运行依赖
-bash build.sh engine [名字]   # 只编引擎 → build/<名字>(默认 qwenox)
+bash build.sh engine [名字]   # 只编引擎 → build/<名字>(默认 qwenox-engine)
 bash build.sh bench           # 只编独立性能测试工具
 bash build.sh api             # 只编 API 服务器 + CLI 工具
 bash build.sh test            # 编 ktest 并运行 kernel 单测
