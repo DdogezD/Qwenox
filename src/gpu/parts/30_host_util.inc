@@ -958,6 +958,72 @@ static bool ht_gemv(const WView& w, const void* x, bool xbf16, uint64_t xs, floa
   }
 }
 
+// --- dense WMMA ht GEMV (k_ht_wmma), row-invariant for P = 1..48 ------------
+// Split-K count from the shape only (never from P): the K slicing and the kz
+// summation order are part of every row's numerics, so they must not change
+// with the batch. Scratch is sized for the largest P (48).
+static constexpr int kHtWmmaMaxP = 48;
+static int ht_wmma_blocks() {
+  static const int v = [] {
+    const char* e = getenv("QWENOX_HT_WMMA_BLOCKS");
+    return e && *e ? std::max(1, atoi(e)) : 80;
+  }();
+  return v;
+}
+static void ht_wmma_split(int ntx, int nty, int& ks, int& tpb) {
+  ks = std::max(1, std::min((ht_wmma_blocks() + nty - 1) / nty, ntx));
+  while (ks > 1 && (size_t)ks * kHtWmmaMaxP * nty * 128 > kHtZs) ks = (ks + 1) / 2;
+  tpb = (ntx + ks - 1) / ks;
+  ks = (ntx + tpb - 1) / tpb;
+}
+template <int NPT>
+static void ht_wmma_p(const WView& w, const void* x, bool xbf16, uint64_t xs, float* y,
+                      uint64_t ys, int P, uint64_t row_off, uint64_t nrows) {
+  if (row_off % 128) throw std::runtime_error("ht wmma: row_off off the 128 grid");
+  const int K = (int)w.cols, ntx = K / 128;
+  const int nty = (int)((nrows + 127) / 128);
+  const uint8_t* codes = w.data + (row_off / 128) * (uint64_t)ntx * 8192;
+  const float* svh = w.svh + row_off;
+  int ks, tpb;
+  ht_wmma_split(ntx, nty, ks, tpb);
+  if (ks > 1 && ((size_t)ks * P * nty * 128 > kHtZs || nty > 4096))
+    throw std::runtime_error("ht wmma: split-K scratch too small");
+  // x^ chunk: ~24 KiB of f16 per pass (staging only, no effect on numerics)
+  const int tpc = std::max(1, std::min(tpb, 6 / NPT));
+  const size_t lds = std::max((size_t)16 * NPT * (tpc * 128 + 8) * 2, (size_t)P * 128 * 4);
+  const dim3 grid((unsigned)nty, (unsigned)ks);
+  if (xbf16)
+    k_ht_wmma<NPT, uint16_t><<<grid, 256, lds, g_str>>>(codes, w.suh, svh, (const uint16_t*)x,
+                                                        xs, y, ys, nty * 128, K, (int)nrows,
+                                                        tpb, tpc, P, g_ht_zs, g_ht_cnt);
+  else
+    k_ht_wmma<NPT, float><<<grid, 256, lds, g_str>>>(codes, w.suh, svh, (const float*)x, xs, y,
+                                                     ys, nty * 128, K, (int)nrows, tpb, tpc, P,
+                                                     g_ht_zs, g_ht_cnt);
+}
+// QWENOX_DENSE_WMMA=1: every v2 ht GEMV of P <= 48 rows (decode gemv, draft,
+// spec verify, batched verify, small prefill chunks) runs k_ht_wmma instead of
+// the fp32 k_ht_gemv. One row-invariant kernel for all P keeps concurrent ==
+// single-run bit for bit; numerics differ from the fp32 path (x^ -> f16),
+// KLD-gated. Default off.
+static bool dense_wmma_on() {
+  static const bool v = [] {
+    const char* e = getenv("QWENOX_DENSE_WMMA");
+    const bool on = e && *e && strcmp(e, "0") != 0;
+    if (on) fprintf(stderr, "dense wmma: v2 ht GEMV P<=%d on k_ht_wmma (QWENOX_DENSE_WMMA)\n", 48);
+    return on;
+  }();
+  return v;
+}
+static bool ht_wmma(const WView& w, const void* x, bool xbf16, uint64_t xs, float* y,
+                    uint64_t ys, int P, uint64_t row_off, uint64_t nrows) {
+  if (P < 1 || P > kHtWmmaMaxP) return false;
+  if (P <= 16) ht_wmma_p<1>(w, x, xbf16, xs, y, ys, P, row_off, nrows);
+  else if (P <= 32) ht_wmma_p<2>(w, x, xbf16, xs, y, ys, P, row_off, nrows);
+  else ht_wmma_p<3>(w, x, xbf16, xs, y, ys, P, row_off, nrows);
+  return true;
+}
+
 // q6g64 GEMV for P rows (same x / y conventions); x 16 B aligned.
 template <int P>
 static void q6g64_gemv_p(const WView& w, const void* x, bool xbf16, uint64_t xs, float* y,
@@ -1085,7 +1151,10 @@ static void gemv(const WView& w, const float* x, float* y, uint64_t row_off = 0,
     else
       q8g32_gemv_small<32, 256>(q, s, x, y, rows, w.cols, g_str);
   } else if (w.dtype == 16) {
-    ht_gemv(w, x, false, 0, y, 0, 1, row_off, rows);
+    if (dense_wmma_on())
+      ht_wmma(w, x, false, w.cols, y, 0, 1, row_off, rows);
+    else
+      ht_gemv(w, x, false, 0, y, 0, 1, row_off, rows);
   } else if (w.dtype == 24) {
     q6g64_gemv(w, x, false, 0, y, 0, 1, row_off, rows);
   } else {
@@ -1417,6 +1486,8 @@ static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
     if (xstride % 8 || (((uintptr_t)x | (uintptr_t)y) & 15)) return false;
   } else if (xstride % 4 || (((uintptr_t)x | (uintptr_t)y) & 15))
     return false;
+  if (w.dtype == 16 && dense_wmma_on())
+    return ht_wmma(w, x, xbf16, xstride, y, w.rows, P, 0, w.rows);
   if (P <= 8) return gemv_multi_q4cp_le8(w, x, y, P, xstride, xbf16);
   // P > 8: chunked passes of ≤ 8 rows re-read the weight per pass
   // (0.5-0.75 B/elem/pass vs ~4.5 B/elem for deq+WMMA, so the crossover is

@@ -383,6 +383,186 @@ __global__ __launch_bounds__(256) void k_ht_gemv(const uint8_t* __restrict__ cod
   }
 }
 
+// --- k_ht_wmma: row-invariant WMMA ht GEMV (dense WMMA, 10-12) --------------
+// Same contract as k_ht_gemv (rot_in -> z = G.x^ -> split-K -> rot_out) for
+// P = 1..16*NPT rows, but z runs on v_wmma_f32_16x16x16_f16: x^ is rounded to
+// f16 (the only new rounding: ht_val is exactly f16 already), f32 accumulate.
+// Row invariance (concurrent == single-run bit for bit): every output element
+// (p, o) is the WMMA chain over (tile t, 16-col group g) in fixed order, its
+// A row is row p's own x^ (rows >= P are zero), the split-K count ks is a
+// function of the shape only (host ht_wmma_ks), and the K-slice partials are
+// summed in kz order. Nothing depends on P or on the row's position in the
+// batch (tests/ht_wmma_test.cu checks shifted / reversed batches bitwise).
+// Layout: wave w owns rows [w*16, +16) of the 128-row tile and walks all 8
+// column groups g of each tile; a 16x16 code block (128 B at g*1024 + w*128)
+// decodes to lane l: row l&15, cols (l>>4)*8..+7 = half the WMMA B column
+// (gfx1151 B(k,c): lane c and lane 16+c both hold col c) -> one permlanex16
+// swap completes it. A(r,k) (r<8: lane 2r, r>=8: lane 17+2(r-8)) is read
+// from the f16 x^ chunk in LDS. C(r,c) = lane c + 16*(r>=8), elem r%8.
+// LDS: max(16*NPT*(tpc*128+8) f16 x^ chunk, P*128 f32 z).
+typedef _Float16 htw_v16h __attribute__((ext_vector_type(16)));
+typedef float htw_v8f __attribute__((ext_vector_type(8)));
+namespace hv2 {
+// packed f16 pair of ht_val2 (same bits, no f32 round trip)
+__device__ __forceinline__ uint32_t ht_h2(uint32_t a0, uint32_t a1) {
+  const uint32_t s0 = __builtin_amdgcn_sad_u8(a0 * 0x83dcd12du, 0u, 0x6400u);
+  const uint32_t s1 = __builtin_amdgcn_sad_u8(a1 * 0x83dcd12du, 0u, 0x6400u);
+  const uint32_t hp = s0 | (s1 << 16);
+  const __half2 r = __hfma2(*(const __half2*)&hp,
+                            __half2half2(__float2half(1.732421875f / 256.f)),
+                            __half2half2(__float2half(-10.3828125f)));
+  return *(const uint32_t*)&r;
+}
+}  // namespace hv2
+
+template <int NPT, typename TX>
+__global__ __launch_bounds__(256) void k_ht_wmma(const uint8_t* __restrict__ codes,
+                                                 const float* __restrict__ suh,
+                                                 const float* __restrict__ svh,
+                                                 const TX* __restrict__ x, uint64_t xs,
+                                                 float* __restrict__ y, uint64_t ys, int O,
+                                                 int K, int nrows, int tpb, int tpc, int P,
+                                                 float* __restrict__ zs, int* __restrict__ cnt) {
+  extern __shared__ __align__(16) unsigned char hw_lds[];
+  __half* xh = (__half*)hw_lds;  // [16*NPT][RS] rotated x chunk (f16)
+  float* zl = (float*)hw_lds;    // after the loop: z [P][128]
+  __shared__ int s_last;
+  constexpr int R16 = 16 * NPT;
+  const int RS = tpc * 128 + 8;  // row stride (halves), +16 B against bank aliasing
+  const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+  const int ty = blockIdx.x, kz = blockIdx.y;
+  const int ntx = K >> 7;
+  const int tx0 = kz * tpb;
+  const int nt = min(ntx, tx0 + tpb) - tx0;
+  // A-fragment row of this lane (k_gemm_wmma mapping; ignored lanes get
+  // complementary dummy rows so LDS phases spread over banks)
+  const int b_ = lane >> 1;
+  const int qrowA = (lane & 1) ? ((lane & 16) ? b_ : ((b_ + 4) & 7))
+                               : ((lane & 16) ? 8 + ((b_ + 4) & 7) : b_);
+  htw_v8f acc[NPT];
+#pragma unroll
+  for (int i = 0; i < NPT; i++)
+#pragma unroll
+    for (int e = 0; e < 8; e++) acc[i][e] = 0.f;
+  const uint8_t* base = codes + ((size_t)ty * ntx + tx0) * 8192 + w * 128 + lane * 4;
+  uint32_t nxt[8];
+#pragma unroll
+  for (int g = 0; g < 8; g++) nxt[g] = *(const uint32_t*)(base + g * 1024);
+  for (int t = 0; t < nt; t++) {
+    const int tc = t % tpc;
+    if (tc == 0) {  // rotate the next chunk of x into LDS (t is block-uniform)
+      const int nc = min(tpc, nt - t);
+      if (t) __syncthreads();
+      for (int c = w; c < R16 * nc; c += 8) {
+        const int p = c / nc, u = c - p * nc;
+        __half* dst = xh + (size_t)p * RS + u * 128;
+        if (p < P) {
+          const int col0 = (tx0 + t + u) * 128;
+          const TX* xr = x + (size_t)p * xs;
+          float v[4];
+#pragma unroll
+          for (int j = 0; j < 4; j++) {
+            const int i = col0 + j * 32 + lane;
+            v[j] = hv2::ldx(xr, i) * suh[i];
+          }
+          hv2::fwht128(v[0], v[1], v[2], v[3], lane);
+#pragma unroll
+          for (int j = 0; j < 4; j++) dst[j * 32 + lane] = __float2half(v[j] * hv2::kRs128);
+        } else {
+#pragma unroll
+          for (int j = 0; j < 4; j++) dst[j * 32 + lane] = __float2half(0.f);
+        }
+      }
+      __syncthreads();
+    }
+    uint32_t cw[8];
+#pragma unroll
+    for (int g = 0; g < 8; g++) cw[g] = nxt[g];
+    if (t + 1 < nt) {
+      const uint8_t* tb = base + (size_t)(t + 1) * 8192;
+#pragma unroll
+      for (int g = 0; g < 8; g++) nxt[g] = *(const uint32_t*)(tb + g * 1024);
+    }
+    const __half* xa = xh + (size_t)qrowA * RS + tc * 128;
+#pragma unroll
+    for (int g = 0; g < 8; g++) {
+      const uint32_t cur = cw[g];
+      // word of lane - 1 (lane 0 <- 31), exactly as k_ht_gemv
+      const uint32_t rr = (uint32_t)__builtin_amdgcn_mov_dpp((int)cur, 0x121, 0xf, 0xf, false);
+      const uint32_t xx = (uint32_t)__builtin_amdgcn_permlanex16((int)rr, (int)rr, 0x76543210,
+                                                                 (int)0xfedcba98, false, false);
+      const uint32_t prev = (lane & 15) ? rr : xx;
+      uint32_t own[4], oth[4];
+#pragma unroll
+      for (int j = 0; j < 4; j++)
+        own[j] = hv2::ht_h2(__builtin_amdgcn_alignbit(prev, cur, 28 - 8 * j) & 0xffffu,
+                            __builtin_amdgcn_alignbit(prev, cur, 24 - 8 * j) & 0xffffu);
+#pragma unroll
+      for (int j = 0; j < 4; j++)
+        oth[j] = (uint32_t)__builtin_amdgcn_permlanex16((int)own[j], (int)own[j], 0x76543210,
+                                                        (int)0xfedcba98, false, false);
+      const bool hi = lane >= 16;
+      uint32_t bw[8];
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        bw[j] = hi ? oth[j] : own[j];
+        bw[4 + j] = hi ? own[j] : oth[j];
+      }
+      htw_v16h bf;
+      memcpy(&bf, bw, 32);
+#pragma unroll
+      for (int pt = 0; pt < NPT; pt++) {
+        const __half* ap = xa + (size_t)pt * 16 * RS + g * 16;
+        uint4 a2[2];
+        a2[0] = *(const uint4*)ap;
+        a2[1] = *(const uint4*)(ap + 8);
+        htw_v16h af;
+        memcpy(&af, a2, 32);
+        acc[pt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf, acc[pt]);
+      }
+    }
+  }
+  __syncthreads();  // x^ chunk dead, LDS becomes z [P][128]
+#pragma unroll
+  for (int pt = 0; pt < NPT; pt++)
+#pragma unroll
+    for (int e = 0; e < 8; e++) {
+      const int p = pt * 16 + (lane >> 4) * 8 + e;
+      if (p < P) zl[p * 128 + w * 16 + (lane & 15)] = acc[pt][e];
+    }
+  __syncthreads();
+  if (gridDim.y > 1) {  // deterministic split-K, as k_ht_gemv
+    for (int i = tid; i < P * 128; i += 256)
+      zs[((size_t)kz * P + (i >> 7)) * O + ty * 128 + (i & 127)] = zl[i];
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) s_last = atomicAdd(cnt + ty, 1) == (int)gridDim.y - 1;
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();
+    for (int i = tid; i < P * 128; i += 256) {
+      const size_t o = (size_t)(i >> 7) * O + ty * 128 + (i & 127);
+      float s = __builtin_nontemporal_load(zs + o);
+      for (int k2 = 1; k2 < (int)gridDim.y; k2++)
+        s += __builtin_nontemporal_load(zs + (size_t)k2 * P * O + o);
+      zl[i] = s;
+    }
+    if (tid == 0) atomicExch(cnt + ty, 0);
+    __syncthreads();
+  }
+  for (int p = w; p < P; p += 8) {
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; j++) v[j] = zl[p * 128 + j * 32 + lane];
+    hv2::fwht128(v[0], v[1], v[2], v[3], lane);
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const int r = ty * 128 + j * 32 + lane;
+      if (r < nrows) y[(size_t)p * ys + r] = v[j] * hv2::kRs128 * svh[r];
+    }
+  }
+}
+
 // ht tile -> original-domain bf16 W[O][K] (prefill dequant into d_wbf16).
 // One block per tile; 64 KiB LDS tile, swizzled [r][c ^ (r & 31)].
 __global__ __launch_bounds__(256) void k_ht_deq_bf16(const uint8_t* __restrict__ codes,
