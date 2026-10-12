@@ -122,14 +122,14 @@ enum MenuId : UINT {
 
 std::wstring state_text() {
     if (g_eng.state == "running")
-        return g_eng.external ? TR(L"Qwenox引擎·运行中（外部）",
-                                   L"Qwenox engine·running (external)")
-                              : TR(L"Qwenox引擎·运行中", L"Qwenox engine·running");
+        return g_eng.external ? TR(L"Qwenox · 运行中（外部）",
+                                   L"Qwenox · running (external)")
+                              : TR(L"Qwenox · 运行中", L"Qwenox · running");
     if (g_eng.state == "starting")
-        return TR(L"Qwenox引擎·启动中…", L"Qwenox engine·starting…");
+        return TR(L"Qwenox · 启动中…", L"Qwenox · starting…");
     if (g_eng.state == "exited")
-        return TR(L"Qwenox引擎·已退出", L"Qwenox engine·exited");
-    return TR(L"Qwenox引擎·已停止", L"Qwenox engine·stopped");
+        return TR(L"Qwenox · 已退出", L"Qwenox · exited");
+    return TR(L"Qwenox · 已停止", L"Qwenox · stopped");
 }
 
 // ---- PerfSnap：3s 轮询引擎行协议的 SNAP 动词（移植自 launch_win.cpp）----------
