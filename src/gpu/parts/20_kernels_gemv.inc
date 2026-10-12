@@ -997,12 +997,21 @@ __global__ void k_gdn_step(const float* __restrict__ q, const float* __restrict_
 // no __syncthreads at all. qkv and out may alias: each row's value is read
 // before the first shfl of that row and the output store happens after the
 // second, inside the same warp.
-// Body shared by k_gdn_verify and the batched-verify k_gdn_verify_vseg
-// (25_kernels_gdn.inc): one source, so both compile the same arithmetic.
-__device__ __forceinline__ void gdn_verify_body(const int h, const float* qkv,
-                                                const float* g48,
-                                                const float* b48, float* S,
-                                                float* out, int P, int stride) {
+// Gated delta recurrence over P rows, one block (512 threads) per v-head h —
+// the single source of the GDN verify / replay arithmetic (10-12):
+//   k_gdn_verify        in place (ngram verify: output + S write-back)
+//   k_gdn_verify_ro     spec verify: output only, S left at the pre-round state
+//   k_gdn_commit        after acceptance: replay the committed rows, write S
+// so a committed S is bit-identical whichever kernel produced it (and to the
+// former k_gdn_snap rows: same per-row update expressions and order).
+// Row t inputs: k at kb + t*rs + (h/3)*128, v[i] at vb + t*rs + h*128 + i,
+// log-decay g at gb + t*gs + h, beta at bb + t*gs + h; OUT: q at
+// qb + t*rs + (h/3)*128 and out row at ob + t*rs + h*128 (may alias v).
+template <bool kOut, bool kWs>
+__device__ __forceinline__ void gdn_rec_body(const int h, const float* qb, const float* kb,
+                                             const float* vb, size_t rs, const float* gb,
+                                             const float* bb, int gs, float* S, float* ob,
+                                             int P) {
   const int lane = threadIdx.x % warpSize;
   const int i = (threadIdx.x / warpSize) * (warpSize / 4) + (lane >> 2);
   const int jc = lane & 3, j0 = jc * 32, jb = lane & ~3;
@@ -1011,11 +1020,10 @@ __device__ __forceinline__ void gdn_verify_body(const int h, const float* qkv,
 #pragma unroll
   for (int j = 0; j < 32; ++j) state[j] = Sh[(j0 + j) * 128 + i];
   for (int row = 0; row < P; ++row) {
-    const float* q = qkv + (size_t)row * stride + (h / 3) * 128;
-    const float* k = q + 2048;
-    const float value = qkv[(size_t)row * stride + 4096 + h * 128 + i];
-    const float alpha = expf(g48[row * 48 + h]);
-    const float beta = b48[row * 48 + h];
+    const float* k = kb + (size_t)row * rs + (h / 3) * 128;
+    const float value = vb[(size_t)row * rs + h * 128 + i];
+    const float alpha = expf(gb[(size_t)row * gs + h]);
+    const float beta = bb[(size_t)row * gs + h];
     float kv = 0.f;
 #pragma unroll
     for (int j = 0; j < 32; ++j) {
@@ -1027,26 +1035,71 @@ __device__ __forceinline__ void gdn_verify_body(const int h, const float* qkv,
     const float kv2 = __shfl_sync(~0ull, kv, jb + 2);
     const float kv3 = __shfl_sync(~0ull, kv, jb + 3);
     const float delta = (value - (kv0 + kv1 + kv2 + kv3)) * beta;
-    float result = 0.f;
+    if constexpr (kOut) {
+      const float* q = qb + (size_t)row * rs + (h / 3) * 128;
+      float result = 0.f;
 #pragma unroll
-    for (int j = 0; j < 32; ++j) {
-      state[j] += k[j0 + j] * delta;
-      result += state[j] * q[j0 + j];
+      for (int j = 0; j < 32; ++j) {
+        state[j] += k[j0 + j] * delta;
+        result += state[j] * q[j0 + j];
+      }
+      const float r0 = __shfl_sync(~0ull, result, jb + 0);
+      const float r1 = __shfl_sync(~0ull, result, jb + 1);
+      const float r2 = __shfl_sync(~0ull, result, jb + 2);
+      const float r3 = __shfl_sync(~0ull, result, jb + 3);
+      if (jc == 0) ob[(size_t)row * rs + h * 128 + i] = r0 + r1 + r2 + r3;
+    } else {
+#pragma unroll
+      for (int j = 0; j < 32; ++j) state[j] += k[j0 + j] * delta;
     }
-    const float r0 = __shfl_sync(~0ull, result, jb + 0);
-    const float r1 = __shfl_sync(~0ull, result, jb + 1);
-    const float r2 = __shfl_sync(~0ull, result, jb + 2);
-    const float r3 = __shfl_sync(~0ull, result, jb + 3);
-    if (jc == 0)
-      out[(size_t)row * stride + 4096 + h * 128 + i] = r0 + r1 + r2 + r3;
   }
+  if constexpr (kWs) {
 #pragma unroll
-  for (int j = 0; j < 32; ++j) Sh[(j0 + j) * 128 + i] = state[j];
+    for (int j = 0; j < 32; ++j) Sh[(j0 + j) * 128 + i] = state[j];
+  }
+}
+// qkv-row form of the body (rows of [q 2048 | k 2048 | v 6144], stride).
+template <bool kOut, bool kWs>
+__device__ __forceinline__ void gdn_verify_body(const int h, const float* qkv,
+                                                const float* g48, const float* b48, float* S,
+                                                float* out, int P, int stride) {
+  gdn_rec_body<kOut, kWs>(h, qkv, qkv + 2048, qkv + 4096, (size_t)stride, g48, b48, 48, S,
+                        out + 4096, P);
 }
 __global__ void k_gdn_verify(const float* qkv, const float* g48,
                              const float* b48, float* S, float* out,
                              int P, int stride) {
-  gdn_verify_body(blockIdx.x, qkv, g48, b48, S, out, P, stride);
+  gdn_verify_body<true, true>(blockIdx.x, qkv, g48, b48, S, out, P, stride);
+}
+// Spec verify: outputs only; S stays at the round start until k_gdn_commit.
+__global__ void k_gdn_verify_ro(const float* qkv, const float* g48, const float* b48,
+                                float* S, float* out, int P, int stride) {
+  gdn_verify_body<true, false>(blockIdx.x, qkv, g48, b48, S, out, P, stride);
+}
+// Per-row replay inputs of a spec verify round, layout per (row, GDN layer):
+// [k 2048 | v 6144 | g 48 | beta 48] floats (post conv/l2norm, post gates).
+constexpr int kGdnRowF = 8288;
+__global__ void k_gdn_rowsave(const float* __restrict__ convb, const float* __restrict__ g48,
+                              const float* __restrict__ b48, float* __restrict__ dst,
+                              size_t rs, int P) {
+  const int t = blockIdx.x;
+  if (t >= P) return;
+  const float* src = convb + (size_t)t * 10240 + 2048;
+  float* d = dst + (size_t)t * rs;
+  for (int c = threadIdx.x; c < 2048; c += blockDim.x)  // k|v as float4
+    *(float4*)(d + c * 4) = *(const float4*)(src + c * 4);
+  if (threadIdx.x < 48) {
+    d[8192 + threadIdx.x] = g48[t * 48 + threadIdx.x];
+    d[8240 + threadIdx.x] = b48[t * 48 + threadIdx.x];
+  }
+}
+// Install the state after the first n committed rows: grid (48, ngdn), rows
+// at rows + t*rs + gi*kGdnRowF, S layer gi at S + gi*48*128*128.
+__global__ void k_gdn_commit(const float* __restrict__ rows, size_t rs, float* S, int n) {
+  const int gi = blockIdx.y;
+  const float* r = rows + (size_t)gi * kGdnRowF;
+  gdn_rec_body<false, true>(blockIdx.x, nullptr, r, r + 2048, rs, r + 8192, r + 8240, (int)rs,
+                            S + (size_t)gi * 48 * 128 * 128, nullptr, n);
 }
 
 // --- indexer proj snapshot: keep every verify row's raw ring value (the

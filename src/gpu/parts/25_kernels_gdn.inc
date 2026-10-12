@@ -181,7 +181,6 @@ struct GdnVSeg {
   float* convst;   // slot conv state (layer gi)
   float* S;        // slot recurrent state (layer gi)
   float* csnap;    // conv snapshot base for row 0 of the segment (layer gi)
-  float* Ssnap;    // S snapshot base for row 0 of the segment (layer gi)
   int r0, P;       // batch rows [r0, r0+P)
 };
 struct GdnVSegs {
@@ -224,23 +223,14 @@ __global__ void k_convst_update_vseg(const float* __restrict__ x, GdnVSegs sg,
   convst_update_body(blockIdx.x * blockDim.x + threadIdx.x, g.convst,
                      x + (size_t)g.r0 * qkv, g.P, qkv);
 }
-// grid (48, nseg), 512 threads.
-__global__ void k_gdn_snap_vseg(const float* __restrict__ qkv,
-                                const float* __restrict__ g48,
-                                const float* __restrict__ b48, GdnVSegs sg,
-                                int qkvstride, size_t snaptstride) {
-  const GdnVSeg& g = sg.s[blockIdx.y];
-  gdn_snap_body(blockIdx.x, qkv + (size_t)g.r0 * qkvstride, g48 + (size_t)g.r0 * 48,
-                b48 + (size_t)g.r0 * 48, g.S, g.Ssnap, g.P, qkvstride,
-                snaptstride);
-}
-// grid (48, nseg), 512 threads; output in place over each segment's v rows.
+// grid (48, nseg), 512 threads; output in place over each segment's v rows,
+// slot S read-only (spec verify: k_gdn_commit installs it after acceptance).
 __global__ void k_gdn_verify_vseg(float* qkv, const float* g48, const float* b48,
                                   GdnVSegs sg, int stride) {
   const GdnVSeg& g = sg.s[blockIdx.y];
   float* q = qkv + (size_t)g.r0 * stride;
-  gdn_verify_body(blockIdx.x, q, g48 + (size_t)g.r0 * 48, b48 + (size_t)g.r0 * 48,
-                  g.S, q, g.P, stride);
+  gdn_verify_body<true, false>(blockIdx.x, q, g48 + (size_t)g.r0 * 48,
+                               b48 + (size_t)g.r0 * 48, g.S, q, g.P, stride);
 }
 
 // --- GDN chunked prefill (torch_chunk_gated_delta_rule equivalent), fp32.

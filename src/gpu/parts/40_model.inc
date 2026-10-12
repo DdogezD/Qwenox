@@ -563,7 +563,9 @@ struct GpuModel {
   // Runtime since 10-12: 48 with several slots (rendezvous), else 9 — a
   // single sequence paid ~4.4 GiB of arena for rows it never used.
   const int kVSnapRows = vsnap_rows_cfg();
-  float* d_Ssnap = nullptr;    // [kVSnapRows][ngdn][48*128*128]
+  // GDN replay inputs per verify row (k_gdn_rowsave): [kVSnapRows][ngdn]
+  // [kGdnRowF]; replaced the per-row S snapshots [kVSnapRows][ngdn][3.1 MB].
+  float* d_grow = nullptr;
   float* d_csnap = nullptr;    // [kVSnapRows][ngdn][3*10240]
   float* d_iproj_snap = nullptr;  // [nqsa][kVSnapRows][128]
   int vsnap_row0_ = 0;         // row base of the bound slot's snap segment
@@ -1153,7 +1155,7 @@ struct GpuModel {
           // captured during a spec verify chunk, indexed by accepted depth.
           // Spec chunks are gamma+1 <= 9 rows (gamma <= 8), not maxbatch;
           // kVSnapRows rows are allocated for the multi-slot rendezvous (D2).
-          DALLOC(&d_Ssnap, (size_t)kVSnapRows * ngdn * 48 * 128 * 128 * 4);
+          DALLOC(&d_grow, (size_t)kVSnapRows * ngdn * kGdnRowF * 4);
           DALLOC(&d_csnap, (size_t)kVSnapRows * ngdn * 3 * 10240 * 4);
           DALLOC(&d_iproj_snap, (size_t)(g_cfg.layers / 4) * kVSnapRows * 128 * 4);
         }
@@ -3029,7 +3031,6 @@ struct GpuModel {
       g.convst = slot_d_convst(t) + (size_t)gi * 3 * 10240;
       g.S = slot_d_S(t) + (size_t)gi * 48 * 128 * 128;
       g.csnap = d_csnap + ((size_t)vrow0 * ngdn + gi) * 3 * 10240;
-      g.Ssnap = d_Ssnap + ((size_t)vrow0 * ngdn + gi) * 48 * 128 * 128;
       g.r0 = voffs[s];
       g.P = Ps[s];
       for (int r = 0; r < Ps[s]; r++) sg.rowseg[voffs[s] + r] = (signed char)s;
@@ -3049,8 +3050,11 @@ struct GpuModel {
     k_gdn_gates<<<(unsigned)R, 64, 0, g_str>>>(d_g48b, d_beta48b, Alog, dtb,
                                                d_g48b, d_beta48b, 48, 48);
     KP_SUB_END();
-    k_gdn_snap_vseg<<<dim3(48, (unsigned)nseg), 512, 0, g_str>>>(
-        d_convb, d_g48b, d_beta48b, sg, 10240, (size_t)ngdn * 48 * 128 * 128);
+    // replay inputs of every row (batch row r -> d_grow row r: segment s's
+    // vsnap_row0_ == its batch offset), then the read-only verify
+    k_gdn_rowsave<<<(unsigned)R, 256, 0, g_str>>>(
+        d_convb, d_g48b, d_beta48b, d_grow + (size_t)gi * kGdnRowF,
+        (size_t)ngdn * kGdnRowF, R);
     KP_SUB("gdn:scan");
     k_gdn_verify_vseg<<<dim3(48, (unsigned)nseg), 512, 0, g_str>>>(
         d_convb, d_g48b, d_beta48b, sg, 10240);
@@ -3150,13 +3154,6 @@ struct GpuModel {
         fprintf(stderr, "[sS] P=%d base=%d bufhash=%016llx\n", P, moe_dump_base_,
                 (unsigned long long)fnv);
       }
-      if (usnap) {
-        int ngdn = g_cfg.layers - g_cfg.layers / 4;
-        k_gdn_snap<<<48, 512, 0, g_str>>>(
-            convb, g48b, beta48b, S,
-            d_Ssnap + ((size_t)vrow0 * ngdn + gi) * 48 * 128 * 128,
-            P, 10240, (size_t)ngdn * 48 * 128 * 128);
-      }
       KP_SUB("gdn:scan");
       // D2-S1b: spec verify rounds (spec_snap) always take k_gdn_verify.
       // Its per-row state recurrence is bit-identical to k_gdn_snap's (same
@@ -3166,7 +3163,18 @@ struct GpuModel {
       // / chunked-reassociated: their write-back differs from snap in LSBs,
       // and acceptance-pattern differences across gamma then leak into the
       // committed state (gs fork at abs 8196, γ2 P=3 vs γ3 P=4).
-      if ((ung || usnap) && !ngram_legacy_gdn && P <= 65) {
+      // 10-12: spec verify no longer snapshots S per row (P x 3.1 MB per
+      // layer). It saves the rows' replay inputs (k|v|g|beta, 33 KB/row) and
+      // leaves S at the round start; gdn_commit(d+1) replays the committed
+      // rows through the same recurrence body (gdn_rec_body) once the
+      // acceptance is known -- rollback and full accept alike.
+      if (usnap && P <= 65) {
+        const int ngdn = g_cfg.layers - g_cfg.layers / 4;
+        k_gdn_rowsave<<<P, 256, 0, g_str>>>(
+            convb, g48b, beta48b, d_grow + ((size_t)vrow0 * ngdn + gi) * kGdnRowF,
+            (size_t)ngdn * kGdnRowF, P);
+        k_gdn_verify_ro<<<48, 512, 0, g_str>>>(convb, g48b, beta48b, S, convb, P, 10240);
+      } else if (ung && !ngram_legacy_gdn && P <= 65) {
         k_gdn_verify<<<48, 512, 0, g_str>>>(
             convb, g48b, beta48b, S, convb, P, 10240);
       } else if (gdn_nosplit) {
@@ -7689,6 +7697,18 @@ struct GpuModel {
   // stays exact: γ is fixed before the round draws anything. Greedy ids can
   // differ from a fixed γ only through fp near-tie flips (as any γ change).
   // A gamma > 0 is used as-is (clamped to 8); adapt stays off.
+  // Spec verify commit (10-12): install the bound slot's GDN S after the first
+  // n rows of the last verify round (n = commit depth + 1, or all P rows on a
+  // full accept) by replaying the saved rows (d_grow at vsnap_row0_) through
+  // gdn_rec_body. The verify left S at the round start; one launch covers all
+  // GDN layers.
+  void gdn_commit(int n) {
+    if (n < 1) return;
+    const int ngdn = g_cfg.layers - g_cfg.layers / 4;
+    k_gdn_commit<<<dim3(48, (unsigned)ngdn), 512, 0, g_str>>>(
+        d_grow + (size_t)vsnap_row0_ * ngdn * kGdnRowF, (size_t)ngdn * kGdnRowF, d_S, n);
+  }
+
   struct GammaCtl {
     static constexpr float kPrior = 0.8f, kPriorN = 4.f;
     bool adapt = false;
@@ -7940,7 +7960,8 @@ struct GpuModel {
       if (keep_v) out.push_back(v[a]);
       auto t3 = std::chrono::steady_clock::now();
       if (!stop && d == g) {
-        cur = v[g];  // full accept; state already at q+1+g
+        gdn_commit(g + 1);  // GDN S: replay all rows (verify left it read-only)
+        cur = v[g];  // full accept; state at q+1+g
       } else {
         rollbacks++;
         // Install the state at commit depth d from the verify snapshots —
@@ -7951,11 +7972,7 @@ struct GpuModel {
         // from the checkpoint. d_Rb rows 0..d hold the accepted tokens'
         // streams for the MTP ingest below.
         int ngdn = g_cfg.layers - g_cfg.layers / 4;
-        const size_t sL = 48 * 128 * 128;
-        for (int gi = 0; gi < ngdn; gi++)
-          CK(hipMemcpyAsync(d_S + (size_t)gi * sL,
-                            d_Ssnap + ((size_t)(vsnap_row0_ + d) * ngdn + gi) * sL, sL * 4,
-                            hipMemcpyDeviceToDevice, g_str));
+        gdn_commit(d + 1);  // S after the committed rows (replay)
         CK(hipMemcpyAsync(d_convst, d_csnap + (size_t)(vsnap_row0_ + d) * ngdn * 3 * 10240,
                           (size_t)ngdn * 3 * 10240 * 4,
                           hipMemcpyDeviceToDevice, g_str));
@@ -8365,17 +8382,14 @@ struct GpuModel {
         if (keep_v) out.push_back(v[a]);
         accepted += d;
         if (!stop && d == g) {
-          cur = v[g];  // full accept; state already at q+1+g
+          gdn_commit(g + 1);  // GDN S: replay all rows (verify left it read-only)
+        cur = v[g];  // full accept; state at q+1+g
         } else {
           ++mtp_roll;
           // Install the state at commit depth d from the verify snapshots —
           // identical to spec_loop's rollback.
           int ngdn = g_cfg.layers - g_cfg.layers / 4;
-          const size_t sL = 48 * 128 * 128;
-          for (int gi = 0; gi < ngdn; gi++)
-            CK(hipMemcpyAsync(d_S + (size_t)gi * sL,
-                              d_Ssnap + ((size_t)(vsnap_row0_ + d) * ngdn + gi) * sL, sL * 4,
-                              hipMemcpyDeviceToDevice, g_str));
+          gdn_commit(d + 1);  // S after the committed rows (replay)
           CK(hipMemcpyAsync(d_convst, d_csnap + (size_t)(vsnap_row0_ + d) * ngdn * 3 * 10240,
                             (size_t)ngdn * 3 * 10240 * 4,
                             hipMemcpyDeviceToDevice, g_str));
@@ -8650,15 +8664,12 @@ struct GpuModel {
 
       auto t3 = std::chrono::steady_clock::now();
       if (!stop && d == g) {
+        gdn_commit(g + 1);  // GDN S: replay all rows
         cur = next;
       } else {
         rollbacks++;
         int ngdn = g_cfg.layers - g_cfg.layers / 4;
-        const size_t sL = 48 * 128 * 128;
-        for (int gi = 0; gi < ngdn; gi++)
-          CK(hipMemcpyAsync(d_S + (size_t)gi * sL,
-                            d_Ssnap + ((size_t)(vsnap_row0_ + d) * ngdn + gi) * sL, sL * 4,
-                            hipMemcpyDeviceToDevice, g_str));
+        gdn_commit(d + 1);  // S after the committed rows (replay)
         CK(hipMemcpyAsync(d_convst, d_csnap + (size_t)(vsnap_row0_ + d) * ngdn * 3 * 10240,
                           (size_t)ngdn * 3 * 10240 * 4,
                           hipMemcpyDeviceToDevice, g_str));
@@ -9240,17 +9251,14 @@ struct GpuModel {
         }
         accepted += d;
         if (!stop && d == g) {
-          cur = next;  // full accept; state already at q+1+g
+          gdn_commit(g + 1);  // GDN S: replay all rows
+          cur = next;  // full accept; state at q+1+g
         } else {
           ++mtp_roll;
           // Install the state at commit depth d from the verify snapshots —
           // identical to spec_loop_sample's rollback.
           int ngdn = g_cfg.layers - g_cfg.layers / 4;
-          const size_t sL = 48 * 128 * 128;
-          for (int gi = 0; gi < ngdn; gi++)
-            CK(hipMemcpyAsync(d_S + (size_t)gi * sL,
-                              d_Ssnap + ((size_t)(vsnap_row0_ + d) * ngdn + gi) * sL, sL * 4,
-                              hipMemcpyDeviceToDevice, g_str));
+          gdn_commit(d + 1);  // S after the committed rows (replay)
           CK(hipMemcpyAsync(d_convst, d_csnap + (size_t)(vsnap_row0_ + d) * ngdn * 3 * 10240,
                             (size_t)ngdn * 3 * 10240 * 4,
                             hipMemcpyDeviceToDevice, g_str));
@@ -10042,7 +10050,7 @@ struct GpuModel {
       fprintf(stderr, "vseg-selftest: R=%d rows exceed the verify cap\n", R);
       return false;
     }
-    if (!d_Ssnap || !d_iraw || !d_iproj_snap) {
+    if (!d_grow || !d_iraw || !d_iproj_snap) {
       fprintf(stderr, "vseg-selftest: needs the MTP build (snap/iraw buffers)\n");
       return false;
     }
@@ -10132,12 +10140,14 @@ struct GpuModel {
         return false;
       }
       spec_snap = false;
+      gdn_commit(pv[s]);  // full-accept commit: S via the replay path
       capture(A[(size_t)s]);
       // full logits rows: sampling consumes every value, not just the argmax
       A[(size_t)s].logits =
           fnv_dev(d_logits_b, (size_t)pv[s] * g_cfg.vocab * 4);
     }
     const uint64_t ipsA = fnv_dev(d_iproj_snap, nqsa * kVSnapRows * 128 * 4);
+    const uint64_t growA = fnv_dev(d_grow, (size_t)R * ngdn * kGdnRowF * 4);
     // ---- phase B: one multi-segment verify ----
     voff = 0;
     for (int s = 0; s < nseg; s++) {
@@ -10158,6 +10168,7 @@ struct GpuModel {
       return false;
     }
     const uint64_t ipsB = fnv_dev(d_iproj_snap, nqsa * kVSnapRows * 128 * 4);
+    const uint64_t growB = fnv_dev(d_grow, (size_t)R * ngdn * kGdnRowF * 4);
     std::vector<uint64_t> logB((size_t)nseg);
     {
       int vo = 0;
@@ -10179,6 +10190,7 @@ struct GpuModel {
         }
       voff += pv[s];
       bind(s);
+      gdn_commit(pv[s]);  // same commit as phase A, from the batched rows
       Snap B;
       capture(B);
       const Snap& a = A[(size_t)s];
@@ -10206,6 +10218,11 @@ struct GpuModel {
       }
     }
     bind(0);
+    if (growA != growB) {
+      fprintf(stderr, "vseg-selftest: d_grow %016llx != serial %016llx\n",
+              (unsigned long long)growB, (unsigned long long)growA);
+      pass = false;
+    }
     if (ipsA != ipsB) {
       fprintf(stderr, "vseg-selftest: d_iproj_snap %016llx != serial %016llx\n",
               (unsigned long long)ipsB, (unsigned long long)ipsA);

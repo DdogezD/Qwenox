@@ -295,7 +295,7 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
     add(512 * 4);                                   // mring_ckpt
     // kVSnapRows = vsnap_rows_cfg()：多槽 48（D2 会合），单槽 9（γ+1 ≤ 9）
     const size_t vr = (size_t)vsnap_rows_cfg();
-    add(vr * ngdn * 48 * 128 * 128 * 4);            // Ssnap
+    add(vr * ngdn * 8288 * 4);                      // grow (kGdnRowF)
     add(vr * ngdn * 3 * 10240 * 4);                 // csnap
     add(nqsa * vr * 128 * 4);                       // iproj_snap
     if (!qsa_dense) {
@@ -1388,10 +1388,30 @@ static bool gemv_multi_q4cp_le8(const WView& w, const void* x, float* y, int P,
   return true;
 }
 
+// QWENOX_GEMV_STAT=1 (diagnostic): histogram of multi-row gemv calls with
+// P > 8 by (dtype, rows, cols, xbf16), printed at process exit.
+struct GemvStat {
+  std::map<std::tuple<int, uint64_t, uint64_t, int>, std::pair<long, long>> m;
+  ~GemvStat() {
+    if (m.empty()) return;
+    fprintf(stderr, "gemv-stat (P>8 calls): dtype rows cols xbf16 -> calls, sumP\n");
+    for (auto& [k, v] : m)
+      fprintf(stderr, "  %d %llu %llu %d -> %ld %ld\n", std::get<0>(k),
+              (unsigned long long)std::get<1>(k), (unsigned long long)std::get<2>(k),
+              std::get<3>(k), v.first, v.second);
+  }
+};
+static GemvStat g_gemv_stat;
 static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
                             uint64_t xstride, bool xbf16 = false) {
   if (getenv("QWENOX_NO_GEMVMR")) return false;
   if (P < 1 || P > gemvmr_maxp()) return false;
+  static const bool gstat = getenv("QWENOX_GEMV_STAT") != nullptr;
+  if (gstat && P > 8) {
+    auto& e = g_gemv_stat.m[{w.dtype, w.rows, w.cols, xbf16 ? 1 : 0}];
+    e.first++;
+    e.second += P;
+  }
   if (!xstride) xstride = w.cols;
   if (xbf16) {
     if (xstride % 8 || (((uintptr_t)x | (uintptr_t)y) & 15)) return false;
