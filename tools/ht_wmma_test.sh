@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# ht_wmma_test.sh [ht|q6] — build + run tools/ht_wmma_test.cu (k_ht_wmma vs
-# k_ht_gemv) or tools/q6_wmma_test.cu (k_q6g64_wmma vs q6g64_gemv): accuracy,
+# ht_wmma_test.sh [ht|q6|q8] — build + run tools/ht_wmma_test.cu (k_ht_wmma vs
+# k_ht_gemv) , tools/q6_wmma_test.cu (k_q6g64_wmma vs q6g64_gemv) or
+# tools/q8_wmma_test.cu (k_q8g32_wmma vs CPU double, GGUF Q8_0 dense): accuracy,
 # row invariance, determinism, timing. Ends HT_WMMA / Q6_WMMA TEST: PASS/FAIL.
 # Windows (Git Bash, TheRock) or Linux (hipcc on PATH / ROCM).
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 mkdir -p build logs
 T="${1:-ht}"
-[[ "$T" == ht || "$T" == q6 ]] || { echo "usage: $0 [ht|q6]"; exit 2; }
+[[ "$T" == ht || "$T" == q6 || "$T" == q8 ]] || { echo "usage: $0 [ht|q6|q8]"; exit 2; }
 if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* ]]; then
   TR="${THEROCK:-/c/therock-dist-windows-gfx1151-10.1.0}"
   HIPCC="$TR/bin/hipcc.exe"

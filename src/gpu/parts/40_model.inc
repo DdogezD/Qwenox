@@ -383,7 +383,7 @@ struct GpuModel {
   float* d_gg_pw = nullptr;     // [topk]
   int *d_gg_tok = nullptr, *d_gg_pid = nullptr, *d_gg_nt = nullptr;
   MoeTile* d_gg_tiles = nullptr;  // [topk]
-  int* d_gg_uq = nullptr;         // expert-dedup metadata (moegg::kUqInts), 2 <= P <= 8
+  int* d_gg_uq = nullptr;         // expert-dedup metadata (moegg::kUqInts), 2 <= P <= 48
   // GDN chunked prefill (Phase 3b)
   float* d_convb;    // [maxctx, 10240] post-conv qkv (conv is not in-place)
   float* d_gdn_ws;   // [48, 2, 64, 128] per-head chunk scratch
@@ -1808,14 +1808,18 @@ struct GpuModel {
     const int k = g_cfg.topk, E = g_cfg.experts, d = g_cfg.d, mid = g_cfg.moe_mid;
     // Small P (decode, spec verify): raw-block GEMVs, FP32 hid, weighted sum in
     // expert-rank order written straight to acc (26_kernels_moe_gguf.inc).
-    // QWENOX_GG_GEMV=<max P> (default 8, 0 = always WMMA).
+    // QWENOX_GG_GEMV=<max P> (default 48 = moegg::kUqMaxP, 0 = always WMMA).
+    // Every P <= 48 (decode, spec verify, batched verify / drafts, small
+    // prefill tails) takes the GEMV family, whose per-(token, slot) arithmetic
+    // does not depend on P -> concurrent == single-run bit for bit (with the
+    // row-invariant dense q8g32 WMMA). P > 48 is prefill: WMMA tiles.
     static const int gemv_max = [] {
       const char* s = getenv("QWENOX_GG_GEMV");
-      return s && *s ? atoi(s) : 8;
+      return std::min(s && *s ? atoi(s) : moegg::kUqMaxP, moegg::kUqMaxP);
     }();
-    // 2 <= P <= 8: experts shared between the P tokens (spec verify) are read
-    // once (bit-identical to the plain path); unweighted pairs go to d_guvb.
-    // QWENOX_GG_UQ=0 disables.
+    // 2 <= P <= 48: experts shared between the P tokens are read once
+    // (bit-identical to the plain path); unweighted pairs go to d_guvb.
+    // QWENOX_GG_UQ=0 disables (then P > 8 re-reads per slot: slow).
     static const bool uq_on = [] {
       const char* s = getenv("QWENOX_GG_UQ");
       return !(s && *s == '0');
@@ -7331,7 +7335,7 @@ struct GpuModel {
     const WView& lw = wview(ckpt.at("lm_head.weight"));
     // QWENOX_DENSE_WMMA: k_ht_wmma takes all P <= 48 rows in one weight
     // stream (rows are independent, so == the 8-row groups bit for bit).
-    if (lw.dtype == 16 && dense_wmma_on() &&
+    if (((lw.dtype == 16 && dense_wmma_on()) || (lw.dtype == 8 && dense_wmma_q8_on())) &&
         gemv_multi_q4cp(lw, d_xb, d_logits_b, P, 2560))
       return;
     // The multi-row kernel is specialized for up to eight rows. Chunk larger

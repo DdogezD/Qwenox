@@ -919,8 +919,12 @@ static float f16_to_f32_host(uint16_t h) {
 // Upload every rotated weight's planes once (f16 -> f32), build the i4r
 // codebook and split-K scratch. No-op on v1 checkpoints. Call after load_arena.
 float* g_q6g_part = nullptr;  // q6g64 split-K partials [16][8][2048]
+extern float* g_q8w_part;
+static constexpr size_t kQ8wPartAlloc = (size_t)4 << 20;  // floats (== kQ8wPartFloats)
 static void v2_init(const Checkpoint& ck) {
   if (!g_q6g_part) CK(hipMalloc(&g_q6g_part, (size_t)16 * 8 * 2048 * 4));
+  // q8g32 WMMA split-K partials (k_q8g32_wmma); before any graph capture
+  if (!g_q8w_part) CK(hipMalloc(&g_q8w_part, kQ8wPartAlloc * 4));
   std::unordered_map<std::string, const float*> up;  // sidecar name -> f32 copy
   auto sidecar = [&](const std::string& n, uint64_t want) -> const float* {
     auto it = up.find(n);
@@ -1319,6 +1323,154 @@ static bool q6g64_wmma(const WView& w, const void* x, bool xbf16, uint64_t xs, f
   return true;
 }
 
+// --- dense WMMA q8g32 GEMV (k_q8g32_wmma), row-invariant for P = 1..48 ------
+// GGUF Q8_0 dense (and q8g32 hgn overlays). QWENOX_DENSE_WMMA_Q8 (default
+// follows QWENOX_DENSE_WMMA): every q8g32 GEMV of P <= 48 rows -- decode gemv,
+// lm_head, spec verify, batched verify / drafts, small prefill chunks -- runs
+// this one kernel, so concurrent == single-run bit for bit. The wave layout
+// (KW) and the K slicing (gps) are functions of the FULL tensor shape
+// (w.rows, w.cols) only: row slices (gemv row_off / nrows) keep the same
+// per-element arithmetic. ns > 1 partials go to g_q8w_part (v2_init).
+static constexpr size_t kQ8wPartFloats = (size_t)4 << 20;  // 16 MiB
+float* g_q8w_part = nullptr;
+static bool dense_wmma_q8_on() {
+  static const bool v = [] {
+    const char* e = getenv("QWENOX_DENSE_WMMA_Q8");
+    const bool on = dense_wmma_on() && !(e && e[0] == '0' && e[1] == 0);
+    if (on) fprintf(stderr, "dense wmma: q8g32 GEMV P<=48 on k_q8g32_wmma (QWENOX_DENSE_WMMA_Q8)\n");
+    return on;
+  }();
+  return v;
+}
+// shape-only config: KW group lanes (RW = 8 / KW row tiles) and gps groups/slice.
+// Knobs (speed only; every value is row-invariant because it depends on the
+// shape alone): QWENOX_Q8W_KW=<short>,<mid>,<long> for cols <= 1024 / mid /
+// >= 4096 (default 2,4,8), QWENOX_Q8W_BLOCKS target blocks per launch (split-K
+// fills it), QWENOX_Q8W_U loads in flight per lane (4 or 8).
+static int q8w_env(const char* n, int d) {
+  const char* e = getenv(n);
+  return e && *e ? atoi(e) : d;
+}
+static void q8w_config(uint64_t rows, uint64_t cols, int& kw, int& gps, int& ns) {
+  static const std::array<int, 3> kwv = [] {
+    int v[3] = {2, 4, 8};
+    if (const char* e = getenv("QWENOX_Q8W_KW"); e && *e) sscanf(e, "%d,%d,%d", &v[0], &v[1], &v[2]);
+    for (int& x : v) x = (x == 1 || x == 2 || x == 4 || x == 8) ? x : 4;
+    return std::array<int, 3>{v[0], v[1], v[2]};
+  }();
+  static const int nblk = std::max(1, q8w_env("QWENOX_Q8W_BLOCKS", 80));
+  const int ng = (int)(cols / 32);
+  kw = cols <= 1024 ? kwv[0] : cols >= 4096 ? kwv[2] : kwv[1];
+  const int rw = 8 / kw;
+  const int nrt = (int)((rows + 16 * rw - 1) / (16 * rw));  // row tiles of the full tensor
+  ns = std::max(1, std::min((nblk + nrt - 1) / nrt, std::max(1, ng / (2 * kw))));
+  gps = (ng + ns - 1) / ns;
+  ns = (ng + gps - 1) / gps;
+}
+// QWENOX_Q8W_SKIP=RxC,RxC,... (debug): these full-tensor shapes keep the old
+// q8g32 kernels (shape-only, so still consistent across P).
+static bool q8w_skip(uint64_t rows, uint64_t cols) {
+  static const std::vector<std::pair<uint64_t, uint64_t>> sk = [] {
+    std::vector<std::pair<uint64_t, uint64_t>> v;
+    if (const char* e = getenv("QWENOX_Q8W_SKIP"))
+      for (const char* p = e; *p;) {
+        unsigned long long r = 0, c = 0;
+        if (sscanf(p, "%llux%llu", &r, &c) == 2) v.push_back({r, c});
+        while (*p && *p != ',') p++;
+        if (*p) p++;
+      }
+    return v;
+  }();
+  for (auto& [r, c] : sk)
+    if (r == rows && c == cols) return true;
+  return false;
+}
+static bool q8g32_wmma(const WView& w, const void* x, bool xbf16, uint64_t xs, float* y,
+                       uint64_t ys, int P, uint64_t row_off, uint64_t nrows) {
+  if (P < 1 || P > 48 || w.dtype != 8 || w.cols % 32 || !nrows) return false;
+  if (q8w_skip(w.rows, w.cols)) return false;
+  // QWENOX_Q8W_XSTAT=N (debug, syncs): magnitude stats of x for the first N
+  // calls per shape -- f16 operand range check (|x| < 2^-14 subnormal, > 65504 inf).
+  static const int xstat = q8w_env("QWENOX_Q8W_XSTAT", 0);
+  if (xstat > 0) {
+    static std::map<std::pair<uint64_t, uint64_t>, int> seen;
+    int& c = seen[{w.rows, w.cols}];
+    hipStreamCaptureStatus cap = hipStreamCaptureStatusNone;
+    (void)hipStreamIsCapturing(g_str, &cap);
+    if (cap == hipStreamCaptureStatusNone && c++ < xstat) {
+      CK(hipStreamSynchronize(g_str));
+      std::vector<float> h((size_t)P * w.cols);
+      for (int p = 0; p < P; p++) {
+        if (xbf16) {
+          std::vector<uint16_t> b(w.cols);
+          CK(hipMemcpy(b.data(), (const uint16_t*)x + (size_t)p * xs, w.cols * 2, hipMemcpyDeviceToHost));
+          for (uint64_t i = 0; i < w.cols; i++) {
+            uint32_t u = (uint32_t)b[i] << 16;
+            memcpy(&h[p * w.cols + i], &u, 4);
+          }
+        } else {
+          CK(hipMemcpy(&h[p * w.cols], (const float*)x + (size_t)p * xs, w.cols * 4, hipMemcpyDeviceToHost));
+        }
+      }
+      double mx = 0, ss = 0;
+      size_t sub = 0, ovf = 0, nz = 0;
+      for (float v : h) {
+        const double a = fabs((double)v);
+        mx = std::max(mx, a);
+        ss += a * a;
+        nz += a > 0;
+        sub += a > 0 && a < 6.103515625e-05;
+        ovf += a > 65504.0;
+      }
+      fprintf(stderr, "q8w xstat %llux%llu P=%d xbf=%d: max %.3g rms %.3g subnormal %.2f%% overflow %zu\n",
+              (unsigned long long)w.rows, (unsigned long long)w.cols, P, (int)xbf16, mx,
+              sqrt(ss / h.size()), 100.0 * sub / std::max<size_t>(1, nz), ovf);
+    }
+  }
+  int kw, gps, ns;
+  q8w_config(w.rows, w.cols, kw, gps, ns);
+  const int R = (int)nrows, C = (int)w.cols;
+  // capacity from the FULL row count (shape-only: a slice never takes a
+  // different path than its full tensor)
+  if (ns > 1 && (!g_q8w_part || (size_t)ns * 48 * w.rows > kQ8wPartFloats)) return false;
+  const int8_t* q = (const int8_t*)w.data + row_off * w.cols;
+  const __half* sc = (const __half*)(w.data + w.rows * w.cols) + row_off * (w.cols / 32);
+  float* out = ns > 1 ? g_q8w_part : y;
+  const int rw = 8 / kw;
+  const dim3 grid((unsigned)((R + 16 * rw - 1) / (16 * rw)), (unsigned)ns);
+  static const int uq = q8w_env("QWENOX_Q8W_U", 4) == 8 ? 8 : 4;
+#define QWENOX_Q8W_(NPT, KW, UU)                                                               \
+  do {                                                                                         \
+    if (xbf16)                                                                                 \
+      k_q8g32_wmma<NPT, KW, uint16_t, UU><<<grid, 256, 0, g_str>>>(                            \
+          q, sc, C / 32, (const uint16_t*)x, xs, out, ys, R, C, gps, P);                       \
+    else                                                                                       \
+      k_q8g32_wmma<NPT, KW, float, UU><<<grid, 256, 0, g_str>>>(                               \
+          q, sc, C / 32, (const float*)x, xs, out, ys, R, C, gps, P);                          \
+  } while (0)
+#define QWENOX_Q8W(NPT, KW)            \
+  do {                                 \
+    if (uq == 8) QWENOX_Q8W_(NPT, KW, 8); \
+    else QWENOX_Q8W_(NPT, KW, 4);       \
+  } while (0)
+#define QWENOX_Q8W_KW(KW)                  \
+  do {                                     \
+    if (P <= 16) QWENOX_Q8W(1, KW);        \
+    else if (P <= 32) QWENOX_Q8W(2, KW);   \
+    else QWENOX_Q8W(3, KW);                \
+  } while (0)
+  if (kw == 1) QWENOX_Q8W_KW(1);
+  else if (kw == 2) QWENOX_Q8W_KW(2);
+  else if (kw == 4) QWENOX_Q8W_KW(4);
+  else QWENOX_Q8W_KW(8);
+#undef QWENOX_Q8W_KW
+#undef QWENOX_Q8W
+#undef QWENOX_Q8W_
+  if (ns > 1)
+    k_q6g64_wred<<<(unsigned)((P * R + 255) / 256), 256, 0, g_str>>>(g_q8w_part, y, ys, R, ns, P);
+  return true;
+}
+
 // ht / q6g64 -> bf16 W[rows][cols] (prefill GEMM operand).
 static void v2_deq_bf16(const WView& w, uint16_t* out, hipStream_t st) {
   if (w.dtype == 16) {
@@ -1358,6 +1510,11 @@ static void gemv(const WView& w, const float* x, float* y, uint64_t row_off = 0,
     k_bf16_gemv<<<(unsigned)blocks, threads, 0, g_str>>>(
         (const uint16_t*)w.data + row_off * w.cols, x, y, rows, w.cols);
   } else if (w.dtype == 8) {
+    // P = 1 decode forward / MTP draft step keeps the bandwidth-tuned GEMV
+    // (k_q8g32_wmma at P = 1 is 15-20% slower). Nothing compares this path
+    // bit for bit with a batched one: verify rows (any P, incl. γ = 0) go
+    // through gemm -> gemv_multi_q4cp -> k_q8g32_wmma, and the AR decode
+    // forward differs from verify rows anyway (decode-graph GDN / attention).
     const int8_t* q = (const int8_t*)w.data + row_off * w.cols;
     const __half* s = (const __half*)(w.data + w.rows * w.cols) + row_off * (w.cols / 32);
     // tools/q8g32_gemv_bench.cu: full-wave rows in 256-thread blocks beat the
@@ -1708,6 +1865,9 @@ static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
     return ht_wmma(w, x, xbf16, xstride, y, w.rows, P, 0, w.rows);
   if (w.dtype == 24 && dense_wmma_hc_on() &&
       q6g64_wmma(w, x, xbf16, xstride, y, w.rows, P, 0, w.rows))
+    return true;
+  if (w.dtype == 8 && dense_wmma_q8_on() &&
+      q8g32_wmma(w, x, xbf16, xstride, y, w.rows, P, 0, w.rows))
     return true;
   if (P <= 8) return gemv_multi_q4cp_le8(w, x, y, P, xstride, xbf16);
   // P > 8: chunked passes of ≤ 8 rows re-read the weight per pass
