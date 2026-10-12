@@ -83,6 +83,15 @@ static int eff_parallel() {
   const char* e = getenv("QWENOX_PARALLEL");
   return e ? std::max(1, std::min(8, atoi(e))) : 1;
 }
+// Multi-sequence verify rendezvous possible in this process (serve with
+// several slots, or the vseg selftest/bench). Sizes the rollback snapshot
+// rows and the multi-row gemv cap: a single sequence never batches more
+// than gamma+1 <= 9 verify rows, so it keeps the pre-D2 footprint.
+static bool vseg_multi() {
+  static const bool v = eff_parallel() > 1 || getenv("QWENOX_VSEG_SELFTEST");
+  return v;
+}
+static int vsnap_rows_cfg() { return vseg_multi() ? 48 : 9; }
 
 // hgn q4cp 路由专家 prefill 走 LUT 解码 WMMA kernel（27_kernels_moe_lut.inc）。
 // 默认开；QWENOX_MOE_Q4W=0 恢复旧路径（QWENOX_MOE_LT / tiled k_moe_w4）。开启时
@@ -284,10 +293,11 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
     add(rb * 4 * 3 + (size_t)g_cfg.d * 4 * 5 + 8);  // mR mRhat mh me meo mt mnorm_*
     add(3 * BP * 10240 * 4);                        // mRb mRhatb mtap
     add(512 * 4);                                   // mring_ckpt
-    // kVSnapRows = 48（40_model.inc，D2 会合预留多槽段；单槽只用前 9 行）
-    add(48 * ngdn * 48 * 128 * 128 * 4);            // Ssnap
-    add(48 * ngdn * 3 * 10240 * 4);                 // csnap
-    add(nqsa * 48 * 128 * 4);                       // iproj_snap
+    // kVSnapRows = vsnap_rows_cfg()：多槽 48（D2 会合），单槽 9（γ+1 ≤ 9）
+    const size_t vr = (size_t)vsnap_rows_cfg();
+    add(vr * ngdn * 48 * 128 * 128 * 4);            // Ssnap
+    add(vr * ngdn * 3 * 10240 * 4);                 // csnap
+    add(nqsa * vr * 128 * 4);                       // iproj_snap
     if (!qsa_dense) {
       add(4 * 128 * 4 + 256 * 4);                   // miraw minorm
       if (index_f32) add((size_t)640 * 2560 * 4);   // miw
@@ -1125,9 +1135,12 @@ static int gemvmr_maxp() {
   // logs/s3a_vbench_*.log。
   // Measured on v2 ht/q6g64; dtype 0/5/7/8 share the default pending their
   // own sweep (per-pass weight cost is the same 0.5-0.75 B/elem order).
+  // Single sequence (no rendezvous): 24, the measured single-pass optimum
+  // (P=32 chunked is +8% vs deq+WMMA); 48 only where batched verify needs
+  // the same gemv family as its per-segment calls.
   static const int v = [] {
     const char* e = getenv("QWENOX_GEMVMR_MAXP");
-    return e && *e ? atoi(e) : 48;
+    return e && *e ? atoi(e) : (vseg_multi() ? 48 : 24);
   }();
   return v;
 }

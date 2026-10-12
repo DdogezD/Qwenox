@@ -1768,6 +1768,61 @@ static GenReq parse_gen(std::istringstream& ss) {
 // N=1 keeps the old batch-1 semantics: live-state reuse is per connection
 // (a new connection starts with an empty hist), no hooks are installed.
 
+// QWENOX_TURN_PROF=1: GPU-turn time accounting for concurrent decode
+// (diagnostic only; off = zero cost). Every release syncs the stream so a
+// hold's time includes the GPU work it enqueued; time with no owner is the
+// hand-off gap (thread wake-ups, rendezvous waits). Tags say who held it.
+enum TurnTag { TT_WORKER = 0, TT_VR = 1, TT_DR = 2, TT_N = 3 };
+static thread_local int tl_turn_tag = TT_WORKER;
+static const bool g_turn_prof = [] {
+  const char* e = getenv("QWENOX_TURN_PROF");
+  return e && *e && strcmp(e, "0") != 0;
+}();
+struct TurnProf {
+  using clk = std::chrono::steady_clock;
+  clk::time_point acq{}, rel{}, last_print{};
+  double held[TT_N] = {}, idle = 0;  // ms, since last print
+  long holds[TT_N] = {};
+  bool have_rel = false;
+  // Called under the turnstile (only the owner touches it).
+  void on_acquire() {
+    acq = clk::now();
+    if (have_rel) idle += std::chrono::duration<double, std::milli>(acq - rel).count();
+  }
+  void on_release(int tag) {
+    (void)hipStreamSynchronize(g_str);
+    rel = clk::now();
+    have_rel = true;
+    held[tag] += std::chrono::duration<double, std::milli>(rel - acq).count();
+    holds[tag]++;
+    if (last_print.time_since_epoch().count() == 0) last_print = rel;
+    const double span = std::chrono::duration<double, std::milli>(rel - last_print).count();
+    if (span >= 10000.0) {
+      const double tot = held[0] + held[1] + held[2] + idle;
+      fprintf(stderr,
+              "%s [turnprof] %.1fs: verify-exec %.1f%% (%ld, %.1fms avg) "
+              "draft-exec %.1f%% (%ld, %.1fms avg) worker %.1f%% (%ld, %.2fms avg) "
+              "idle %.1f%%\n",
+              log_ts(), span / 1000.0, 100 * held[1] / tot, holds[1],
+              holds[1] ? held[1] / holds[1] : 0.0, 100 * held[2] / tot, holds[2],
+              holds[2] ? held[2] / holds[2] : 0.0, 100 * held[0] / tot, holds[0],
+              holds[0] ? held[0] / holds[0] : 0.0, 100 * idle / tot);
+      if (g_vseg_calls)
+        fprintf(stderr,
+                "%s [turnprof] batched verify: %ld calls, %.1f rows avg, "
+                "PLE join wait %.1fms avg, host enqueue %.1fms avg\n",
+                log_ts(), g_vseg_calls, (double)g_vseg_rows / g_vseg_calls,
+                g_vseg_ple_ms / g_vseg_calls, g_vseg_enq_ms / g_vseg_calls);
+      g_vseg_calls = g_vseg_rows = 0;
+      g_vseg_ple_ms = g_vseg_enq_ms = 0;
+      for (int i = 0; i < TT_N; i++) held[i] = 0, holds[i] = 0;
+      idle = 0;
+      last_print = rel;
+    }
+  }
+};
+static TurnProf g_turnprof;
+
 // FIFO ticket lock around the (single-threaded) GpuModel.
 struct Turnstile {
   std::mutex mu;
@@ -1777,8 +1832,10 @@ struct Turnstile {
     std::unique_lock<std::mutex> lk(mu);
     const uint64_t t = next++;
     cv.wait(lk, [&] { return serving == t; });
+    if (g_turn_prof) g_turnprof.on_acquire();
   }
   void release() {
+    if (g_turn_prof) g_turnprof.on_release(tl_turn_tag);
     {
       std::lock_guard<std::mutex> lk(mu);
       serving++;
@@ -2035,6 +2092,7 @@ struct VrReq {
   const std::vector<int>* vt;  // worker stack; valid while the worker blocks
   int base;                    // q+1
   int* vout;                   // worker stack v.data(), room for vt->size()
+  const std::function<void(int)>* post = nullptr;  // see GpuModel::vseg_pool_fn
   bool done = false;
   bool dropped = false;        // abort/guard refusal -> worker serial rerun
 };
@@ -2084,6 +2142,7 @@ static int vseg_active() {
 // vout, and wakes everyone. Call with the turn NOT held; returns with it
 // released again.
 static void vr_execute(GpuModel& m) {
+  tl_turn_tag = TT_VR;
   g_turn.acquire();
   m.bind(tl_slot);
   std::vector<VrReq*> mine;
@@ -2100,7 +2159,7 @@ static void vr_execute(GpuModel& m) {
       if (g_slots[(size_t)r->slot].abort) { r->dropped = true; continue; }
     }
     const int P = (int)r->vt->size();
-    if (rows + P > (int)GpuModel::kVSnapRows) {  // hard row budget
+    if (rows + P > m.kVSnapRows) {  // hard row budget
       r->dropped = true;
       g_vr.fallbacks++;
       continue;
@@ -2116,6 +2175,7 @@ static void vr_execute(GpuModel& m) {
       for (size_t i = 0; i < segs.size(); i++) {
         const int P = (int)segs[i].toks->size();
         memcpy(run[i]->vout, v.data() + off, (size_t)P * sizeof(int));
+        if (run[i]->post) (*run[i]->post)(off);  // rows still in d_logits_b
         off += P;
       }
     } else {
@@ -2128,6 +2188,8 @@ static void vr_execute(GpuModel& m) {
         m.bind(segs[i].slot);
         if (!m.verify_segments(&segs[i], 1, run[i]->vout))
           run[i]->dropped = true;  // worker re-runs prefill_batch+batch_argmax
+        else if (run[i]->post)
+          (*run[i]->post)(0);
       }
     }
   }
@@ -2147,17 +2209,19 @@ static void vr_execute(GpuModel& m) {
   }
   g_vr.cv.notify_all();
   g_turn.release();
+  tl_turn_tag = TT_WORKER;
 }
 
 // Worker half (GpuModel::vseg_pool_fn), called from spec_loop holding the
 // GPU turn, drafts done. Returns true with vout filled, or false when the
 // pool could not run this segment (caller runs the serial verify).
-static bool vseg_pool(GpuModel& m, const GpuModel::VSeg& self, int* vout) {
+static bool vseg_pool(GpuModel& m, const GpuModel::VSeg& self, int* vout,
+                      const std::function<void(int)>* post) {
   {
     std::lock_guard<std::mutex> lk(g_vr.mu);
     if (g_vr.active <= 1) return false;  // sole decoder: keep the serial path
   }
-  VrReq req{self.slot, self.toks, self.base, vout, false, false};
+  VrReq req{self.slot, self.toks, self.base, vout, post, false, false};
   bool am_exec = false;
   {
     std::lock_guard<std::mutex> lk(g_vr.mu);
@@ -2251,6 +2315,7 @@ struct DrActive {
 // draft, and wakes everyone. Call with the turn NOT held; returns with it
 // released again.
 static void dr_execute(GpuModel& m) {
+  tl_turn_tag = TT_DR;
   g_turn.acquire();
   m.bind(tl_slot);
   std::vector<DrReq*> mine;
@@ -2288,6 +2353,7 @@ static void dr_execute(GpuModel& m) {
   }
   g_dr.cv.notify_all();
   g_turn.release();
+  tl_turn_tag = TT_WORKER;
 }
 
 // Worker half (GpuModel::dr_pool_fn), called from the spec loops holding the

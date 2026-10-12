@@ -1513,14 +1513,15 @@ __device__ __forceinline__ void tr16x16_bf16(unsigned a[8]) {
 // iteration count is the runtime ceil(ntok / QW_KITER) (<= 17 here). Q/KV
 // layouts, softmax and the output write are identical to the sparse tail; the
 // launcher uses grid = (dense_P, 2), first = kbase = base, selected = nullptr.
-template <bool TransposedV = false, bool Paged = false, bool Dense = false>
-__global__ void __launch_bounds__(256)
-    k_qsa_wmma(const float* __restrict__ q, const uint16_t* __restrict__ kc,
-               const uint16_t* __restrict__ vc, const uint16_t* __restrict__ vct,
-               float* __restrict__ out, int P,
-               int dh, int hkv, int hq, const int* __restrict__ selected,
-               int first, int kbase = 0, const int* __restrict__ ptab = nullptr,
-               const int* __restrict__ dvb = nullptr, int dvb_edge = 0) {
+// Body of k_qsa_wmma for grid cell (bx, kvh); k_qsa_wmma_vseg (batched
+// multi-segment verify) runs the same body per segment row window.
+template <bool TransposedV, bool Paged, bool Dense>
+__device__ __forceinline__ void qsa_wmma_body(
+    const int bx, const int kvh_, const float* __restrict__ q,
+    const uint16_t* __restrict__ kc, const uint16_t* __restrict__ vc,
+    const uint16_t* __restrict__ vct, float* __restrict__ out, int P, int dh,
+    int hkv, int hq, const int* __restrict__ selected, int first, int kbase,
+    const int* __restrict__ ptab, const int* __restrict__ dvb, int dvb_edge) {
   (void)ptab;
   // P3-B: dvb carries the batch base on device (graph capture). dvb_edge:
   // 0 = full sparse range [max(kb,2051), kb+P) (grid == P), 1 = union right
@@ -1534,7 +1535,7 @@ __global__ void __launch_bounds__(256)
     else if (dvb_edge == 1) first_ = (kb + P) & ~3;
     else first_ = max(kb, 2051);
   }
-  const int token = first_ + (int)blockIdx.x, kvh = blockIdx.y;
+  const int token = first_ + bx, kvh = kvh_;
   if (dvb && !Dense) {
     const int ga_ = (max(kb, 2051) + 3) & ~3;
     if (dvb_edge == 1) {
@@ -1568,7 +1569,7 @@ __global__ void __launch_bounds__(256)
     }
   }
   __syncthreads();
-  const int* blocks = Dense ? nullptr : selected + (size_t)(dvb ? token - kb : (int)blockIdx.x) * 512;
+  const int* blocks = Dense ? nullptr : selected + (size_t)(dvb ? token - kb : bx) * 512;
   const int ntok = Dense ? token + 1 : 2048 + (token + 1) % 4;
   const long tail0 = Dense ? 0 : ((token + 1) / 4) * 4L;  // dense tail (visible = token+1)
   const int qw_niter = Dense ? (ntok + QW_KITER - 1) / QW_KITER : QW_NITER;
@@ -1807,6 +1808,44 @@ __global__ void __launch_bounds__(256)
       int r = (lane < 16) ? e : 8 + e;
       if (r < hq / hkv) ob[(size_t)r * dh + w * 32 + dt * 16 + c16] = acc[dt][e] * lfin[e];
     }
+}
+template <bool TransposedV = false, bool Paged = false, bool Dense = false>
+__global__ void __launch_bounds__(256)
+    k_qsa_wmma(const float* __restrict__ q, const uint16_t* __restrict__ kc,
+               const uint16_t* __restrict__ vc, const uint16_t* __restrict__ vct,
+               float* __restrict__ out, int P,
+               int dh, int hkv, int hq, const int* __restrict__ selected,
+               int first, int kbase = 0, const int* __restrict__ ptab = nullptr,
+               const int* __restrict__ dvb = nullptr, int dvb_edge = 0) {
+  qsa_wmma_body<TransposedV, Paged, Dense>(
+      (int)blockIdx.x, (int)blockIdx.y, q, kc, vc, vct, out, P, dh, hkv, hq,
+      selected, first, kbase, ptab, dvb, dvb_edge);
+}
+// Batched multi-segment verify: the dense (or sparse) attention rows of every
+// segment in ONE launch. Launch row i belongs to segment rowseg[i] and is
+// that segment's grid cell rowbx[i]; the segment's q/out/selected bases and
+// (first, kbase, P, ptab) are exactly what its per-segment k_qsa_wmma launch
+// receives, and the body is shared, so each output row is bit-identical.
+struct QsaVSeg {
+  const int* ptab;
+  const int* sel;   // selected rows for this launch's first row (sparse)
+  int first, kbase, P, r0;
+};
+struct QsaVSegs {
+  QsaVSeg s[8];
+  signed char rowseg[64];
+  signed char rowbx[64];
+};
+template <bool TransposedV, bool Paged, bool Dense>
+__global__ void __launch_bounds__(256)
+    k_qsa_wmma_vseg(const float* __restrict__ q, const uint16_t* __restrict__ kc,
+                    const uint16_t* __restrict__ vc, const uint16_t* __restrict__ vct,
+                    float* __restrict__ out, int dh, int hkv, int hq, QsaVSegs sg) {
+  const QsaVSeg& g = sg.s[sg.rowseg[blockIdx.x]];
+  const size_t ro = (size_t)g.r0 * hq * dh;
+  qsa_wmma_body<TransposedV, Paged, Dense>(
+      (int)sg.rowbx[blockIdx.x], (int)blockIdx.y, q + ro, kc, vc, vct, out + ro,
+      g.P, dh, hkv, hq, g.sel, g.first, g.kbase, g.ptab, nullptr, 0);
 }
 
 // --- k_qsa_wmma6: dim-split WMMA sparse flash attention (128 thr = 4 warps) --

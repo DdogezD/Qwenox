@@ -42,6 +42,14 @@ if [[ "${D2_GAMMA:-0}" -gt 7 ]]; then
 fi
 if [[ "${D2_GAMMA:-0}" -gt 0 ]]; then export QWENOX_SPEC_GAMMA="$D2_GAMMA"; fi
 if [[ "${D2_NOVR:-0}" = 1 ]]; then export QWENOX_NO_VR=1; fi
+# D2_SAMPLE=<temperature>：采样请求（固定 seed）。单跑/并发须逐 token 一致：会合
+# verify 的 logits 行与串行逐 bit 相同、每请求 RNG 流独立，所以采样结果也应相同。
+# 默认只测 drafter=4（chain，API 默认），跳过混合相位（纯 ngram 只支持 greedy）。
+SMP=""
+if [[ -n "${D2_SAMPLE:-}" ]]; then
+  SMP=",\"temperature\":${D2_SAMPLE},\"seed\":4242"
+  D2_DRAFTERS="${D2_DRAFTERS:-4}"
+fi
 
 # eng_cli：纯主机 C++，缺了就用 TheRock 自带 clang++ 现编（同 build.sh 的源列表）。
 if [[ ! -x "$CLI" ]]; then
@@ -69,7 +77,7 @@ if netstat -an | grep -E "[:.]$EPORT\s+.*LISTENING" >/dev/null 2>&1; then
   echo "FAIL: 端口 $EPORT 已被占用"; exit 1
 fi
 
-echo "== d2_s2_ids $(date '+%F %T')  PARALLEL=4 NO_VR=${D2_NOVR:-0} GAMMA=${D2_GAMMA:-auto} DRAFTERS=${D2_DRAFTERS:-1 4}"
+echo "== d2_s2_ids $(date '+%F %T')  PARALLEL=4 NO_VR=${D2_NOVR:-0} GAMMA=${D2_GAMMA:-auto} DRAFTERS=${D2_DRAFTERS:-1 4} SAMPLE=${D2_SAMPLE:-off}"
 "$BIN" "$M" "$NG" "$MTP" --serve --host 127.0.0.1 --port "$EPORT" \
     --maxctx 16384 >"$ELOG" 2>&1 &
 epid=$!
@@ -85,7 +93,7 @@ PROMPT='Write a complete, production-quality quicksort implementation in Python.
 
 run_client() {  # $1=标签 $2=drafter
   "$CLI" --host "127.0.0.1:$EPORT" --tokenizer "$TOKDIR" \
-      "{\"prompt\":\"$PROMPT\",\"max_tokens\":257,\"drafter\":$2}" \
+      "{\"prompt\":\"$PROMPT\",\"max_tokens\":257,\"drafter\":$2$SMP}" \
       > "logs/d2s2_$1.json" 2> "logs/d2s2_$1.err"
 }
 ids_md5() { grep -o '"ids":\[[0-9,]*\]' "logs/d2s2_$1.json" | md5sum | cut -d' ' -f1; }
@@ -131,7 +139,7 @@ done
 
 # 混合相位：2×chain(drafter=4) + 2×ngram(drafter=3) 并发。ngram 客户端永不
 # 入会合（不入 active、不提交），chain 客户端照常会合；各自 ≡ 各自基线。
-if [[ " ${D2_DRAFTERS:-1 4} " == *" 4 "* ]]; then
+if [[ " ${D2_DRAFTERS:-1 4} " == *" 4 "* && -z "${D2_SAMPLE:-}" ]]; then
   echo "-- mix: 2x drafter=4 + 2x drafter=3"
   run_client base_d3 3 || { echo "FAIL: base_d3 rc=$?"; exit 1; }
   b3=$(ids_md5 base_d3)

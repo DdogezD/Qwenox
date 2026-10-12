@@ -179,7 +179,12 @@ struct GpuModel {
   // single-segment verify_segments. vseg_active_fn reports how many workers
   // can submit a round now (gamma clamp for the shared row budget).
   struct VSeg;
-  bool (*vseg_pool_fn)(GpuModel&, const VSeg&, int*) = nullptr;
+  // post (optional, sampled spec loops): run by the executor right after the
+  // batched verify, still holding the GPU, with this segment's first row in
+  // d_logits_b — the worker's logits rows are only valid until the next
+  // batch, so their sampling prep (top-k / D2H) happens there.
+  bool (*vseg_pool_fn)(GpuModel&, const VSeg&, int*,
+                       const std::function<void(int)>*) = nullptr;
   int (*vseg_active_fn)() = nullptr;
   // D2-S2b/c: chain mode joins/leaves the rendezvous membership via these
   // (loop-scope count; ngram rounds excuse themselves per round — they never
@@ -420,7 +425,18 @@ struct GpuModel {
     int base = -1, P = 0, buf = 0;
     bool valid = false;
     std::chrono::steady_clock::time_point start, done;
+    // Batched verify (prefill_chunk_vseg): toks = nseg concatenated segments
+    // of different slots; segment s spans [seg_start[s], seg_start[s+1]) and
+    // has its own history pair. nseg == 0: one window (pre0/pre1 above).
+    int nseg = 0;
+    int seg_start[9] = {};
+    int64_t seg_pre0[8] = {}, seg_pre1[8] = {};
   } ple_fl;
+  struct PleSegs {  // ple_spawn argument for a multi-segment flight
+    int n = 0;
+    int start[9] = {};
+    int64_t pre0[8] = {}, pre1[8] = {};
+  };
 
   // ---- MTP speculative draft head (Phase A) ----
   // Single QSA+MoE layer on top of the trunk's 48-layer stream; predicts
@@ -538,7 +554,9 @@ struct GpuModel {
   // 48 = 8 slots × (gamma 5 + 1): B=8 rendezvous no longer clamps gamma
   // (24-row budget forced gamma<=2 there). Cost: +2.8 GiB arena (S0 的
   // 9→24 为 +1.73 GiB)，devarena estimate 86.4→89.2 + 4 slack = 93.2 < 95。
-  static constexpr int kVSnapRows = 48;
+  // Runtime since 10-12: 48 with several slots (rendezvous), else 9 — a
+  // single sequence paid ~4.4 GiB of arena for rows it never used.
+  const int kVSnapRows = vsnap_rows_cfg();
   float* d_Ssnap = nullptr;    // [kVSnapRows][ngdn][48*128*128]
   float* d_csnap = nullptr;    // [kVSnapRows][ngdn][3*10240]
   float* d_iproj_snap = nullptr;  // [nqsa][kVSnapRows][128]
@@ -2953,7 +2971,95 @@ struct GpuModel {
   // GDN: projections batched. Chunked path: conv/l2norm/gates batched, then
   // k_gdn_chunk (chunk=64, fp32) advances S and writes all outputs at once.
   // QWENOX_GDN_LOOP=1 falls back to the per-token recurrence loop.
-  void gdn_b(int l, int gi, int P, int slot = -1, int r0 = 0) {
+  // GDN in/out projections over P rows starting at the given workspace rows.
+  // Row-invariant gemv (ktest ri_*): a row's result does not depend on P, so
+  // one R-row call equals per-segment calls bit for bit.
+  void gdn_proj_in_b(int l, int P, float* xb, float* qkvb, float* g48b,
+                     float* beta48b, float* zb) {
+    char buf[128];
+    KP_SUB("gdn:proj");
+    snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_qkv.weight", l);
+    gemm(wview(ckpt.at(buf)), xb, qkvb, P);
+    snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_a.weight", l);
+    gemm(wview(ckpt.at(buf)), xb, g48b, P);
+    snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_b.weight", l);
+    gemm(wview(ckpt.at(buf)), xb, beta48b, P);
+    snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_z.weight", l);
+    gemm(wview(ckpt.at(buf)), xb, zb, P);
+    KP_SUB_END();
+  }
+  void gdn_proj_out_b(int l, int P, float* convb, float* yb, uint16_t* xbf16b) {
+    char buf[128];
+    KP_SUB("gdn:oproj");
+    snprintf(buf, sizeof buf, "layers.%d.linear_attn.out_proj.weight", l);
+    gemm(wview(ckpt.at(buf)), convb + 4096, yb, P, 10240 /*row stride*/,
+         xbf16b);
+    KP_SUB_END();
+  }
+  // Batched-verify GDN state ops for all segments of one layer: the same
+  // kernel sequence gdn_b(state_only) runs per segment on the spec-verify
+  // path (conv+l2n, conv snap, conv update, gates, S snap, k_gdn_verify,
+  // gated norm), each as ONE launch over all segments (blockIdx picks the
+  // segment; bodies shared with the per-segment kernels -> bit-identical).
+  // Returns false (caller runs the per-segment loop) unless every segment is
+  // on that path. Projections are the caller's (gdn_proj_in_b/out_b).
+  bool gdn_state_vseg(int l, int gi, const int* Ps, const int* sl,
+                      const int* voffs, int nseg, int R) {
+    static const bool off = env_zero("QWENOX_VSEG_GDN_BATCH");
+    static const bool convl2 = !env_zero("QWENOX_GDN_CONVL2");
+    if (off || gdn_loop || !convl2 || ngram_legacy_gdn || nseg < 2 || R > 64)
+      return false;
+    const int ngdn = g_cfg.layers - g_cfg.layers / 4;
+    GdnVSegs sg{};
+    sg.n = nseg;
+    for (int s = 0; s < nseg; s++) {
+      const int t = sl[s];
+      if (!slot_spec_snap(t) || slot_ngram_verify_active(t) || slot_cut_r_(t) ||
+          Ps[s] > 65)
+        return false;
+      const int vrow0 = slot_vsnap_row0_(t);
+      GdnVSeg& g = sg.s[s];
+      g.convst = slot_d_convst(t) + (size_t)gi * 3 * 10240;
+      g.S = slot_d_S(t) + (size_t)gi * 48 * 128 * 128;
+      g.csnap = d_csnap + ((size_t)vrow0 * ngdn + gi) * 3 * 10240;
+      g.Ssnap = d_Ssnap + ((size_t)vrow0 * ngdn + gi) * 48 * 128 * 128;
+      g.r0 = voffs[s];
+      g.P = Ps[s];
+      for (int r = 0; r < Ps[s]; r++) sg.rowseg[voffs[s] + r] = (signed char)s;
+    }
+    const float* cw = d_convw + (size_t)gi * 10240 * 4;
+    const float* Alog = d_Alog + (size_t)gi * 48;
+    const float* dtb = d_dtbias + (size_t)gi * 48;
+    const float* gnw = d_gdnnorm + (size_t)gi * 128;
+    const float qscale = 1.f / sqrtf(128.f);
+    KP_SUB("gdn:conv");
+    k_gdn_conv_l2n_vseg<<<dim3(10, (unsigned)R), 256, 0, g_str>>>(
+        d_qkvb, cw, d_convb, sg, 10240, 16, qscale);
+    k_convst_snap_vseg<<<(unsigned)R, 512, 0, g_str>>>(
+        d_qkvb, sg, 10240, (size_t)ngdn * 3 * 10240);
+    k_convst_update_vseg<<<dim3((10240 + 255) / 256, (unsigned)nseg), 256, 0,
+                           g_str>>>(d_qkvb, sg, 10240);
+    k_gdn_gates<<<(unsigned)R, 64, 0, g_str>>>(d_g48b, d_beta48b, Alog, dtb,
+                                               d_g48b, d_beta48b, 48, 48);
+    KP_SUB_END();
+    k_gdn_snap_vseg<<<dim3(48, (unsigned)nseg), 512, 0, g_str>>>(
+        d_convb, d_g48b, d_beta48b, sg, 10240, (size_t)ngdn * 48 * 128 * 128);
+    KP_SUB("gdn:scan");
+    k_gdn_verify_vseg<<<dim3(48, (unsigned)nseg), 512, 0, g_str>>>(
+        d_convb, d_g48b, d_beta48b, sg, 10240);
+    KP_SUB_END();
+    KP_SUB("gdn:norm");
+    k_gdn_gatednorm_b<true><<<dim3(48, (unsigned)((R + 31) / 32)), 128, 0, g_str>>>(
+        d_convb + 4096, d_zb, gnw, nullptr, g_cfg.norm_eps, 10240, 6144, d_xbf16b,
+        R);
+    KP_SUB_END();
+    return true;
+  }
+  // state_only (batched verify): the caller runs the in/out projections over
+  // all R rows at once (gdn_proj_in_b / gdn_proj_out_b); this call does only
+  // the segment's conv/gates/scan/gatednorm on its slot's state.
+  void gdn_b(int l, int gi, int P, int slot = -1, int r0 = 0,
+             bool state_only = false) {
     char buf[128];
     // D2-S1c: slot >= 0 runs the segment on that slot's state (accessors
     // resolve bound_ back to the members); r0 shifts the batch-row bases of
@@ -2979,16 +3085,7 @@ struct GpuModel {
     auto vgd_g = [&](const char* tag, const void* p, size_t bytes) {
       if (l == vgl) vg_dump_buf(tag, P, p, bytes);
     };
-    KP_SUB("gdn:proj");
-    snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_qkv.weight", l);
-    gemm(wview(ckpt.at(buf)), xb, qkvb, P);
-    snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_a.weight", l);
-    gemm(wview(ckpt.at(buf)), xb, g48b, P);
-    snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_b.weight", l);
-    gemm(wview(ckpt.at(buf)), xb, beta48b, P);
-    snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_z.weight", l);
-    gemm(wview(ckpt.at(buf)), xb, zb, P);
-    KP_SUB_END();
+    if (!state_only) gdn_proj_in_b(l, P, xb, qkvb, g48b, beta48b, zb);
     vgd_g("gq", qkvb, (size_t)P * 10240 * 4);
     vgd_g("ga", g48b, (size_t)P * 48 * 4);
     vgd_g("bt", beta48b, (size_t)P * 48 * 4);
@@ -3160,14 +3257,12 @@ struct GpuModel {
       vgd_g("gs", convb, (size_t)P * 10240 * 4);
       // d_xbf16b rows are 48*128 = 6144 bf16 (gatednorm writes (t*48+h)*128).
       vgd_g("gz", xbf16b, (size_t)P * 6144 * 2);
-      KP_SUB("gdn:oproj");
-      snprintf(buf, sizeof buf, "layers.%d.linear_attn.out_proj.weight", l);
-      gemm(wview(ckpt.at(buf)), convb + 4096, yb, P, 10240 /*row stride*/,
-           xbf16b);
-      KP_SUB_END();
+      if (!state_only) gdn_proj_out_b(l, P, convb, yb, xbf16b);
       vgd_g("go", yb, (size_t)P * 2560 * 4);
       return;
     }
+    if (state_only)
+      throw std::runtime_error("gdn_b: state_only needs the batched (non-loop) path");
     for (int t = 0; t < P; t++) {
       float* qkv = qkvb + (size_t)t * 10240;
       k_gdn_conv<<<(10240 + 255) / 256, 256, 0, g_str>>>(qkv, cw, convst, qkv, 10240);
@@ -3762,7 +3857,8 @@ struct GpuModel {
   // positions. QWENOX_QSA_LOOP=1 falls back to the per-token loop (debug).
   // Indexer + score/select phase of qsa_b: host-driven, base-dependent grids,
   // so verify graph capture (P3-B) runs it eagerly between graph segments.
-  void qsa_idx_b(int l, int qi, int P, int base, int slot = -1, int r0 = 0) {
+  void qsa_idx_b(int l, int qi, int P, int base, int slot = -1, int r0 = 0,
+                 bool state_only = false) {
     if (qsa_dense) return;
     char buf[128];
     // D2-S1c: slot >= 0 runs the segment on that slot's state (iraw ring,
@@ -3804,7 +3900,9 @@ struct GpuModel {
         snprintf(tag, sizeof tag, "xb%d", l);
         vg_dump_buf(tag, P, d_xbf16, (size_t)P * 2560 * 2);
       }
-      if (index_f32) {
+      if (state_only && !index_f32) {
+        // projection hoisted (qsa_proj_in_b over all R rows)
+      } else if (index_f32) {
         iproj_sgemm(d_iw + (size_t)qi * 640 * 2560, xb, iproj, P);
       } else {
         gemm(wview(ckpt.at(buf)), xb, iproj, P);
@@ -3972,15 +4070,103 @@ struct GpuModel {
   }
 
   void qsa_b(int l, int qi, int P, int base = 0, const int* dvb = nullptr,
-             int slot = -1, int r0 = 0) {
-    qsa_idx_b(l, qi, P, base, slot, r0);
-    qsa_main_b(l, qi, P, base, dvb, slot, r0);
+             int slot = -1, int r0 = 0, bool state_only = false,
+             bool defer_attn = false) {
+    qsa_idx_b(l, qi, P, base, slot, r0, state_only);
+    qsa_main_b(l, qi, P, base, dvb, slot, r0, state_only, defer_attn);
+  }
+  // Batched-verify attention: can every segment's qsa_flash_b be replaced by
+  // the one-launch k_qsa_wmma_vseg? Only the production bf16-KV configuration
+  // whose per-segment launches are k_qsa_wmma<true, true, Dense> (paged KV,
+  // transposed V, WMMA, per-token sparse kernel because spec_snap is on).
+  bool qsa_attn_vseg_ok(int qi, const int* sl, int nseg) {
+    static const bool off = env_zero("QWENOX_VSEG_ATTN_BATCH");
+    if (off || nseg < 2 || qsa_loop || qsa_kv_fp32 || qsa_dense || !qsa_wmma ||
+        !qsa_wmma_btv || qsa_wmma6 || qsa_global_v || !kv_paged || !vct_layer(qi))
+      return false;
+    for (int s = 0; s < nseg; s++)
+      if (!slot_spec_snap(sl[s])) return false;  // union path would differ
+    return true;
+  }
+  // All segments' attention (dense prefix rows, then sparse rows) in at most
+  // two launches, then the output gate over all R rows (elementwise). Same
+  // kernels/arguments per row as qsa_flash_b + the vseg gate, so the output
+  // bits match the per-segment loop.
+  void qsa_attn_vseg(int qi, const int* Ps, const int* bases, const int* sl,
+                     const int* voffs, int nseg, int R) {
+    const size_t qsa_off = (size_t)qi * kv_layer_rows * 512;
+    const uint16_t* kc = d_kcb + qsa_off;
+    const uint16_t* vc = d_vcb + qsa_off;
+    const uint16_t* vct = vct_layer(qi);
+    QsaVSegs dn{}, sp{};
+    int nd = 0, ns = 0;
+    for (int s = 0; s < nseg; s++) {
+      const int P = Ps[s], base = bases[s];
+      const int* ptab = slot_d_ptab(sl[s]);
+      const int* iselb = d_iselected + (size_t)voffs[s] * 512;
+      const int dense_P = std::min(P, std::max(0, 2051 - base));
+      const int first_abs = std::max(base, 2051), nsparse = base + P - first_abs;
+      dn.s[s] = QsaVSeg{ptab, nullptr, base, base, dense_P, voffs[s]};
+      for (int b = 0; b < dense_P; b++, nd++) {
+        dn.rowseg[nd] = (signed char)s;
+        dn.rowbx[nd] = (signed char)b;
+      }
+      sp.s[s] = QsaVSeg{ptab, iselb + (size_t)(first_abs - base) * 512, first_abs,
+                        base, P, voffs[s]};
+      for (int b = 0; b < nsparse; b++, ns++) {
+        sp.rowseg[ns] = (signed char)s;
+        sp.rowbx[ns] = (signed char)b;
+      }
+    }
+    KP_SUB("qsa:flash");
+    if (nd)
+      k_qsa_wmma_vseg<true, true, true><<<dim3((unsigned)nd, 2), 256, 0, g_str>>>(
+          d_qsb, kc, vc, vct, d_attnb, 256, 2, 24, dn);
+    if (ns)
+      k_qsa_wmma_vseg<true, true, false><<<dim3((unsigned)ns, 2), 256, 0, g_str>>>(
+          d_qsb, kc, vc, vct, d_attnb, 256, 2, 24, sp);
+    KP_SUB_END();
+    KP_SUB("qsa:gate");
+    k_sigmoid_gate<<<(R * 6144 + 255) / 256, 256, 0, g_str>>>(d_attnb, d_gsb,
+                                                              d_attnb, R * 6144);
+    KP_SUB_END();
+  }
+  // QSA q/k/v + indexer projections / o_proj over P batch rows (row-invariant
+  // gemv: one R-row call == per-segment calls bit for bit). Batched verify
+  // hoists these out of the per-segment loop (state_only below).
+  void qsa_proj_in_b(int l, int qi, int P) {
+    char buf[128];
+    KP_SUB("qsa:proj");
+    // Indexer projection only on the bf16/quantized gemm path: the fp32
+    // iproj_sgemm switches kernel family at P > 8 (gemv -> rocBLAS, not
+    // bit-exact), so under index_f32 it stays per segment (qsa_idx_b).
+    if (!qsa_dense && !index_f32) {
+      snprintf(buf, sizeof buf, "layers.%d.self_attn.indexer.index_qk_proj.weight", l);
+      gemm(wview(ckpt.at(buf)), d_xb, d_iproj, P);
+    }
+    snprintf(buf, sizeof buf, "layers.%d.self_attn.q_proj.weight", l);
+    gemm(wview(ckpt.at(buf)), d_xb, d_qgb, P);
+    snprintf(buf, sizeof buf, "layers.%d.self_attn.k_proj.weight", l);
+    gemm(wview(ckpt.at(buf)), d_xb, d_kbb, P);
+    snprintf(buf, sizeof buf, "layers.%d.self_attn.v_proj.weight", l);
+    gemm(wview(ckpt.at(buf)), d_xb, d_vbb, P);
+    KP_SUB_END();
+  }
+  void qsa_proj_out_b(int l, int P) {
+    char buf[128];
+    KP_SUB("qsa:oproj");
+    snprintf(buf, sizeof buf, "layers.%d.self_attn.o_proj.weight", l);
+    gemm(wview(ckpt.at(buf)), d_attnb, d_yb, P, 0, nullptr);
+    KP_SUB_END();
   }
 
   // Graphable remainder of qsa_b (P3-B): dvb = device base mirror (graph
   // capture) or nullptr (direct execution, identical scalar path).
+  // defer_attn (batched verify, with state_only): stop after the KV store —
+  // the caller runs every segment's attention + output gate in one launch
+  // (qsa_attn_vseg). Only the bf16-KV non-loop path supports it.
   void qsa_main_b(int l, int qi, int P, int base, const int* dvb, int slot = -1,
-                  int r0 = 0) {
+                  int r0 = 0, bool state_only = false, bool defer_attn = false) {
     char buf[128];
     // D2-S1c: slot >= 0 runs the segment on that slot's state (page table,
     // snap flag) with explicit scalar base (no d_vbase); r0 shifts the
@@ -4004,6 +4190,7 @@ struct GpuModel {
     const int* const ptabc = kv_paged ? slot_d_ptab(bs) : nullptr;
     const int sovr = vseg ? (slot_spec_snap(bs) ? 1 : 0) : -1;
     const uint16_t* attn_bf = nullptr;  // gated o_proj input already in bf16
+    if (!state_only) {
     KP_SUB("qsa:proj");
     snprintf(buf, sizeof buf, "layers.%d.self_attn.q_proj.weight", l);
     gemm(wview(ckpt.at(buf)), xb, qgb, P);
@@ -4012,6 +4199,7 @@ struct GpuModel {
     snprintf(buf, sizeof buf, "layers.%d.self_attn.v_proj.weight", l);
     gemm(wview(ckpt.at(buf)), xb, vbb, P);
     KP_SUB_END();
+    }
     if (getenv("QWENOX_VGDUMP")) {  // D2-S1b bisect: q/k/v proj outs
       char tag[12];
       snprintf(tag, sizeof tag, "qg%d", l);
@@ -4168,6 +4356,7 @@ struct GpuModel {
           snprintf(tag, sizeof tag, "vn%d", l);
           vg_dump_buf(tag, P, vbb, (size_t)P * 512 * 4);
         }
+        if (defer_attn) return;  // KV is stored; attention + gate batched later
         KP_SUB("qsa:flash");
         qsa_flash_b(kc, vc, P, dense_P, base, vct, ptabc, dvb, r0, sovr);
         KP_SUB_END();
@@ -4250,10 +4439,15 @@ struct GpuModel {
         k_sigmoid_gate<<<(6144 + 255) / 256, 256, 0, g_str>>>(att, gs, att, 6144);
       }
     }
+    if (state_only) {
+      if (qsa_loop || attn_bf)  // hoisted o_proj needs the fp32 gated attnb
+        throw std::runtime_error("qsa_main_b: state_only needs fp32 gate path");
+    } else {
     KP_SUB("qsa:oproj");
     snprintf(buf, sizeof buf, "layers.%d.self_attn.o_proj.weight", l);
     gemm(wview(ckpt.at(buf)), attnb, yb, P, 0, attn_bf);
     KP_SUB_END();
+    }
     if (getenv("QWENOX_VGDUMP")) {  // D2-S1b bisect: o_proj out
       char tag[12];
       snprintf(tag, sizeof tag, "op%d", l);
@@ -5231,12 +5425,34 @@ struct GpuModel {
              "layers.%d.attn_hyper_connection", l);
     enq_layer_norm_b(l, R, fuse_prev_mlp);
     KP(is_qsa(l) ? "qsa" : "gdn");
+    // Projections once over all R rows (one weight stream instead of one
+    // per segment); only the state ops run per segment on their slot state.
+    // QWENOX_VSEG_PROJ_SPLIT=0: old per-segment projections (A/B control).
+    static const bool hoist = !env_zero("QWENOX_VSEG_PROJ_SPLIT");
     if (is_qsa(l)) {
-      for (int s = 0; s < nseg; s++)
-        qsa_b(l, l / 4, Ps[s], bases[s], nullptr, sl[s], voffs[s]);
+      if (hoist && !qsa_loop) {
+        qsa_proj_in_b(l, l / 4, R);
+        const bool batt = qsa_attn_vseg_ok(l / 4, sl, nseg);
+        for (int s = 0; s < nseg; s++)
+          qsa_b(l, l / 4, Ps[s], bases[s], nullptr, sl[s], voffs[s],
+                /*state_only=*/true, /*defer_attn=*/batt);
+        if (batt) qsa_attn_vseg(l / 4, Ps, bases, sl, voffs, nseg, R);
+        qsa_proj_out_b(l, R);
+      } else {
+        for (int s = 0; s < nseg; s++)
+          qsa_b(l, l / 4, Ps[s], bases[s], nullptr, sl[s], voffs[s]);
+      }
     } else {
       const int gi = l - (l + 1) / 4;
-      for (int s = 0; s < nseg; s++) gdn_b(l, gi, Ps[s], sl[s], voffs[s]);
+      if (hoist) {
+        gdn_proj_in_b(l, R, d_xb, d_qkvb, d_g48b, d_beta48b, d_zb);
+        if (!gdn_state_vseg(l, gi, Ps, sl, voffs, nseg, R))
+          for (int s = 0; s < nseg; s++)
+            gdn_b(l, gi, Ps[s], sl[s], voffs[s], /*state_only=*/true);
+        gdn_proj_out_b(l, R, d_convb, d_yb, d_xbf16b);
+      } else {
+        for (int s = 0; s < nseg; s++) gdn_b(l, gi, Ps[s], sl[s], voffs[s]);
+      }
     }
     snprintf(mlp_prefix, sizeof mlp_prefix,
              "layers.%d.mlp_hyper_connection", l);
@@ -5320,6 +5536,15 @@ struct GpuModel {
   // gather exactly.
   static int64_t ple_cat(const PleFlight& fl, int t, int back) {
     int j = t - back;
+    if (fl.nseg > 0) {
+      // Multi-segment flight: the window of token t is its own segment, so a
+      // look-back past the segment start reads that segment's history pair —
+      // the same bytes a per-segment flight would gather.
+      int s = 0;
+      while (s + 1 < fl.nseg && t >= fl.seg_start[s + 1]) s++;
+      const int r = j - fl.seg_start[s];
+      return r >= 0 ? fl.toks[j] : (r == -1 ? fl.seg_pre0[s] : fl.seg_pre1[s]);
+    }
     return j >= 0 ? fl.toks[j] : (j == -1 ? fl.pre0 : fl.pre1);
   }
   // per-token NOSORT fallback, window variant of ple_rows_fp8.
@@ -5354,13 +5579,21 @@ struct GpuModel {
   // two-phase, NOSORT per-token); the flight owns all worker-visible state so
   // it can be joined from a later prefill_chunk call.
   void ple_spawn(std::vector<int>&& toks, int base, int64_t pre0, int64_t pre1,
-                 uint8_t* fp8, int buf) {
+                 uint8_t* fp8, int buf, const PleSegs* segs = nullptr) {
     PleFlight& fl = ple_fl;
     fl.toks = std::move(toks);
     fl.base = base;
     fl.P = (int)fl.toks.size();
     fl.pre0 = pre0;
     fl.pre1 = pre1;
+    fl.nseg = segs ? segs->n : 0;
+    if (segs) {
+      for (int s = 0; s <= segs->n; s++) fl.seg_start[s] = segs->start[s];
+      for (int s = 0; s < segs->n; s++) {
+        fl.seg_pre0[s] = segs->pre0[s];
+        fl.seg_pre1[s] = segs->pre1[s];
+      }
+    }
     fl.fp8 = fp8;
     fl.buf = buf;
     fl.start = std::chrono::steady_clock::now();
@@ -5920,41 +6153,37 @@ struct GpuModel {
     for (int s = 0; s < nseg; s++)  // back (and unshare) each segment's rows
       kv_prepare_seq(slot_kv_seq(sl[s]), slot_d_ptab(sl[s]), bases[s],
                      bases[s] + Ps[s]);
-    // PLE: the flight is single, so the per-segment disk gathers run serially
-    // (host IO, off the GPU critical path); each segment's staging is
-    // dequanted into its own d_eb rows right after its join. The conv/gate
-    // device phase runs after L0, in the serial chunk's order.
+    // PLE: ONE disk-gather flight for all R rows (segment s = staging rows
+    // [voffs[s], voffs[s]+P_s), each token's n-gram window read from its own
+    // slot's history — the same staging bytes as per-segment flights). Like
+    // the serial chunk it is spawned before embed and joined after L0 is
+    // enqueued, so the host IO overlaps embed+L0 instead of idling the GPU.
+    // The dequant is elementwise per row: one launch over R rows writes the
+    // same d_eb bytes as per-segment launches. The conv/gate device phase
+    // runs after L0, in the serial chunk's order.
+    g_vseg_rows += R;
+    g_vseg_calls++;
+    int ple_buf = 0;
     if (ple_on) {
-      for (int s = 0; s < nseg; s++) {
-        if (ple_fl.valid) {  // stale flight for another chunk: finish and drop
-          ple_join();
-          ple_fl.valid = false;
-        }
-        int64_t pre0, pre1;
-        ple_pre01(slot_chist(sl[s]), pre0, pre1);
-        const int buf = ple_par;
-        ple_spawn(std::vector<int>(*segs[s].toks), bases[s], pre0, pre1,
-                  (uint8_t*)(buf ? ple_eb2 : ple_eb), buf);
+      if (ple_fl.valid) {  // stale flight for another chunk: finish and drop
         ple_join();
         ple_fl.valid = false;
-        uint8_t* stg_dev = buf ? ple_eb_dev2 : ple_eb_dev;
-        float* const eb = d_eb + (size_t)voffs[s] * 2560;
-        if (ple_iq4) {
-          size_t nb = (size_t)Ps[s] * 2560 / 32;
-          k_ple_iq4nl_dequant<<<(unsigned)((nb + 255) / 256), 256, 0, g_str>>>(
-              stg_dev, eb, nb);
-        } else {
-          size_t n16 = (size_t)Ps[s] * 2560 / 16;
-          k_ple_fp8_dequant<<<(unsigned)((n16 + 255) / 256), 256, 0, g_str>>>(
-              stg_dev, eb, ple_tscale, n16);
-        }
-        // staging is free once the dequant ran; gates the next gather into buf
-        CK(hipEventRecord(ple_stg_ev[buf], g_str));
-        ple_stg_ev_ok[buf] = true;
-        ple_par = buf ^ 1;
+      }
+      PleSegs ps;
+      ps.n = nseg;
+      std::vector<int> cat;
+      cat.reserve((size_t)R);
+      for (int s = 0; s < nseg; s++) {
+        ps.start[s] = voffs[s];
+        ple_pre01(slot_chist(sl[s]), ps.pre0[s], ps.pre1[s]);
+        cat.insert(cat.end(), segs[s].toks->begin(), segs[s].toks->end());
         for (int t = 0; t < Ps[s]; t++)
           slot_chist(sl[s]).push_back((*segs[s].toks)[(size_t)t]);
       }
+      ps.start[nseg] = R;
+      ple_buf = ple_par;
+      ple_spawn(std::move(cat), bases[0], 0, 0,
+                (uint8_t*)(ple_buf ? ple_eb2 : ple_eb), ple_buf, &ps);
     }
     // embed: one gather pass over the concatenated rows (row-independent)
     int all[8 * 8];
@@ -5962,6 +6191,28 @@ struct GpuModel {
       memcpy(all + voffs[s], segs[s].toks->data(), (size_t)Ps[s] * 4);
     enq_embed_body(all, R);
     enq_layer_vseg(0, Ps, bases, sl, voffs, nseg, R, false, true);
+    if (ple_on) {
+      const auto ple_t0 = std::chrono::steady_clock::now();
+      ple_join();
+      g_vseg_ple_ms += std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - ple_t0).count();
+      ple_fl.valid = false;
+      ple_fl.nseg = 0;  // later single-window flights must not see segments
+      uint8_t* stg_dev = ple_buf ? ple_eb_dev2 : ple_eb_dev;
+      if (ple_iq4) {
+        size_t nb = (size_t)R * 2560 / 32;
+        k_ple_iq4nl_dequant<<<(unsigned)((nb + 255) / 256), 256, 0, g_str>>>(
+            stg_dev, d_eb, nb);
+      } else {
+        size_t n16 = (size_t)R * 2560 / 16;
+        k_ple_fp8_dequant<<<(unsigned)((n16 + 255) / 256), 256, 0, g_str>>>(
+            stg_dev, d_eb, ple_tscale, n16);
+      }
+      // staging is free once the dequant ran; gates the next gather into buf
+      CK(hipEventRecord(ple_stg_ev[ple_buf], g_str));
+      ple_stg_ev_ok[ple_buf] = true;
+      ple_par = ple_buf ^ 1;
+    }
     if (ple_on) {  // device phase, same shape as enq_ple_device_b over R rows
       float* hc_storage = d_Rb;
       if (gr_bf16) {
@@ -5985,6 +6236,7 @@ struct GpuModel {
       enq_layer_vseg(l, Ps, bases, sl, voffs, nseg, R, fuse_prev, flush_mlp);
     }
     // per-segment tail: hand the last row to that slot's decode state
+    I32Set iset{};
     for (int s = 0; s < nseg; s++) {
       const int lastrow = voffs[s] + Ps[s] - 1;
       if (gr_bf16)
@@ -5998,10 +6250,14 @@ struct GpuModel {
       int& rp = slot_ple_ringpos(sl[s]);
       p = bases[s] + Ps[s];
       rp = (bases[s] + Ps[s]) % 9;
-      CK(hipMemcpyAsync(slot_d_pos(sl[s]), &p, 4, hipMemcpyHostToDevice, g_str));
-      CK(hipMemcpyAsync(slot_d_ringpos(sl[s]), &rp, 4, hipMemcpyHostToDevice,
-                        g_str));
+      // device mirrors: one stream-ordered kernel for all segments (no
+      // pageable H2D round trips); same values the copies used to write
+      iset.p[iset.n] = slot_d_pos(sl[s]);
+      iset.v[iset.n++] = p;
+      iset.p[iset.n] = slot_d_ringpos(sl[s]);
+      iset.v[iset.n++] = rp;
     }
+    k_set_i32<<<1, 32, 0, g_str>>>(iset);
     return true;
   }
 
@@ -6026,10 +6282,21 @@ struct GpuModel {
       slot_vsnap_row0_(segs[s].slot) = voff;
       voff += (int)segs[s].toks->size();
     }
+    KP("vseg_begin");
+    const auto te0 = std::chrono::steady_clock::now();
     if (!prefill_chunk_vseg(segs, nseg)) return false;
     int R = 0;
     for (int s = 0; s < nseg; s++) R += (int)segs[s].toks->size();
-    batch_argmax(R, vout);
+    KP("lm_head");
+    batch_logits_device(R);
+    // host time to enqueue the whole pass (layers + lm_head); compare with
+    // the wall time: equal means the pass is launch-bound, not GPU-bound
+    g_vseg_enq_ms += std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - te0).count();
+    argmax_rows(d_logits_b, g_cfg.vocab, R, d_amx_cand, d_argmax_arr, g_str);
+    CK(hipMemcpy(vout, d_argmax_arr, R * 4, hipMemcpyDeviceToHost));
+    KP("end");
+    if (g_kprof_on) g_kprof_ring.flush(segs[0].base, R, true);
     return true;
   }
 
@@ -7600,7 +7867,7 @@ struct GpuModel {
         // D2-S2a: rendezvous verify — the pool's executor already ran this
         // segment (rollback snapshots included) when it returns true; false
         // (dropped / pool idle) -> run the serial verify here.
-        if (vseg_pool_fn && vseg_pool_fn(*this, vseg, v.data()))
+        if (vseg_pool_fn && vseg_pool_fn(*this, vseg, v.data(), nullptr))
           spec_snap = false;
         else if (no_vseg || !verify_segments(&vseg, 1, v.data())) {
           prefill_batch(vt, q + 1, false, true);
@@ -8056,7 +8323,7 @@ struct GpuModel {
           // D2-S2b: rendezvous verify (same shape as spec_loop); false ->
           // this slot runs the serial verify itself.
           const VSeg vseg{bound_, &vt, q + 1};
-          if (vseg_pool_fn && vseg_pool_fn(*this, vseg, v.data()))
+          if (vseg_pool_fn && vseg_pool_fn(*this, vseg, v.data(), nullptr))
             spec_snap = false;
           else {
             static const bool no_vseg =
@@ -8490,6 +8757,26 @@ struct GpuModel {
       if (!ple_on) chist.insert(chist.end(), tokens.begin(), tokens.end());
     };
     auto T0 = std::chrono::steady_clock::now();
+    // Verify rendezvous membership (as spec_loop_chain): count this worker for
+    // the whole loop when its MTP rounds can submit; ngram rounds and plain
+    // serial steps never submit, so they excuse themselves per round.
+    // QWENOX_VR_SAMPLE=0 keeps sampled requests out of the rendezvous.
+    static const bool vr_sample = !env_zero("QWENOX_VR_SAMPLE");
+    const bool vr_on = vr_sample && mtp_ok && vseg_pool_fn != nullptr;
+    struct VrLoopS {
+      GpuModel& m;
+      bool on;
+      VrLoopS(GpuModel& m, bool on) : m(m), on(on) { if (on) m.vseg_round_enter(); }
+      ~VrLoopS() { if (on) m.vseg_round_exit(); }
+    } vr_loop(*this, vr_on);
+    struct VrExcuseS {
+      GpuModel& m;
+      bool on;
+      VrExcuseS(GpuModel& m, bool on) : m(m), on(on) { if (on) m.vseg_round_exit(); }
+      ~VrExcuseS() { if (on) m.vseg_round_enter(); }
+    };
+    std::vector<int> pool_ids;  // post-callback top-k rows (worker-local)
+    std::vector<float> pool_vals;
     while ((int)out.size() < gen && pos < maxctx) {
       yield_point();  // round top: only persistent slot state is live
       if (chist.size() != (size_t)pos)
@@ -8511,6 +8798,7 @@ struct GpuModel {
       const bool smg = sms_gpu_active(sampler) && sms_round_shared(sampler);
       if (!draft.empty() && ng_legacy) {
         // ---- ngram round: long draft, whole-state checkpoint + replay ----
+        VrExcuseS vr_x(*this, vr_on);
         const int base = pos;
         const size_t history_size = chist.size();
         if (mtp_ok)
@@ -8619,6 +8907,7 @@ struct GpuModel {
         // ---- chunked ngram round, sampling semantics: the Sampler view ----
         // walks rows in draft order across chunks, so the draw stream matches
         // the single-pass form; tokens emit per chunk (see the greedy chain).
+        VrExcuseS vr_x(*this, vr_on);
         if (mtp_ok)
           // Stash h_{base-1} (d_R) for the per-chunk MTP patch below.
           CK(hipMemcpyAsync(d_mtap, d_R, 10240 * 4, hipMemcpyDeviceToDevice,
@@ -8749,6 +9038,11 @@ struct GpuModel {
         int q = pos - 1;
         int g = std::min({gctl.cur, gen - (int)out.size(), maxctx - pos - 1});
         if (g < 1) break;  // context edge: no room for even one draft
+        // Shared row budget of the batched verify (as the greedy loops).
+        if (vr_on && vseg_active_fn) {
+          const int va = vseg_active_fn();
+          if (va > 1) g = std::min(g, std::max(1, (int)kVSnapRows / va - 1));
+        }
         size_t chist_sz = chist.size();
         mtp_ckpt_save();
         Sampler draft_sampler = sampler.fork_stream(
@@ -8801,16 +9095,54 @@ struct GpuModel {
         for (int j = 0; j < g; j++) vt.push_back(drafts[j]);
         spec_snap = true;  // capture per-row rollback snapshots during verify
         vsnap_row0_ = 0;  // D2-S2a: serial verify always packs at row 0
-        prefill_batch(vt, q + 1, true, true);
-        spec_snap = false;
-        bool smg_v = false;
-        if (smg) {
-          const bool pfx = sms_prefix_upload(sampler, drafts.data(), 0, g + 1);
-          batch_logits_device(g + 1);
-          smg_v = sms_topk_rows(d_logits_b, g_cfg.vocab, g + 1, sampler.top_k,
-                                pfx, sms_out_ids.data(), sms_out_vals.data());
+        bool smg_v = false, pooled = false;
+        if (vr_on) {
+          // Rendezvous verify: the executor runs the batched pass, then this
+          // callback on our rows (bit-identical logits to the serial verify),
+          // so the sampling inputs below are the serial path's exactly. The
+          // shared correction lists are re-uploaded first: peers' rounds ran
+          // in between and overwrote them.
+          bool cb_smg = false;
+          const std::function<void(int)> post = [&](int r0) {
+            float* rows = d_logits_b + (size_t)r0 * g_cfg.vocab;
+            cb_smg = false;
+            if (smg && sms_round_shared(sampler)) {
+              const bool pfx = sms_prefix_upload(sampler, drafts.data(), 0, g + 1);
+              pool_ids.resize((size_t)(g + 1) * sampler.top_k);
+              pool_vals.resize((size_t)(g + 1) * sampler.top_k);
+              cb_smg = sms_topk_rows(rows, g_cfg.vocab, g + 1, sampler.top_k, pfx,
+                                     pool_ids.data(), pool_vals.data());
+            }
+            if (!cb_smg) {
+              verify_logits.resize((size_t)(g + 1) * g_cfg.vocab);
+              CK(hipMemcpy(verify_logits.data(), rows,
+                           verify_logits.size() * sizeof(float),
+                           hipMemcpyDeviceToHost));
+            }
+          };
+          std::vector<int> vtmp((size_t)g + 1);
+          const VSeg vseg{bound_, &vt, q + 1};
+          if (vseg_pool_fn(*this, vseg, vtmp.data(), &post)) {
+            pooled = true;
+            smg_v = cb_smg;
+            if (smg_v) {
+              std::copy(pool_ids.begin(), pool_ids.end(), sms_out_ids.begin());
+              std::copy(pool_vals.begin(), pool_vals.end(), sms_out_vals.begin());
+            }
+          }
         }
-        if (!smg_v) batch_logits(g + 1, verify_logits);
+        if (!pooled) {
+          vsnap_row0_ = 0;
+          prefill_batch(vt, q + 1, true, true);
+          if (smg) {
+            const bool pfx = sms_prefix_upload(sampler, drafts.data(), 0, g + 1);
+            batch_logits_device(g + 1);
+            smg_v = sms_topk_rows(d_logits_b, g_cfg.vocab, g + 1, sampler.top_k,
+                                  pfx, sms_out_ids.data(), sms_out_vals.data());
+          }
+          if (!smg_v) batch_logits(g + 1, verify_logits);
+        }
+        spec_snap = false;
         const int smk = sampler.top_k;
         verify_ms += elapsed(t);
         Sampler target_view = sampler;
@@ -8930,7 +9262,7 @@ struct GpuModel {
           CK(hipMemcpyAsync(d_pos, &pos, 4, hipMemcpyHostToDevice, g_str));
           CK(hipMemcpyAsync(d_ringpos, &ple_ringpos, 4, hipMemcpyHostToDevice,
                             g_str));
-          restore_dR_row(d);
+          restore_dR_row(d, vsnap_row0_);  // row base 0 unless pooled
           cur = stopped_token >= 0 ? stopped_token : next;
         }
         // Committed-token history: rebuild explicitly so it is right whether
@@ -8942,13 +9274,15 @@ struct GpuModel {
                           hipMemcpyDeviceToDevice, g_str));
         if (d > 0) {
           std::vector<int> mtoks(drafts.begin(), drafts.begin() + d);
-          mtp_ingest_b(spec_taps(d), mtoks, d, q + 1);
+          mtp_ingest_b(spec_taps(d, vsnap_row0_), mtoks, d, q + 1);
         } else {
           mtp_pos = q + 1;
           CK(hipMemcpyAsync(d_mpos, &mtp_pos, 4, hipMemcpyHostToDevice, g_str));
         }
+        vsnap_row0_ = 0;
       } else {
         // ---- no draft, no MTP: plain serial sampling step ----
+        VrExcuseS vr_x(*this, vr_on);
         ++fallback;
         forward(cur);
         if (!ple_on) chist.push_back(cur);
@@ -9711,7 +10045,11 @@ struct GpuModel {
               "QWENOX_KV_PAGED=1)\n", nseg);
       return false;
     }
-    static const int plens[8] = {2048, 4097, 6146, 2055, 3076, 4101, 6152, 2049};
+    // QWENOX_VSEG_SHORT=1: short prompts (bases < 2051 -> the dense attention
+    // path that short chat prompts take; mixed base %4).
+    static const int plens_long[8] = {2048, 4097, 6146, 2055, 3076, 4101, 6152, 2049};
+    static const int plens_short[8] = {97, 130, 163, 99, 140, 171, 103, 152};
+    const int* plens = getenv("QWENOX_VSEG_SHORT") ? plens_short : plens_long;
     for (int s = 0; s < nseg; s++)
       if (plens[s] + pv[s] > maxctx) {
         fprintf(stderr, "vseg-selftest: slot %d needs base %d + P %d > maxctx "
@@ -9742,6 +10080,7 @@ struct GpuModel {
                  nqsa = (size_t)(g_cfg.layers / 4);
     struct Snap {
       uint64_t dS, dconv, dring, diraw, dR, dpos, dringpos, chist;
+      uint64_t logits = 0;  // this segment's verify rows of d_logits_b
       int pos, ringpos, mapped;
       std::vector<int> v;
     };
@@ -9787,6 +10126,9 @@ struct GpuModel {
       }
       spec_snap = false;
       capture(A[(size_t)s]);
+      // full logits rows: sampling consumes every value, not just the argmax
+      A[(size_t)s].logits =
+          fnv_dev(d_logits_b, (size_t)pv[s] * g_cfg.vocab * 4);
     }
     const uint64_t ipsA = fnv_dev(d_iproj_snap, nqsa * kVSnapRows * 128 * 4);
     // ---- phase B: one multi-segment verify ----
@@ -9809,6 +10151,15 @@ struct GpuModel {
       return false;
     }
     const uint64_t ipsB = fnv_dev(d_iproj_snap, nqsa * kVSnapRows * 128 * 4);
+    std::vector<uint64_t> logB((size_t)nseg);
+    {
+      int vo = 0;
+      for (int s = 0; s < nseg; s++) {
+        logB[(size_t)s] = fnv_dev(d_logits_b + (size_t)vo * g_cfg.vocab,
+                                  (size_t)pv[s] * g_cfg.vocab * 4);
+        vo += pv[s];
+      }
+    }
     // ---- compare ----
     bool pass = true;
     voff = 0;
@@ -9839,6 +10190,7 @@ struct GpuModel {
       cmp("d_pos", B.dpos, a.dpos);
       cmp("d_ringpos", B.dringpos, a.dringpos);
       cmp("chist", B.chist, a.chist);
+      cmp("logits", logB[(size_t)s], a.logits);
       if (B.pos != a.pos || B.ringpos != a.ringpos || B.mapped != a.mapped) {
         fprintf(stderr, "vseg-selftest: seg %d pos/ringpos/mapped (%d,%d,%d) "
                 "!= serial (%d,%d,%d)\n", s, B.pos, B.ringpos, B.mapped, a.pos,
@@ -9854,6 +10206,78 @@ struct GpuModel {
     }
     fprintf(stderr, "VSEG SELFTEST (nseg=%d R=%d): %s\n", nseg, R,
             pass ? "PASS" : "FAIL");
+    // QWENOX_VSEG_BENCH=N: after the check, time N batched calls vs N rounds
+    // of the serial per-segment calls (same segments, same bases; slot state
+    // is overwritten in place, so only timing is meaningful here). With
+    // QWENOX_KPROF=1 QWENOX_KPROF_V=1 each call also prints its kprof line.
+    if (const char* be = getenv("QWENOX_VSEG_BENCH")) {
+      const int N = std::max(1, atoi(be));
+      auto now = [] { return std::chrono::steady_clock::now(); };
+      auto ms = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+      };
+      std::vector<double> tb, ts, te;
+      for (int it = 0; it < N + 1; it++) {  // first iteration = warm-up
+        bind(0);
+        CK(hipStreamSynchronize(g_str));
+        g_vseg_enq_ms = 0;
+        auto t0 = now();
+        verify_segments(segs, nseg, vout.data());
+        CK(hipStreamSynchronize(g_str));
+        auto t1 = now();
+        if (it) te.push_back(g_vseg_enq_ms);
+        int vo = 0;
+        for (int s = 0; s < nseg; s++) {
+          bind(s);
+          spec_snap = true;
+          vsnap_row0_ = vo;
+          vo += pv[s];
+          VSeg one{s, &segt[(size_t)s], plens[s]};
+          verify_segments(&one, 1, A[(size_t)s].v.data());
+          spec_snap = false;
+        }
+        CK(hipStreamSynchronize(g_str));
+        auto t2 = now();
+        if (it) {
+          tb.push_back(ms(t0, t1));
+          ts.push_back(ms(t1, t2));
+        }
+      }
+      std::sort(tb.begin(), tb.end());
+      std::sort(ts.begin(), ts.end());
+      // Reference: ONE segment of R rows on slot 0 (the single-sequence verify
+      // path at the same total row count), when R fits a verify chunk.
+      double t1med = -1;
+      if (R <= 8) {
+        std::vector<int> one_t((size_t)R);
+        for (int i = 0; i < R; i++) one_t[(size_t)i] = segt[0][(size_t)i % pv[0]];
+        std::vector<int> o((size_t)R);
+        std::vector<double> t1;
+        for (int it = 0; it < N + 1; it++) {
+          bind(0);
+          spec_snap = true;
+          vsnap_row0_ = 0;
+          VSeg one{0, &one_t, plens[0]};
+          CK(hipStreamSynchronize(g_str));
+          auto a = now();
+          verify_segments(&one, 1, o.data());
+          CK(hipStreamSynchronize(g_str));
+          if (it) t1.push_back(ms(a, now()));
+          spec_snap = false;
+        }
+        std::sort(t1.begin(), t1.end());
+        t1med = t1[t1.size() / 2];
+      }
+      std::sort(te.begin(), te.end());
+      fprintf(stderr,
+              "VSEG BENCH nseg=%d R=%d: batched median %.1f ms (min %.1f, host "
+              "enqueue %.1f) | serial %d segs median %.1f ms (min %.1f) | ratio "
+              "%.2f | single-seg P=%d %.1f ms\n",
+              nseg, R, tb[tb.size() / 2], tb[0], te[te.size() / 2], nseg,
+              ts[ts.size() / 2], ts[0], ts[ts.size() / 2] / tb[tb.size() / 2], R,
+              t1med);
+      bind(0);
+    }
     return pass;
   }
 

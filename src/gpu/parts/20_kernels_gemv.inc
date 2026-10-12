@@ -997,10 +997,12 @@ __global__ void k_gdn_step(const float* __restrict__ q, const float* __restrict_
 // no __syncthreads at all. qkv and out may alias: each row's value is read
 // before the first shfl of that row and the output store happens after the
 // second, inside the same warp.
-__global__ void k_gdn_verify(const float* qkv, const float* g48,
-                             const float* b48, float* S, float* out,
-                             int P, int stride) {
-  const int h = blockIdx.x;
+// Body shared by k_gdn_verify and the batched-verify k_gdn_verify_vseg
+// (25_kernels_gdn.inc): one source, so both compile the same arithmetic.
+__device__ __forceinline__ void gdn_verify_body(const int h, const float* qkv,
+                                                const float* g48,
+                                                const float* b48, float* S,
+                                                float* out, int P, int stride) {
   const int lane = threadIdx.x % warpSize;
   const int i = (threadIdx.x / warpSize) * (warpSize / 4) + (lane >> 2);
   const int jc = lane & 3, j0 = jc * 32, jb = lane & ~3;
@@ -1041,6 +1043,11 @@ __global__ void k_gdn_verify(const float* qkv, const float* g48,
 #pragma unroll
   for (int j = 0; j < 32; ++j) Sh[(j0 + j) * 128 + i] = state[j];
 }
+__global__ void k_gdn_verify(const float* qkv, const float* g48,
+                             const float* b48, float* S, float* out,
+                             int P, int stride) {
+  gdn_verify_body(blockIdx.x, qkv, g48, b48, S, out, P, stride);
+}
 
 // --- indexer proj snapshot: keep every verify row's raw ring value (the
 // 128-float tail of the 640-wide proj) so a rollback can rebuild the 4-slot
@@ -1057,12 +1064,11 @@ __global__ void k_iproj_snap(const float* __restrict__ proj,
 // this kernel still sees and advances the pre-chunk state. Lets speculative
 // rollback install the state at any accepted depth without a re-prefill.
 // snap t-stride = ngdn*48*128*128.
-__global__ void k_gdn_snap(const float* __restrict__ qkv,
-                           const float* __restrict__ g48,
-                           const float* __restrict__ b48,
-                           const float* __restrict__ S, float* __restrict__ snap,
-                           int P, int qkvstride, size_t snaptstride) {
-  int h = blockIdx.x;  // 48 v-heads, group of 3 over 16 k-heads
+__device__ __forceinline__ void gdn_snap_body(
+    const int h, const float* __restrict__ qkv, const float* __restrict__ g48,
+    const float* __restrict__ b48, const float* __restrict__ S,
+    float* __restrict__ snap, int P, int qkvstride, size_t snaptstride) {
+  // h: 48 v-heads, group of 3 over 16 k-heads
   const int dk = 128, dv = 128;
   const float* Sh = S + (size_t)h * dk * dv;
   float* Sn = snap + (size_t)h * dk * dv;
@@ -1101,15 +1107,20 @@ __global__ void k_gdn_snap(const float* __restrict__ qkv,
     __syncthreads();
   }
 }
+__global__ void k_gdn_snap(const float* __restrict__ qkv,
+                           const float* __restrict__ g48,
+                           const float* __restrict__ b48,
+                           const float* __restrict__ S, float* __restrict__ snap,
+                           int P, int qkvstride, size_t snaptstride) {
+  gdn_snap_body(blockIdx.x, qkv, g48, b48, S, snap, P, qkvstride, snaptstride);
+}
 
 // --- conv state snapshot: convst after row t = rows (t-2,t-1,t) of the raw
 // qkv stream, with the live (pre-chunk) convst filling rows < 0. snap layout
 // per t: [3][qkv], t-stride = ngdn*3*qkv.
-__global__ void k_convst_snap(const float* __restrict__ qkvb,
-                              const float* __restrict__ convst,
-                              float* __restrict__ snap, int P, int qkv,
-                              size_t snaptstride) {
-  int t = blockIdx.x;
+__device__ __forceinline__ void convst_snap_body(
+    const int t, const float* __restrict__ qkvb, const float* __restrict__ convst,
+    float* __restrict__ snap, int qkv, size_t snaptstride) {
   float* out = snap + (size_t)t * snaptstride;
   for (int c = threadIdx.x; c < qkv; c += blockDim.x) {
     out[c] = t >= 2   ? qkvb[(size_t)(t - 2) * qkv + c]
@@ -1118,6 +1129,12 @@ __global__ void k_convst_snap(const float* __restrict__ qkvb,
     out[qkv + c] = t >= 1 ? qkvb[(size_t)(t - 1) * qkv + c] : convst[2 * qkv + c];
     out[2 * qkv + c] = qkvb[(size_t)t * qkv + c];
   }
+}
+__global__ void k_convst_snap(const float* __restrict__ qkvb,
+                              const float* __restrict__ convst,
+                              float* __restrict__ snap, int P, int qkv,
+                              size_t snaptstride) {
+  convst_snap_body(blockIdx.x, qkvb, convst, snap, qkv, snaptstride);
 }
 
 // --- indexer raw-ring rebuild after rollback: slot s must hold the proj row
