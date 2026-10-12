@@ -1076,15 +1076,19 @@ struct GpuModel {
         // GGUF IQ4_NL table: 90 B rows, no global scale. The batch-read fd is
         // re-pointed at the shard that holds it (mmapped from offset 0).
         g_ple_rb = 90;
-#ifndef _WIN32
         if (g_gguf)
           for (const auto& mp : g_gguf->mappings())
             if (ple_table->data >= mp.base && ple_table->data < mp.base + mp.len) {
               ple_uring_open(mp.path.c_str());
               g_ple_foff = (uint64_t)(ple_table->data - mp.base);
+#ifdef _WIN32
+              g_ple_off_ok = g_ple_win.fh != INVALID_HANDLE_VALUE;
+#else
               g_ple_off_ok = g_ple_fd >= 0;
-            }
 #endif
+              fprintf(stderr, "ple: IQ4_NL n-gram table from %s%s\n", mp.path.c_str(),
+                      g_ple_off_ok ? "" : " (batch reader unavailable: mapped reads)");
+            }
       } else {
       memcpy(&ple_tscale, ple_table->data + ple_table->numel(), 4);
       // io_uring / IOCP path: file offset of the PLE table in the file that
@@ -1843,9 +1847,9 @@ struct GpuModel {
     }
     const size_t n4 = (size_t)P * d / 4;
     k_f32_to_f16_v4<<<(unsigned)((n4 + 255) / 256), 256, 0, g_str>>>(x, x16, n4);
-    if (!moe_gg_up(g.tgu, g.gate, g.up, x16, tokidx, tiles, ntiles, max_tiles, hid, mid, d,
+    if (!moe_ggx_up(g.tgu, g.gate, g.up, x16, tokidx, tiles, ntiles, max_tiles, hid, mid, d,
                    g_str) ||
-        !moe_gg_down(g.tdn, g.down, hid, tiles, ntiles, max_tiles, pairs, d, mid, g_str))
+        !moe_ggx_down(g.tdn, g.down, hid, tiles, ntiles, max_tiles, pairs, d, mid, g_str))
       throw std::runtime_error("moe_gguf: unsupported expert type");
     k_moe_reduce_pw<10><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(pairs, pairids, pw, acc,
                                                                      P, d);

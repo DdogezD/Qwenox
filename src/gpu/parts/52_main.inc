@@ -12,11 +12,31 @@ static void gguf_base_setup(const std::string& base) {
 #else
   setenv("QWENOX_GGUF", base.c_str(), 1);
   setenv("QWENOX_GGUF_DENSE", "1", 1);
-  if (!getenv("QWENOX_GGUF_MTP")) {
-    const size_t sl = base.find_last_of('/');
+#endif
+  // QWENOX_GGUF_MTP=none|0: no MTP sidecar and no auto-detect (the Windows
+  // launcher uses this: an empty variable cannot be passed reliably there).
+  if (const char* m = getenv("QWENOX_GGUF_MTP"); m && (!strcmp(m, "none") || !strcmp(m, "0"))) {
+#ifdef _WIN32
+    _putenv_s("QWENOX_GGUF_MTP", "");  // CRT: an empty value removes the variable
+#else
+    unsetenv("QWENOX_GGUF_MTP");
+#endif
+  } else if (!getenv("QWENOX_GGUF_MTP")) {
+    // default: the single mtp-*.gguf next to the shards
+    const size_t sl = base.find_last_of("/\\");
     const std::string dir = sl == std::string::npos ? "." : base.substr(0, sl);
     std::string hit;
     int n = 0;
+#ifdef _WIN32
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((dir + "\\mtp-*.gguf").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+      do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) hit = dir + "/" + fd.cFileName, n++;
+      } while (FindNextFileA(h, &fd));
+      FindClose(h);
+    }
+#else
     if (DIR* d = opendir(dir.c_str())) {
       while (dirent* e = readdir(d)) {
         const std::string nm = e->d_name;
@@ -24,11 +44,18 @@ static void gguf_base_setup(const std::string& base) {
       }
       closedir(d);
     }
-    if (n == 1) setenv("QWENOX_GGUF_MTP", hit.c_str(), 1);
-    else fprintf(stderr, "gguf: %s MTP sidecar (mtp-*.gguf) in %s; set QWENOX_GGUF_MTP\n",
-                 n ? "several" : "no", dir.c_str());
-  }
 #endif
+    if (n == 1) {
+#ifdef _WIN32
+      _putenv_s("QWENOX_GGUF_MTP", hit.c_str());
+#else
+      setenv("QWENOX_GGUF_MTP", hit.c_str(), 1);
+#endif
+    } else {
+      fprintf(stderr, "gguf: %s MTP sidecar (mtp-*.gguf) in %s; set QWENOX_GGUF_MTP\n",
+              n ? "several" : "no", dir.c_str());
+    }
+  }
   fprintf(stderr, "gguf: pure GGUF start from %s (MTP %s)\n", base.c_str(),
           getenv("QWENOX_GGUF_MTP") && *getenv("QWENOX_GGUF_MTP") ? getenv("QWENOX_GGUF_MTP") : "none");
 }

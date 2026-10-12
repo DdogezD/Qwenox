@@ -126,6 +126,9 @@ static bool guvb_f16_env() {
 
 // 镜像 GpuModel 构造函数的分配公式（含相同 env 分支），用于 arena 精确 sizing。
 // 每项 256B 对齐后求和；估少了一律有 dalloc_arena 的 hipMalloc 回退兜底。
+// GGUF routed experts that load_arena will copy into the arena (Windows),
+// and the hgn expert bytes they replace (defined after gguf_experts_open).
+[[maybe_unused]] static size_t gguf_experts_arena_bytes(const Checkpoint& ck, size_t* hgn_replaced);
 static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
   size_t total = 0;
   auto add = [&](size_t b) { total += (b + 255) & ~(size_t)255; };
@@ -135,6 +138,13 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
     if (t.dtype == 10 || t.dtype == 11 || t.dtype == 4) continue;
     add(t.data_size);
   }
+#ifdef _WIN32
+  {  // GGUF 专家（QWENOX_GGUF）同样拷进 arena；被它替换的 hgn 专家不进
+    size_t hgn_rep = 0;
+    total += gguf_experts_arena_bytes(ck, &hgn_rep);
+    total -= std::min(total, hgn_rep);
+  }
+#endif
   const bool qsa_dense = getenv("QWENOX_QSA_DENSE") != nullptr;
   const bool kv_fp32 = getenv("QWENOX_QSA_KV_BF16") == nullptr;
   const bool index_f32 = getenv("QWENOX_INDEX_BF16") == nullptr;
@@ -363,6 +373,10 @@ static void devarena_init(const Checkpoint& ck, int maxctx) {
 struct GgExperts {
   const uint8_t *gate = nullptr, *up = nullptr, *down = nullptr;
   int tgu = 0, tdn = 0;  // gguf::Type of gate/up and of down
+  // source tensors (gate, up, down). Linux: gate/up/down are their
+  // hipHostRegister'd mmap pointers. Windows: load_arena copies them into the
+  // device arena and re-points gate/up/down there.
+  const gguf::Tensor* src[3] = {nullptr, nullptr, nullptr};
 };
 static gguf::File* g_gguf = nullptr;
 static gguf::File* g_gguf_mtp = nullptr;  // QWENOX_GGUF_MTP sidecar
@@ -387,9 +401,6 @@ static void gguf_experts_open() {
     fprintf(stderr, "gguf experts: off (QWENOX_GGUF_EXPERTS=0), hgn experts\n");
     return;
   }
-#ifdef _WIN32
-  throw std::runtime_error("QWENOX_GGUF: not supported on Windows yet");
-#else
   auto t0 = std::chrono::steady_clock::now();
   if (!g_gguf) g_gguf = new gguf::File(path);  // may be open already (gguf_dense_apply)
   struct Range { uintptr_t a, b; };
@@ -411,11 +422,15 @@ static void gguf_experts_open() {
         t[2]->ne[1] != D || t[2]->ne[2] != E)
       throw std::runtime_error("QWENOX_GGUF: unexpected expert shapes/types at layer " +
                                std::to_string(l));
-    if (t[0]->type != gguf::Q4_K && t[0]->type != gguf::Q5_K &&
-        !(mtp && t[0]->type == gguf::Q8_0))
+    // UD-Q4_K_XL: Q4_K/Q5_K gate+up, Q5_1/Q8_0 down; UD-IQ4_XS: IQ3_S/IQ4_XS
+    // gate+up, IQ4_NL/Q8_0 down (per-layer mix); MTP sidecar: Q8_0.
+    (void)mtp;
+    const uint32_t tg = t[0]->type, td = t[2]->type;
+    if (tg != gguf::Q4_K && tg != gguf::Q5_K && tg != gguf::Q8_0 && tg != gguf::IQ4_XS &&
+        tg != gguf::IQ3_S)
       throw std::runtime_error(std::string("QWENOX_GGUF: gate/up type ") +
                                gguf::type_name(t[0]->type) + " unsupported");
-    if (t[2]->type != gguf::Q5_1 && t[2]->type != gguf::Q8_0)
+    if (td != gguf::Q5_1 && td != gguf::Q8_0 && td != gguf::IQ4_NL)
       throw std::runtime_error(std::string("QWENOX_GGUF: down type ") +
                                gguf::type_name(t[2]->type) + " unsupported");
     for (auto* x : t) {
@@ -424,7 +439,9 @@ static void gguf_experts_open() {
       rs.push_back({a, b});
       bytes += x->nbytes;
     }
-    return GgExperts{t[0]->data, t[1]->data, t[2]->data, (int)t[0]->type, (int)t[2]->type};
+    GgExperts g{t[0]->data, t[1]->data, t[2]->data, (int)t[0]->type, (int)t[2]->type};
+    for (int i = 0; i < 3; i++) g.src[i] = t[i];
+    return g;
   };
   std::vector<GgExperts> trunk;
   for (int l = 0; l < g_cfg.layers; l++) {
@@ -449,21 +466,54 @@ static void gguf_experts_open() {
     else
       merged.push_back(r);
   }
+#ifndef _WIN32
   for (const Range& r : merged) {
     hipError_t re = hipHostRegister((void*)r.a, r.b - r.a, hipHostRegisterMapped);
     if (re != hipSuccess)
       throw std::runtime_error(std::string("QWENOX_GGUF: hipHostRegister: ") +
                                hipGetErrorString(re));
   }
+#endif
   g_ggx = std::move(trunk);
   g_ggx_mtp = mtpx;
   double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  fprintf(stderr,
-          "gguf experts: %zu layers from %s%s (%.1f GiB, %zu ranges, %.1f s; "
-          "Q5_K gate/up %d layers, Q8_0 down %d layers)\n",
-          g_ggx.size(), path, gg_mtp_on() ? " + MTP sidecar" : "", bytes / 1073741824.0,
-          merged.size(), s, n_q5k, n_q80);
+  std::string mix;  // per-layer type mix, e.g. "IQ3_S/IQ4_NL x42, IQ4_XS/Q8_0 x1, ..."
+  {
+    std::vector<std::pair<std::string, int>> kinds;
+    for (const auto& g : g_ggx) {
+      const std::string k = std::string(gguf::type_name(g.tgu)) + "/" + gguf::type_name(g.tdn);
+      auto it = std::find_if(kinds.begin(), kinds.end(), [&](auto& p) { return p.first == k; });
+      if (it == kinds.end()) kinds.push_back({k, 1});
+      else it->second++;
+    }
+    for (auto& k : kinds) mix += (mix.empty() ? "" : ", ") + k.first + " x" + std::to_string(k.second);
+  }
+  (void)n_q5k;
+  (void)n_q80;
+#ifdef _WIN32
+  const char* how = "copied into the device arena";
+#else
+  const char* how = "registered";
 #endif
+  fprintf(stderr, "gguf experts: %zu layers from %s%s (%.1f GiB, %zu ranges %s, %.1f s; gate+up/down: %s)\n",
+          g_ggx.size(), path, gg_mtp_on() ? " + MTP sidecar" : "", bytes / 1073741824.0,
+          merged.size(), how, s, mix.c_str());
+}
+
+[[maybe_unused]] static size_t gguf_experts_arena_bytes(const Checkpoint& ck, size_t* hgn_replaced) {
+  *hgn_replaced = 0;
+#ifdef _WIN32
+  gguf_experts_open();  // Windows: tensor lookup only (no registration), idempotent
+#endif
+  if (!gg_on()) return 0;
+  size_t b = 0;
+  for (const auto& g : g_ggx)
+    for (const gguf::Tensor* t : g.src) b += (t->nbytes + 255) & ~(size_t)255;
+  if (gg_mtp_on())
+    for (const gguf::Tensor* t : g_ggx_mtp.src) b += (t->nbytes + 255) & ~(size_t)255;
+  for (const auto& kv : ck.tensors())
+    if (is_gguf_experts(kv.first)) *hgn_replaced += (kv.second.data_size + 255) & ~(size_t)255;
+  return b;
 }
 
 // --- GGUF non-expert weights (G3.1, QWENOX_GGUF + QWENOX_GGUF_DENSE=1) ----------
@@ -493,10 +543,6 @@ static void gguf_dense_apply(Checkpoint& ck) {
   if (!on || !*on || !strcmp(on, "0")) return;
   const char* path = getenv("QWENOX_GGUF");
   if (!path || !*path) throw std::runtime_error("QWENOX_GGUF_DENSE needs QWENOX_GGUF=<first shard>");
-#ifdef _WIN32
-  (void)ck;
-  throw std::runtime_error("QWENOX_GGUF_DENSE: not supported on Windows yet");
-#else
   auto t0 = std::chrono::steady_clock::now();
   if (!g_gguf) g_gguf = new gguf::File(path);
   const char* mp = getenv("QWENOX_GGUF_MTP");
@@ -538,7 +584,6 @@ static void gguf_dense_apply(Checkpoint& ck) {
           "gguf dense: %zu tensors from GGUF%s (%d q8g32, %.2f GiB synthetic, %.1f s)%s\n", n,
           g_gguf_mtp ? " + MTP sidecar" : "", n8, bytes / 1073741824.0, s,
           ple ? "; PLE table IQ4_NL" : "");
-#endif
 }
 // After GpuModel construction: free host copies of large synthetic tensors
 // (the device arena has them). Small ones stay: ensure_hcnorm/ensure_norm256
@@ -588,16 +633,35 @@ static void load_arena(const Checkpoint& ck) {
 #endif
     total += (t.data_size + 255) & ~255ull;
   }
+  // Windows: GGUF routed experts (trunk + MTP sidecar) are copied into the
+  // same arena (no hipHostRegister direct-read path, see above); their
+  // GgExperts pointers are re-pointed below.
+  std::vector<GgExperts*> ggx_arena;
+#ifdef _WIN32
+  for (auto& g : g_ggx) ggx_arena.push_back(&g);
+  if (gg_mtp_on()) ggx_arena.push_back(&g_ggx_mtp);
+  size_t ggbytes = 0;
+  for (GgExperts* g : ggx_arena)
+    for (const gguf::Tensor* t : g->src) ggbytes += (t->nbytes + 255) & ~255ull;
+  total += ggbytes;
+  if (ggbytes)
+    fprintf(stderr, "weight arena: GGUF experts %.1f GiB copied in\n", ggbytes / 1073741824.0);
+#endif
   fprintf(stderr, "weight arena: %.1f GiB (experts direct-read: %.1f GiB)\n",
           total / 1073741824.0, xbytes / 1073741824.0);
   uint8_t* arena = nullptr;
   DALLOC(&arena, total);
 
+  // src = host view (mmap / synthetic). Windows: os_handle + foff = the file
+  // range behind src for the unbuffered ReadFile path; nullptr = host memory
+  // (gguf_map synthetic tensors), copied with memcpy.
   struct Job {
     std::string name;
     const uint8_t* src;
     uint8_t* dst;
     size_t size;
+    void* os_handle = nullptr;
+    uint64_t foff = 0;
   };
   std::vector<Job> jobs;
   size_t off = 0;
@@ -609,9 +673,29 @@ static void load_arena(const Checkpoint& ck) {
 #ifndef _WIN32
     if (is_experts(t.name)) continue;  // 已在上面登记 host 指针
 #endif
-    jobs.push_back({t.name, t.data, arena + off, t.data_size});
+    Job j{t.name, t.data, arena + off, t.data_size};
+    for (auto& mp : ck.mappings())
+      if (t.data >= mp.base && t.data < mp.base + mp.len) {
+        j.os_handle = mp.os_handle;
+        j.foff = (uint64_t)(t.data - mp.base);
+        break;
+      }
+    jobs.push_back(j);
     g_devtensor[t.name] = arena + off;
     off += (t.data_size + 255) & ~255ull;
+  }
+  for (GgExperts* g : ggx_arena) {
+    const uint8_t** ptrs[3] = {&g->gate, &g->up, &g->down};
+    for (int i = 0; i < 3; i++) {
+      const gguf::Tensor* t = g->src[i];
+      const gguf::File* f = (g == &g_ggx_mtp) ? g_gguf_mtp : g_gguf;
+      Job j{t->name, t->data, arena + off, (size_t)t->nbytes};
+      j.os_handle = f->mappings()[t->shard].os_handle;
+      j.foff = t->file_off;
+      jobs.push_back(j);
+      *ptrs[i] = arena + off;
+      off += (t->nbytes + 255) & ~255ull;
+    }
   }
   // big tensors first so stragglers don't serialize at the end
   std::sort(jobs.begin(), jobs.end(),
@@ -667,19 +751,21 @@ static void load_arena(const Checkpoint& ck) {
       size_t ji = next.fetch_add(1);
       if (ji >= jobs.size()) break;
       const Job& j = jobs[ji];
-      // 所属映射 -> （句柄， 文件偏移）
-      HANDLE h = nullptr;
-      uint64_t foff = 0;
-      for (auto& mp : ck.mappings()) {
-        if (j.src >= mp.base && j.src < mp.base + mp.len) {
-          foff = (uint64_t)(j.src - mp.base);
-          h = (HANDLE)mp.os_handle;
-          break;
-        }
-      }
+      // 所属映射 -> （句柄， 文件偏移）：预先解析在 Job 里
+      HANDLE h = (HANDLE)j.os_handle;
+      const uint64_t foff = j.foff;
       if (!h) {
-        fprintf(stderr, "pload: no os handle for %s\n", j.name.c_str());
-        abort();
+        // 无文件句柄 = 主机内存里的合成张量（gguf_map）：memcpy 进 pinned 槽再 H2D
+        WSlot& s = slots[0];
+        for (size_t c = 0; c < j.size; c += WCHUNK) {
+          const size_t n = std::min(WCHUNK, j.size - c);
+          memcpy(s.buf, j.src + c, n);
+          CK(hipMemcpyAsync(j.dst + c, s.buf, n, hipMemcpyHostToDevice, st[wid]));
+          CK(hipStreamSynchronize(st[wid]));
+          done_bytes += n;
+          prog_tick();
+        }
+        continue;
       }
       const uint64_t A = foff & ~4095ull, E = (foff + j.size + 4095) & ~4095ull;
       int si = 0;
