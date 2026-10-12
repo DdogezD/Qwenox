@@ -46,6 +46,11 @@ OpenAI 接口）。Git Bash 下 `start_win.sh` 与 Linux `start.sh` 并列。
 > 全程平均 **~1000 tok/s**，无衰减断崖；逐 chunk 缓降来自 PLE 按需读随前缀变长
 > （prof 的 ple_wait 逐 chunk 增长），属预期。
 
+> **2026-10-13 更新（GGUF 可在 Windows 启动）**：纯 GGUF 启动已移植到 Windows，目标文件是 Unsloth
+> `UD-IQ4_XS`（专家 IQ3_S/IQ4_XS/IQ4_NL/Q8_0，显存常驻 ≈60.4 GiB，比 v2 hgn 少约 1.7 GiB）。专家与 dense
+> 拷进 devarena，PLE 表在分片里按需读盘。设置页选"GGUF"即可，详见 [GGUF.md](GGUF.md)"UD-IQ4_XS（Windows）"；
+> 一键验证 `bash tools/iq4xs_verify_win.sh`。
+>
 > **2026-09-26 更新（高质量 hgn）**：新的 8-bit dense overlay + imatrix 路由专家基座（同一 hgn 格式，
 > 见 [HGN-HQ.md](HGN-HQ.md)）把 KLD 从 0.163 降到 GGUF 量级；weight arena +2.2 GiB，
 > 256K / chunk 8192 估算 ~93.2 GiB（上限 95）。只需换文件（`MODEL_FILE` / `OVERLAY_FILE`），Windows 上尚未实测。

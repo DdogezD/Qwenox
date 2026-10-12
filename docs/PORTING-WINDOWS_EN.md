@@ -54,6 +54,12 @@ Verification matrix (all PASS):
 > comes from PLE on-demand reads growing with prefix length (ple_wait rises chunk over chunk
 > in prof), which is expected.
 >
+> **Update 2026-10-13 (GGUF starts on Windows)**: the pure-GGUF start is ported to Windows, targeting
+> Unsloth `UD-IQ4_XS` (experts IQ3_S/IQ4_XS/IQ4_NL/Q8_0, ≈60.4 GiB resident, about 1.7 GiB less than
+> v2 hgn). Experts and dense weights are copied into the devarena; the PLE table is read from its
+> shard on demand. Pick "GGUF" in the settings panel; see [GGUF.md](GGUF.md) "UD-IQ4_XS (Windows)".
+> One-shot check: `bash tools/iq4xs_verify_win.sh`.
+>
 > **Update 2026-09-26 (high-quality hgn)**: the new 8-bit dense overlay + imatrix routed-expert
 > base (same hgn format, see [HGN-HQ.md](HGN-HQ.md)) brings KLD down from 0.163 to GGUF levels;
 > weight arena +2.2 GiB, estimated ~93.2 GiB at 256K / chunk 8192 (cap 95). Only the files need

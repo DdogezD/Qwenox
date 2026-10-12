@@ -42,7 +42,7 @@ models/
 - PLE n-gram 表直接用 GGUF 里的 IQ4_NL（90 B/行，约 27 GiB；hgn fp8 为 160 B/行 47.7 GiB），
   prefill 在 GPU 上解量化（`k_ple_iq4nl_dequant`），decode 在 CPU 上解量化；`PLE_URING=1` 的 io_uring 批量读
   改为指向表所在的分片。
-- 目前只支持 Linux（`QWENOX_GGUF_DENSE` 还没移植到 Windows；Windows 启动器只读 service.conf 的 hgn 一段）。
+- Linux 与 Windows 都支持（Windows 2026-10-13 起，见下文"UD-IQ4_XS（Windows）"）。
 
 ## 用法：混合模式（过渡，仍需 hgn；只用于验证脚本直接运行引擎，启动器会清掉这些变量）
 
@@ -208,6 +208,67 @@ Windows（96 GiB 上限）继续用 hgn 即可拿到这份 prefill 提速，重�
 GGUF 的质量优势主要来自 dense 8-bit（Q8_0）。同样的 dense 8-bit + imatrix 专家量化可以直接做进
 hgn（Windows 需要），见 [HGN-HQ.md](HGN-HQ.md)。
 
+## UD-IQ4_XS（Windows，2026-10-13）
+
+Unsloth `Qwen3.8-Flash-Next-UD-IQ4_XS`（3 个分片，87.2 GiB，第 1 个分片只有元数据）与 UD-Q4_K_XL
+是同一架构、同一套张量名，差别只在块类型。名字里的 IQ4_XS 只占很少一部分，实际分布（读分片头统计）：
+
+| 张量 | 类型 | 大小 |
+|---|---|---|
+| gate/up 专家，47 层 | IQ3_S（110 B/256） | 31.6 GiB |
+| gate/up 专家，blk.2 | IQ4_XS | 0.8 GiB |
+| down 专家，43 层 | IQ4_NL | 18.9 GiB |
+| down 专家，blk.2/4/30/46/47 | Q8_0 | 4.2 GiB |
+| 注意力/SSM/HC/共享专家/embed | Q8_0 | ≈4.3 GiB |
+| lm_head（output.weight） | Q6_K | 0.49 GiB |
+| PLE n-gram 表 | IQ4_NL | 26.8 GiB（按需读盘，不进显存） |
+
+显存常驻 ≈60.4 GiB（专家 55.4 + dense 4.8 + norm 等），比 v2 hgn（62.1 GiB）还小，95 GiB arena 放 256K
+没有问题。分片里没有 MTP 头，MTP 用单独的 `mtp-*.gguf` sidecar（没有时不投机）。
+
+实现要点：
+
+- **IQ3_S 不需要新的解码框架**：`iq3s_grid` 的 512×4 个字节全部是 {1,3,…,15}，所以每 32 个元素等价于
+  "4-bit 码（低 3 位 = g>>1，第 3 位 = 符号）+ 16 项码本 ±(2c+1) + 一个 scale `d·(1+2·sc)`"。WMMA prefill
+  复用 `k_moe_lut`（`kIQ3S`）：commit 阶段用 LDS 里的 grid 把原始块展开成与 IQ4 相同的 16 个配对码字节，
+  decode/WMMA/epilogue 全部不变。grid 表见 `src/gguf_iq3s_grid.h`（llama.cpp，MIT）。
+- 小 P（decode/投机验证）GEMV：`26_kernels_moe_gguf.inc` 新增 `UnitW<kIq4nl / kIq4xs / kIq3s>`；IQ4 码本
+  在寄存器里用 `v_perm` 查表，IQ3_S grid 在 `__constant__`。点积写成显式 `fmaf` 链：专家去重路径要求与
+  普通路径逐位相同，隐式 fp-contract 在两个 kernel 里不一定一样。
+- 逐层混合类型：`moe_ggx_up/down`（27 末尾）按每层的 `tgu/tdn` 派发——K-quant/Q5_1/Q8_0 走 `k_moe_gg`，
+  IQ 走 `k_moe_lut`。
+- lm_head Q6_K：加载时按 ggml 语义反量化，再每 32 个元素重量化为 q8g32（`gguf_map::add_q8` 的非 Q8_0 分支）。
+  8-bit 码对 6-bit 源，误差不超过源量化步长的 1/8；decode logits GEMV 读取字节与 Q8_0 dense 一致。
+- Windows：分片用 `OVERLAPPED | NO_BUFFERING` 句柄打开（同 hgn），专家与 dense 一起拷进 devarena（没有
+  hipHostRegister 直读路径）；`devarena_estimate` 计入 GGUF 专家；PLE 表的 IOCP 批量读指向表所在分片。
+- 服务启动：设置页/网页选"GGUF"（service.conf 写 `# start_win: weights=gguf`）后，托盘 `qwenox-win` 与
+  `bash start_win.sh` 都改用 `GGUF_FILE`（第 1 个分片）启动；`GGUF_MTP_FILE` 置空即不投机，
+  `GGUF_VISION_FILE` 可以填 mmproj `*.gguf`，也可以直接用现有的 `*-vision.hgn`。
+
+验证：`bash tools/iq4xs_verify_win.sh`（约 30 分钟，结尾 `IQ4XS_VERIFY PASS/FAIL`）——编译、真实权重
+kernel 对拍（混合类型层 0/2/30/47）、v2 路径与旧提交逐位相同、GGUF prefill/GEMV PPL 一致、PPL 低于 v2、
+服务端到端（weights=gguf 临时 conf + 测试端口）、decode/prefill 速度。CPU 解码参考对 ggml 逐位：
+`tools/gguf_dequant_ref_check.cpp`（g++ 即可，见文件头）。
+
+结果（Windows，2026-10-13，同一二进制，`data/qsa-oracle/2048.tokens`）：
+
+| 项目 | UD-IQ4_XS（GGUF） | v2 hgn |
+|---|---|---|
+| kernel 对拍（层 0/2/30/47，真实权重 vs CPU） | WMMA up rel-L2 ≤ 6.3e-4，GEMV ≤ 2e-7，去重路径逐位相同 | — |
+| v2 路径（新二进制 vs 6eb7c9e） | — | PPL 与 greedy 128 ids 逐字相同 |
+| PPL（生产内核组合，chunk 2048 / chunk 4） | **39.62** / 39.50（相差 0.30%） | 48.12 |
+| decode（2048 prompt，`--gen 128`，均无 MTP） | 27.7 tok/s | 31.4 tok/s |
+| prefill（qwenox-bench，1 遍）2K / 8K / 32K / 64K / 128K | 1164 / 1318 / 1443 / 1444 / 1418 | 546¹ / 1167 / 1562 / 1566 / 1539 |
+| prefill 加权平均 | 1415.6 tok/s | 1504.3 tok/s |
+| 冷启动（`--ppl`，maxctx 4096） | 46 s，arena 69.8 GiB | 30 s，arena 72.1 GiB |
+| 服务端到端（weights=gguf，32K，单路） | 拉起 + 中文对话正常，device 74.1 GiB | — |
+
+¹ 第一个文件，含预热，不计。
+
+结论：质量明显好于 v2（PPL −18%，KLD 待 Linux 上对 BF16 基准补测），显存更省。速度方面 decode 慢
+约 12%，32K 以上 prefill 慢约 8%，原因和 UD-Q4_K_XL 相同：dense 是 Q8_0，每 token 读的字节约为 v2 的 2 倍。
+MTP 投机要等 `mtp-*.gguf` sidecar 就位后实测。
+
 ## 验证脚本
 
 - `tools/g2_verify.sh` — G2（专家）
@@ -222,6 +283,8 @@ hgn（Windows 需要），见 [HGN-HQ.md](HGN-HQ.md)。
 - `tools/lut_verify.sh` — hgn LUT MoE kernel：开关关闭与旧二进制逐位相同、decode 不变、KLD、
   prefill/decode PPL、MTP、速度（`BIN=` 新二进制，`REF=` 旧提交二进制）
 - `tools/moe_lut_test.cu` — LUT kernel（q4cp 真实权重 `--hgn` / 合成 IQ4_NL、IQ4_XS `--synth`）vs CPU 参考
-- `tools/moe_gguf_test.cu` — MoE kernel vs CPU 参考
+- `tools/iq4xs_verify_win.sh` — UD-IQ4_XS（Windows）：kernel 对拍、v2 逐位不变、PPL 一致性/质量、服务端到端、速度
+- `tools/gguf_dequant_ref_check.cpp` — gguf.h CPU 解码（IQ3_S、Q6_K）vs ggml 原函数逐位
+- `tools/moe_gguf_test.cu` — MoE kernel（含 IQ 类型，经 `moe_ggx_*`）vs CPU 参考
 - `tools/moe_gguf_gemv_test.cu` — 小 P 专家 GEMV（含去重路径逐位对照）vs CPU 参考
 - `tools/q8g32_gemv_bench.cu` — q8g32 dense GEMV 各变体（P=1 与 P=4）
