@@ -69,7 +69,8 @@ MTP_GAMMA="${MTP_GAMMA:-0}"
 KVSNAP_MAX_GB="${KVSNAP_MAX_GB:-20}"
 RCKPT_MAX="${RCKPT_MAX:-8}"
 # 分页 KV（见 service.conf）：默认开启，页池 = 一条 MAX_CONTEXT 序列。
-# Windows 的 95 GiB arena 在 256K 下没有余量，KV_POOL_TOKENS 保持 0。
+# Windows 的 arena 上限 95 GiB：v2 权重 512K 池（KV_POOL_TOKENS=524288）用 92–94 GiB，放得下；
+# w4b 只放得下 256K。
 KV_PAGED="${KV_PAGED:-1}"
 KV_POOL_TOKENS="${KV_POOL_TOKENS:-0}"
 PARALLEL="${PARALLEL:-1}"
@@ -134,7 +135,7 @@ echo "模型：$MODEL_FILE$([[ "$WEIGHTS" == gguf ]] && echo "（GGUF，MTP：${
 echo "配置：${MAX_CONTEXT} 上下文，MTP gamma=$([[ $MTP_GAMMA == 0 ]] && echo 'auto（greedy 4 / 采样自适应）' || echo "$MTP_GAMMA")，engine ${ENGINE_HOST}:${ENGINE_PORT}，API ${API_HOST}:${API_PORT}"
 if (( KV_PAGED )); then
   echo "KV：分页，页池 $(( (KV_POOL_TOKENS > MAX_CONTEXT ? KV_POOL_TOKENS : MAX_CONTEXT) )) token（${PARALLEL} 路并发共享），RAM 检查点 ${RCKPT_MAX} 个"
-  (( PARALLEL == 1 )) || echo "提示：每多一路并发约多占 0.12 GiB 设备内存，arena（95 GiB 上限）放不下的部分会回退 hipMalloc" >&2
+  (( PARALLEL == 1 )) || echo "提示：每多一路并发约多占 0.27 GiB 设备内存，arena（95 GiB 上限）放不下的部分会回退 hipMalloc" >&2
   (( KV_POOL_TOKENS <= MAX_CONTEXT )) || echo "警告：KV_POOL_TOKENS 大于 MAX_CONTEXT，Windows arena（95 GiB 上限）可能放不下，超出部分会回退 hipMalloc" >&2
 else
   echo "KV：不分页（KV_PAGED=0）"
