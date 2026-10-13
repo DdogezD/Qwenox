@@ -3,7 +3,7 @@
  * - 四个页面（总览/用量/请求/采样），hash 路由，左侧按钮分页。
  * - 文案双语：静态文本在 index.html 挂 data-i18n 键，动态文案走 t()；
  *   语言存 localStorage，首次按浏览器语言自动选择，侧栏 EN/中文 按钮切换。
- * - 数据源：/health /memory /power /admin/overrides /reqstat/page /reqstat/tail。
+ * - 数据源：/health /memory /power（功耗 + 温度）/admin/overrides /reqstat/page /reqstat/tail。
  *   请求页无筛选条件时走 /reqstat/page 服务端分页（可翻阅全部历史）；
  *   设了筛选条件回退到 tail 最近 1000 条内存过滤。用量页仍按 tail 聚合，
  *   按天聚合端点落地后再切换（见 usage-note）。
@@ -27,6 +27,11 @@ const I18N = {
     "ov.mem": "显存与内存", "ov.power": "功耗",
     "power.socket": "整机封装", "power.gfx": "GPU 功耗", "power.cpu": "CPU 功耗",
     "power.na": "功耗读数不可用",
+    "ov.temp": "温度",
+    "temp.gpu": "GPU 核心", "temp.hotspot": "GPU 热点", "temp.cpu": "CPU", "temp.soc": "SoC",
+    "temp.na": "温度读数不可用",
+    "temp.note": "刻度 0–100 °C；≥80 °C 偏热，≥90 °C 过热",
+    "temp.warm": "偏热", "temp.hot": "过热",
     "health.status": "状态", "health.busy_field": "忙闲",
     "health.busy_yes": "推理中", "health.busy_no": "空闲",
     "health.inflight": "在途请求", "health.model": "模型",
@@ -130,6 +135,11 @@ const I18N = {
     "ov.mem": "VRAM & memory", "ov.power": "Power",
     "power.socket": "Package", "power.gfx": "GPU", "power.cpu": "CPU",
     "power.na": "power reading unavailable",
+    "ov.temp": "Temperature",
+    "temp.gpu": "GPU core", "temp.hotspot": "GPU hotspot", "temp.cpu": "CPU", "temp.soc": "SoC",
+    "temp.na": "temperature reading unavailable",
+    "temp.note": "Scale 0–100 °C; ≥80 °C warm, ≥90 °C hot",
+    "temp.warm": "warm", "temp.hot": "hot",
     "health.status": "Status", "health.busy_field": "Busy",
     "health.busy_yes": "generating", "health.busy_no": "idle",
     "health.inflight": "In flight", "health.model": "Model",
@@ -620,10 +630,12 @@ async function refreshMemory() {
   }
 }
 
+// 功耗卡和温度卡共用一次 /power 请求（同一次传感器快照）。
 async function refreshPower() {
   const el = document.getElementById("ov-power");
+  let p = null;
   try {
-    const p = await getJSON("/power");
+    p = await getJSON("/power");
     if (!p.available) {
       fillKv(el, [[t("ov.power"), t("power.na")]]);
     } else {
@@ -636,6 +648,49 @@ async function refreshPower() {
   } catch (e) {
     fillKv(el, [[t("ov.power"), t("common.read_failed")]]);
   }
+  renderTemps(p);
+}
+
+// 温度条：刻度 0–100 °C；≥TEMP_WARM 偏热（琥珀/橙章），≥TEMP_HOT 过热（红）。
+// 旧版后端没有 temp_* 字段时 temp_available 为 undefined → 显示不可用。
+const TEMP_WARM = 80, TEMP_HOT = 90;
+function renderTemps(p) {
+  const bars = document.getElementById("temp-bars");
+  const note = document.getElementById("temp-note");
+  bars.textContent = "";
+  bars.classList.remove("muted");
+  note.textContent = "";
+  if (!p) {
+    bars.textContent = t("common.read_failed");
+    bars.classList.add("muted");
+    return;
+  }
+  const items = [
+    ["temp.cpu", p.cpu_temp_c],
+    ["temp.gpu", p.gpu_temp_c],
+    ["temp.hotspot", p.gpu_hotspot_c],
+    ["temp.soc", p.soc_temp_c],
+  ].filter(([, v]) => v != null);
+  if (!p.temp_available || items.length === 0) {
+    bars.textContent = t("temp.na");
+    bars.classList.add("muted");
+    return;
+  }
+  for (const [key, c] of items) {
+    const lvl = c >= TEMP_HOT ? "hot" : c >= TEMP_WARM ? "warm" : "";
+    const row = document.createElement("div");
+    row.className = "bar-row temp-row" + (lvl ? " " + lvl : "");
+    const l = document.createElement("span"); l.className = "bar-label"; l.textContent = t(key);
+    const tr = document.createElement("div"); tr.className = "bar-track";
+    const fl = document.createElement("div"); fl.className = "bar-fill";
+    fl.style.width = Math.max(0, Math.min(100, c)).toFixed(0) + "%";
+    tr.appendChild(fl);
+    const v = document.createElement("span"); v.className = "bar-value";
+    v.textContent = c + " °C" + (lvl ? " · " + t("temp." + lvl) : "");
+    row.append(l, tr, v);
+    bars.appendChild(row);
+  }
+  note.textContent = t("temp.note");
 }
 
 // ---------------- 采样（服务端覆盖编辑） ----------------

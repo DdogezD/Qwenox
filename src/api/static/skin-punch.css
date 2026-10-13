@@ -369,6 +369,11 @@
   border-right: 1px dashed var(--ink-mid);
   transition: width .4s steps(8);
 }
+/* 温度条：偏热 = 已打孔段染橙章色，过热 = 色带红 */
+[data-style="punch"] .temp-row.warm .bar-fill { background-color: rgba(176, 97, 26, .28); border-right-color: var(--stamp-busy); }
+[data-style="punch"] .temp-row.hot .bar-fill  { background-color: rgba(179, 38, 30, .30); border-right-color: var(--ribbon); }
+[data-style="punch"] .temp-row.warm .bar-value { color: var(--stamp-busy); font-weight: 700; }
+[data-style="punch"] .temp-row.hot .bar-value  { color: var(--ribbon); font-weight: 700; }
 
 /* ---- 纸面上的控件：印出来的方框，主操作是反白印刷 ---- */
 [data-style="punch"] .btn {

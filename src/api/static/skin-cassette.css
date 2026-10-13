@@ -338,6 +338,11 @@
   filter: drop-shadow(0 0 4px rgba(134, 245, 168, .6));
   transition: width .4s ease;
 }
+/* 温度条：偏热琥珀、过热红 */
+[data-style="cassette"] .temp-row.warm .bar-fill { background: var(--amber); filter: drop-shadow(0 0 4px rgba(255, 193, 94, .6)); }
+[data-style="cassette"] .temp-row.hot .bar-fill  { background: var(--red); filter: drop-shadow(0 0 4px rgba(255, 111, 94, .6)); }
+[data-style="cassette"] .temp-row.warm .bar-value { color: var(--amber); }
+[data-style="cassette"] .temp-row.hot .bar-value  { color: var(--red); }
 
 /* ---- 屏幕内控件：终端式方框 ---- */
 [data-style="cassette"] .btn {

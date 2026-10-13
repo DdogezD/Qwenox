@@ -1926,7 +1926,8 @@ void handle_memory(const http::Request&, http::Response* r, http::Stream*) {
     r->body = json_py::dumps(j, /*spaced=*/false);
 }
 
-// GET /power — APU 功耗瞬时值（Windows ADL PMLog / Linux amdgpu hwmon），
+// GET /power — APU 功耗与温度瞬时值（Windows ADL PMLog / Linux amdgpu hwmon +
+// k10temp），
 // 读不到的字段为 null，完全不可用时 available=false。
 void handle_power(const http::Request&, http::Response* r, http::Stream*) {
     const power::Reading p = power::read();
@@ -1938,6 +1939,16 @@ void handle_power(const http::Request&, http::Response* r, http::Stream*) {
     else j["gfx_watts"] = nullptr;
     if (p.cpu_watts >= 0) j["cpu_watts"] = p.cpu_watts;
     else j["cpu_watts"] = nullptr;
+    // 温度（°C），与功耗同一次快照；读不到的为 null。
+    j["temp_available"] = p.temp_available;
+    const auto put_temp = [&j](const char* k, int v) {
+        if (v >= 0) j[k] = v;
+        else j[k] = nullptr;
+    };
+    put_temp("gpu_temp_c", p.gpu_temp_c);
+    put_temp("gpu_hotspot_c", p.gpu_hotspot_c);
+    put_temp("cpu_temp_c", p.cpu_temp_c);
+    put_temp("soc_temp_c", p.soc_temp_c);
     r->body = json_py::dumps(j, /*spaced=*/false);
 }
 
