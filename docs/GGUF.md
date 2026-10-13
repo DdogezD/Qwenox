@@ -266,6 +266,7 @@ kernel 对拍（混合类型层 0/2/30/47）、v2 路径与旧提交逐位相同
 | kernel 对拍（层 0/2/30/47，真实权重 vs CPU） | WMMA up rel-L2 ≤ 6.3e-4，GEMV ≤ 2e-7，去重路径逐位相同 | — |
 | v2 路径（新二进制 vs 6eb7c9e） | — | PPL 与 greedy 128 ids 逐字相同 |
 | PPL（生产内核组合，chunk 2048 / chunk 4） | **39.62** / 39.50（相差 0.30%） | 48.12 |
+| KLD vs BF16（`data/kld/bf16_c512.kld`，64×512，生产 env）：Mean / top-1 / 99.9% / PPL(Q) | **0.1002** / 89.72% / 3.109 / 3.444 | 0.1075 / 88.79% / 2.910 / 3.416 |
 | decode（2048 prompt，`--gen 128`，均无 MTP） | 27.7 tok/s | 31.4 tok/s |
 | prefill（qwenox-bench，1 遍）2K / 8K / 32K / 64K / 128K | 1164 / 1318 / 1443 / 1444 / 1418 | 546¹ / 1167 / 1562 / 1566 / 1539 |
 | prefill 加权平均 | 1415.6 tok/s | 1504.3 tok/s |
@@ -274,7 +275,9 @@ kernel 对拍（混合类型层 0/2/30/47）、v2 路径与旧提交逐位相同
 
 ¹ 第一个文件，含预热，不计。
 
-结论：质量明显好于 v2（PPL −18%，KLD 待 Linux 上对 BF16 基准补测），显存更省。速度方面 decode 慢
+结论：质量与 v2 基本持平。对 BF16 的 KLD 平均值和 top-1 一致率略好，PPL(Q) 和 99.9% 尾部略差；
+上面单个 2048-token 文本的 PPL 差 18%，不能代表整体（单段文本的 PPL 对个别位置很敏感）。不带 MTP 时
+显存更省。速度方面 decode 慢
 约 12%，32K 以上 prefill 慢约 8%，原因和 UD-Q4_K_XL 相同：dense 是 Q8_0，每 token 读的字节约为 v2 的 2 倍。
 MTP（`tools/iq4xs_verify_win.sh` 的 mtp 步骤，greedy γ=4，`--spec-gen 256`，maxctx 16384）：
 

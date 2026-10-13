@@ -15,7 +15,7 @@
 #     30/47（IQ3_S/Q8_0）；WMMA rel-L2 < 1e-2，GEMV < 1e-4，dedup 与普通路径逐 bit
 #   3 v2 hgn 不受影响：新二进制 vs 基线 BASE_REV（默认 6eb7c9e）PPL 与 greedy ids 逐字相同
 #   4 GGUF 一致性：prefill（chunk 2048，WMMA）与小 chunk（4，GEMV+dedup）PPL 相差 < 1%
-#   5 GGUF 质量：同 tokens 上 PPL 低于 v2（参考：UD-IQ4_XS KLD ~0.084 vs v2 .107）
+#   5 GGUF 质量：同 tokens 上 PPL 低于 v2（BF16 KLD 64×512：UD-IQ4_XS .100 vs v2 .107）
 #   M MTP（有 sidecar 时）：GGUF+sidecar 与 v2+mtp.hgn 同 prompt greedy γ=4 --spec-gen 256，
 #     草稿头已加载，commit/round ≥ 0.9×v2（只报告：tok/s、与普通 greedy 的前缀一致长度）
 #   6 服务端到端：临时 conf（weights=gguf，测试端口 18730/18731）起 qwenox-win，
