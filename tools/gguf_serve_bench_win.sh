@@ -57,6 +57,9 @@ for cfg in $CFGS; do
   } > "$CONF"
   # 引擎子进程继承 qwenox-win 的环境
   [[ $cfg == gguf_old ]] && export QWENOX_DENSE_WMMA_Q8=0 QWENOX_GG_GEMV=8
+  # BENCH_ENV="QWENOX_X=0 ..." (A/B): extra engine env for every config (the loop
+  # clears QWENOX_* above, so plain exports from the caller are lost)
+  for e in ${BENCH_ENV:-}; do export "$e"; done
   ./build/qwenox-win.exe --console --service-conf "$(cygpath -w "$CONF")" > "$L/api_$cfg.log" 2>&1 &
   ok=0
   for i in $(seq 60); do curl -s -m 2 $API/admin/engine/status > /dev/null && { ok=1; break; }; sleep 1; done
@@ -79,6 +82,7 @@ for cfg in $CFGS; do
   sleep 5
   kill_test; sleep 3
   unset QWENOX_DENSE_WMMA_Q8 QWENOX_GG_GEMV
+  for e in ${BENCH_ENV:-}; do unset "${e%%=*}"; done
 done
 echo
 for cfg in $CFGS; do echo "--- $cfg"; tail -14 "$L/bench_$cfg.txt" 2>/dev/null; done

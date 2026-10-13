@@ -26,7 +26,18 @@ rckpt 检查点连同 MTP 层的页一起钉住，恢复后继续 MTP 投机（`
   默认的 unified KV。例如 256K 池可以是 4 条 64K，也可以是 1 条 200K 加 3 条短的。
 - **调度**：每个连接一个读线程（`PING/INFO/X` 随时响应），每个 `GEN` 一个工作线程；
   FIFO 票据锁拥有 GPU，持有者在让出点（spec 轮开头、prefill 分块边界、串行 decode
-  每个 token）发现有人排队就交出。每条序列算出的结果与它单独运行逐位一致。
+  每个 token）发现有人排队就交出。
+- **与单跑是否一致**：v2 hgn 上，每条序列的 greedy 输出与它单独运行逐位一致；带 seed
+  的采样请求（API 显式传 `seed`，引擎协议 `SEEDED`）同样一致。没给 seed 的采样请求本来就
+  随机，不保证。GGUF 上 greedy 在近似平局处偶尔会不同（Windows UD-IQ4_XS 实测：10 个请求里
+  有 1 个，在第 27 个 token 上“are:”与“are G…”的差别，大约一半的并发运行出现）：并发时
+  MTP 投机的 γ 按同时在跑的人数选（OccGamma），而 GGUF 路径的输出对 γ 不严格不变。需要
+  严格一致时设 `QWENOX_OCC_FORCE=4`，greedy 的 γ 在任何并发下都固定为 4（吞吐会低一些）。
+- **会合 verify 的行窗口备份**：多条序列的 MTP verify 合成一批跑完后，GPU 会先交出去，
+  各序列再依次回来提交 / 回滚，期间别的请求（prefill、ngram verify、单段 verify）可能已经
+  改写了共享缓冲里它们那几行。引擎在交出前按槽备份这些行，回来时先拷回（每槽 48.4 MB，
+  `QWENOX_VR_RESTORE=0` 可关，关掉后并发输出会与单跑分叉）。`QWENOX_VR_CHECK=1` 调试用：
+  两边算哈希，被改写时日志打 `[vr-check] ... CLOBBERED`。
 - **并发时的 prefill 分段**：PARALLEL>1 时 prompt 按 min(`CONC_PREFILL_CHUNK`, 单路分段) 分段
   （默认 8192，引擎变量 `QWENOX_CONC_PREFILL_CHUNK`；单路分段 = `PREFILL_CHUNK`，Linux 默认 16384），
   只缩不放。`PREFILL_CHUNK` 管工作区显存和单条 prompt 的 PP，`CONC_PREFILL_CHUNK` 管并发响应：
@@ -80,3 +91,17 @@ bash tools/conc_verify.sh
 
 可选：`OLD_BIN=build/qwenox.old` 额外对拍旧二进制的单路结果（注意上面的确定性修复会让
 旧/新在长输出上合法地不同）；`STAGES="ovf"` 只跑某几段；`CONC_ENV="..."` 附加引擎环境。
+
+Windows（Git Bash）：
+
+```bash
+bash build_win.sh engine
+bash tools/conc_fix_regress_win.sh     # 约 70 分钟，结尾 CONC_FIX PASS/FAIL
+bash tools/conc_diverge_win.sh         # 排查用：单跑参考 + 若干并发配置，只比 token，打表
+```
+
+`conc_fix_regress_win.sh` 跑 v2 4 路 / 8 路多次、带 seed 的采样、GGUF 4 路 / 8 路、
+`d2_s2_ids.sh`、vseg 自检和 API 吞吐（`QWENOX_VR_RESTORE` 开 / 关对照）。GGUF 按上面“与单跑
+是否一致”一节，用 `QWENOX_OCC_FORCE=4` 判定，按人数选 γ 的那次只报告。
+`conc_diverge_win.sh` 的用法见文件头（`CONFIGS="base|QWENOX_OCC_FORCE=4"`、`CONC_SEEDED=1`、
+GGUF 用 `MODEL_ARGS=<gguf> GGUF_MTP=<sidecar>`）。

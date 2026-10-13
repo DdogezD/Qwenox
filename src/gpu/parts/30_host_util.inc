@@ -308,6 +308,11 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
     add(vr * ngdn * 8288 * 4);                      // grow (kGdnRowF)
     add(vr * ngdn * 3 * 10240 * 4);                 // csnap
     add(nqsa * vr * 128 * 4);                       // iproj_snap
+    // 10-13 会合 verify 行窗口每槽备份（GpuModel::vr_save_，9 行，d_Rb 按 fp32 上界）
+    const char* vre = getenv("QWENOX_VR_RESTORE");
+    if (kv_paged && eff_parallel() > 1 && !(vre && vre[0] == '0' && vre[1] == 0))
+      add((size_t)eff_parallel() * 9 *
+          (10240 * 4 + ngdn * 8288 * 4 + ngdn * 3 * 10240 * 4 + nqsa * 128 * 4));
     if (!qsa_dense) {
       add(4 * 128 * 4 + 256 * 4);                   // miraw minorm
       if (index_f32) add((size_t)640 * 2560 * 4);   // miw

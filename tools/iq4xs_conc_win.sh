@@ -57,6 +57,9 @@ ENG_PID=""
 serve() {
   local tag=$1 mc=$2; shift 2
   for e in "$@"; do export "$e"; done
+  # EXTRA_ENV="QWENOX_X=1 QWENOX_Y=2" (debug): extra engine env on every engine
+  # this script starts (prod_env clears QWENOX_* first, so plain exports are lost)
+  for e in ${EXTRA_ENV:-}; do export "$e"; done
   local log=$ROOT/$L/iq4xs_conc_$tag.log
   # MODEL_ARGS="<hgn args>" (debug): serve another model with the same harness
   local margs=("$GW")
@@ -94,7 +97,8 @@ if step conc; then
   # SEQ_PAR=8: run the serial reference on an 8-slot engine too (separates
   # concurrency effects from PARALLEL-dependent engine configuration)
   SP=${SEQ_PAR:-1}
-  if serve single 32768 QWENOX_PARALLEL=$SP QWENOX_PREFILL_CHUNK=8192 QWENOX_CONC_PREFILL_CHUNK=8192 QWENOX_KVSNAP=0 QWENOX_NGRAM_CHUNK=16; then
+  # SEQ_MAXCTX=262144: same --maxctx as the concurrent engine (debug)
+  if serve single ${SEQ_MAXCTX:-32768} QWENOX_PARALLEL=$SP QWENOX_PREFILL_CHUNK=8192 QWENOX_CONC_PREFILL_CHUNK=8192 QWENOX_KVSNAP=0 QWENOX_NGRAM_CHUNK=16; then
     python tools/conc_verify.py seq --tag iq1 > $L/iq4xs_conc_seq.txt 2>&1 \
       && pass "单路串行 8 组 flow 正常结束" || { fail "单路串行"; tail -5 $L/iq4xs_conc_seq.txt; }
     grep -E "requests|FAIL" $L/iq4xs_conc_seq.txt | sed 's/^/    /'

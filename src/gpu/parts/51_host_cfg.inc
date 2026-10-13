@@ -1836,11 +1836,12 @@ struct Turnstile {
   std::mutex mu;
   std::condition_variable cv;
   uint64_t next = 0, serving = 0;
-  void acquire() {
+  uint64_t acquire() {  // returns this grant's ticket (QWENOX_VR_CHECK diagnostics)
     std::unique_lock<std::mutex> lk(mu);
     const uint64_t t = next++;
     cv.wait(lk, [&] { return serving == t; });
     if (g_turn_prof) g_turnprof.on_acquire();
+    return t;
   }
   void release() {
     if (g_turn_prof) g_turnprof.on_release(tl_turn_tag);
@@ -2103,7 +2104,20 @@ struct VrReq {
   const std::function<void(int)>* post = nullptr;  // see GpuModel::vseg_pool_fn
   bool done = false;
   bool dropped = false;        // abort/guard refusal -> worker serial rerun
+  // QWENOX_VR_CHECK / QWENOX_VR_RESTORE (10-13): this segment's row window in
+  // the shared post-verify scratch (-1 = not recorded), its hash at the
+  // executor's release, and the executor's turn ticket.
+  int win_row0 = -1;
+  bool saved = false;
+  std::array<uint64_t, 4> win_hash{};
+  uint64_t exec_ticket = 0;
 };
+static bool vr_check_on() {
+  static const bool v = getenv("QWENOX_VR_CHECK") && !GpuModel::env_zero("QWENOX_VR_CHECK");
+  return v;
+}
+static bool vr_restore_on() { return GpuModel::vr_restore_env(); }  // default on
+static std::atomic<long> g_vrc_ok{0}, g_vrc_bad{0}, g_vrc_restored{0};
 struct VerifyPool {
   std::mutex mu;
   std::condition_variable cv;
@@ -2151,7 +2165,7 @@ static int vseg_active() {
 // released again.
 static void vr_execute(GpuModel& m) {
   tl_turn_tag = TT_VR;
-  g_turn.acquire();
+  const uint64_t my_ticket = g_turn.acquire();
   m.bind(tl_slot);
   std::vector<VrReq*> mine;
   {
@@ -2184,6 +2198,14 @@ static void vr_execute(GpuModel& m) {
         const int P = (int)segs[i].toks->size();
         memcpy(run[i]->vout, v.data() + off, (size_t)P * sizeof(int));
         if (run[i]->post) (*run[i]->post)(off);  // rows still in d_logits_b
+        // 10-13: record this segment's shared row window before the turn is
+        // released (see GpuModel::vr_rows_each).
+        run[i]->exec_ticket = my_ticket;
+        if (vr_check_on() || vr_restore_on()) {
+          run[i]->win_row0 = off;
+          if (vr_check_on()) run[i]->win_hash = m.vr_rows_hash(off, P);
+          if (vr_restore_on()) run[i]->saved = m.vr_rows_save(segs[i].slot, off, P);
+        }
         off += P;
       }
     } else {
@@ -2192,12 +2214,23 @@ static void vr_execute(GpuModel& m) {
       g_vr.fallbacks++;
       fprintf(stderr, "%s [vr] batched verify refused (%zu segments, %d rows);"
                       " serial fallback\n", log_ts(), segs.size(), rows);
+      // Every serial segment packs at its slot's vsnap_row0_ (0 from the
+      // spec loop), so segment i+1 overwrites segment i's rows: record and
+      // save each window right after its own verify (10-13).
       for (size_t i = 0; i < segs.size(); i++) {
         m.bind(segs[i].slot);
-        if (!m.verify_segments(&segs[i], 1, run[i]->vout))
+        if (!m.verify_segments(&segs[i], 1, run[i]->vout)) {
           run[i]->dropped = true;  // worker re-runs prefill_batch+batch_argmax
-        else if (run[i]->post)
-          (*run[i]->post)(0);
+          continue;
+        }
+        if (run[i]->post) (*run[i]->post)(0);
+        run[i]->exec_ticket = my_ticket;
+        if (vr_check_on() || vr_restore_on()) {
+          const int P = (int)segs[i].toks->size(), r0 = m.vsnap_row0_;
+          run[i]->win_row0 = r0;
+          if (vr_check_on()) run[i]->win_hash = m.vr_rows_hash(r0, P);
+          if (vr_restore_on()) run[i]->saved = m.vr_rows_save(segs[i].slot, r0, P);
+        }
       }
     }
   }
@@ -2262,8 +2295,37 @@ static bool vseg_pool(GpuModel& m, const GpuModel::VSeg& self, int* vout,
     lk.unlock();
   }
   if (am_exec) vr_execute(m);
-  g_turn.acquire();
+  const uint64_t back = g_turn.acquire();
   m.bind(tl_slot);
+  if (!req.dropped && req.win_row0 >= 0) {
+    const int P = (int)self.toks->size();
+    // grants that ran between the executor's turn and ours (peers + others)
+    const long between = (long)(back - req.exec_ticket) - 1;
+    if (vr_check_on()) {
+      const auto h = m.vr_rows_hash(req.win_row0, P);
+      static const char* nm[4] = {"d_Rb", "d_grow", "d_csnap", "d_iproj_snap"};
+      std::string bad;
+      for (int k = 0; k < 4; k++)
+        if (h[k] != req.win_hash[k]) bad += std::string(bad.empty() ? "" : ",") + nm[k];
+      if (bad.empty()) {
+        g_vrc_ok++;
+      } else {
+        const long nb = ++g_vrc_bad;
+        fprintf(stderr, "%s [vr-check] slot %d rows [%d,%d) CLOBBERED: %s (%ld grants in between;"
+                        " ok %ld bad %ld)\n",
+                log_ts(), self.slot, req.win_row0, req.win_row0 + P, bad.c_str(), between,
+                g_vrc_ok.load(), nb);
+      }
+      const long tot = g_vrc_ok.load() + g_vrc_bad.load();
+      if (tot % 100 == 0)
+        fprintf(stderr, "%s [vr-check] ok %ld bad %ld\n", log_ts(), g_vrc_ok.load(),
+                g_vrc_bad.load());
+    }
+    if (vr_restore_on() && req.saved) {
+      m.vr_rows_load(self.slot, req.win_row0, P);
+      g_vrc_restored++;
+    }
+  }
   borrow_abort_check();
   return !req.dropped;
 }

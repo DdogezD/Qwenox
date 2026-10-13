@@ -6385,6 +6385,79 @@ struct GpuModel {
     return true;
   }
 
+  // ---- 10-13 并发分叉排查：会合 verify 之后的共享行窗口 ----
+  // The batched verify leaves each segment's post-verify inputs in SHARED
+  // scratch at its row window [row0, row0+P): trunk streams d_Rb (rollback
+  // d_R, MTP ingest taps), GDN replay rows d_grow, conv snapshots d_csnap,
+  // indexer proj rows d_iproj_snap. The executor then releases the FIFO
+  // turn, so a non-member (prefill, ngram verify, a serial spec verify that
+  // packs at row 0, ...) may run before the member re-acquires it and reads
+  // its window (Windows v2 C4: 2-3 grants in between, outputs forked at
+  // tokens 5-86). QWENOX_VR_RESTORE (default on, =0 off) saves the window
+  // per slot in the executor and copies it back when the member resumes
+  // (~50 MB per slot, ~0.3 ms per member round); QWENOX_VR_CHECK=1 (debug)
+  // hashes the window on both sides and logs clobbers.
+  static bool vr_restore_env() {
+    static const bool v = !env_zero("QWENOX_VR_RESTORE");
+    return v;
+  }
+  template <class F>
+  void vr_rows_each(int row0, int P, F f) {
+    const size_t ngdn = (size_t)(g_cfg.layers - g_cfg.layers / 4),
+                 nqsa = (size_t)(g_cfg.layers / 4);
+    const size_t esz = gr_bf16 ? 2 : 4;
+    f(0, (char*)d_Rb + (size_t)row0 * 10240 * esz, (size_t)P * 10240 * esz);
+    if (d_grow)
+      f(1, (char*)(d_grow + (size_t)row0 * ngdn * kGdnRowF), (size_t)P * ngdn * kGdnRowF * 4);
+    if (d_csnap)
+      f(2, (char*)(d_csnap + (size_t)row0 * ngdn * 3 * 10240), (size_t)P * ngdn * 3 * 10240 * 4);
+    if (d_iproj_snap)
+      for (size_t qi = 0; qi < nqsa; qi++)
+        f(3, (char*)(d_iproj_snap + (qi * kVSnapRows + row0) * 128), (size_t)P * 128 * 4);
+  }
+  // Per-buffer FNV of the window: [0] d_Rb [1] d_grow [2] d_csnap [3] d_iproj_snap.
+  std::array<uint64_t, 4> vr_rows_hash(int row0, int P) {
+    CK(hipStreamSynchronize(g_str));
+    std::array<uint64_t, 4> h;
+    h.fill(1469598103934665603ULL);
+    std::vector<uint8_t> buf;
+    vr_rows_each(row0, P, [&](int k, char* p, size_t n) {
+      buf.resize(n);
+      CK(hipMemcpy(buf.data(), p, n, hipMemcpyDeviceToHost));
+      for (uint8_t b : buf) { h[k] ^= b; h[k] *= 1099511628211ULL; }
+    });
+    return h;
+  }
+  // Per slot, room for kVrSaveRows rows of every buffer (a spec segment is
+  // γ+1 <= 9 rows). Allocated by slots_init (devarena_estimate counts it).
+  static constexpr int kVrSaveRows = 9;
+  std::vector<char*> vr_save_;
+  size_t vr_save_bytes(int P) {
+    size_t n = 0;
+    vr_rows_each(0, P, [&](int, char*, size_t b) { n += b; });
+    return n;
+  }
+  bool vr_rows_save(int slot, int row0, int P) {
+    if (P > kVrSaveRows || slot < 0 || slot >= (int)vr_save_.size()) return false;
+    char* s = vr_save_[(size_t)slot];
+    if (!s) return false;
+    size_t off = 0;
+    vr_rows_each(row0, P, [&](int, char* p, size_t n) {
+      CK(hipMemcpyAsync(s + off, p, n, hipMemcpyDeviceToDevice, g_str));
+      off += n;
+    });
+    return true;
+  }
+  void vr_rows_load(int slot, int row0, int P) {
+    char* s = slot < (int)vr_save_.size() ? vr_save_[(size_t)slot] : nullptr;
+    if (!s) return;
+    size_t off = 0;
+    vr_rows_each(row0, P, [&](int, char* p, size_t n) {
+      CK(hipMemcpyAsync(p, s + off, n, hipMemcpyDeviceToDevice, g_str));
+      off += n;
+    });
+  }
+
   // Wiring: MTP stream position p takes (trunk h_p, emb(t_{p+1})) and predicts
   // t_{p+2}. Input: h = sum_b fc_hidden(norm_h(tap)[b]), e =
   // fc_embedding(norm_e(embed(tok))), stream = repeat4(h + e). Norm mode is
@@ -10189,6 +10262,17 @@ struct GpuModel {
       }
     }
     nslots = n;
+    // 10-13: per-slot backup of the rendezvous verify's shared row window
+    // (vr_rows_save/load; the verify pool only runs with MTP and without
+    // QWENOX_NO_VR).
+    const bool no_vr = getenv("QWENOX_NO_VR") && !env_zero("QWENOX_NO_VR");
+    if (vr_restore_env() && !no_vr && mtp_avail && d_grow && d_csnap && d_iproj_snap) {
+      const size_t b = vr_save_bytes(kVrSaveRows);
+      vr_save_.assign((size_t)n, nullptr);
+      for (int i = 0; i < n; i++) DALLOC(&vr_save_[(size_t)i], b);
+      fprintf(stderr, "qwenox: verify rendezvous row backup on (%d slots x %.1f MB, "
+                      "QWENOX_VR_RESTORE=0 off)\n", n, b / 1048576.0);
+    }
     if (!env_zero("QWENOX_CONC_PREFILL")) {  // D1b: arm the borrow workspace
       if (const char* v = getenv("QWENOX_CONC_PREFILL_QUANTUM_MS"))
         conc_quantum_ms_ = (float)atof(v);
