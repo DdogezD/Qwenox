@@ -1832,16 +1832,41 @@ struct TurnProf {
 static TurnProf g_turnprof;
 
 // FIFO ticket lock around the (single-threaded) GpuModel.
+// 10-13: a waiter may tag itself HEAVY with its remaining prompt tokens
+// (acquire(rem > 0)): its next GPU work is a big prompt chunk. Grant order is
+// unchanged (FIFO); the owner only reads the tags (waiters()) to decide whether
+// lending or yielding can help anyone (see yield_hook / borrow_query).
 struct Turnstile {
   std::mutex mu;
   std::condition_variable cv;
   uint64_t next = 0, serving = 0;
-  uint64_t acquire() {  // returns this grant's ticket (QWENOX_VR_CHECK diagnostics)
+  std::vector<std::pair<uint64_t, int>> heavy;  // (ticket, remaining) still waiting
+  uint64_t acquire(int heavy_rem = 0) {  // returns this grant's ticket (QWENOX_VR_CHECK)
     std::unique_lock<std::mutex> lk(mu);
     const uint64_t t = next++;
+    if (heavy_rem > 0) heavy.emplace_back(t, heavy_rem);
     cv.wait(lk, [&] { return serving == t; });
+    if (heavy_rem > 0)
+      for (size_t i = 0; i < heavy.size(); i++)
+        if (heavy[i].first == t) {
+          heavy.erase(heavy.begin() + (long)i);
+          break;
+        }
     if (g_turn_prof) g_turnprof.on_acquire();
     return t;
+  }
+  struct Waiters {
+    int light = 0, heavy = 0;
+    int min_heavy_rem = INT_MAX;
+  };
+  Waiters waiters() {  // owner only: who is queued behind it
+    std::lock_guard<std::mutex> lk(mu);
+    Waiters w;
+    const int all = (int)(next - serving) - 1;
+    w.heavy = (int)heavy.size();
+    w.light = std::max(0, all - w.heavy);
+    for (const auto& h : heavy) w.min_heavy_rem = std::min(w.min_heavy_rem, h.second);
+    return w;
   }
   void release() {
     if (g_turn_prof) g_turnprof.on_release(tl_turn_tag);
@@ -2043,13 +2068,45 @@ static void slot_leave(int s) {
   g_scv.notify_all();
 }
 
+// 10-13 prefill scheduling knobs (both default on; =0 restores the old rule
+// for A/B). QWENOX_CONC_LEND_LIGHT_ONLY: mid-chunk lending only when a light
+// worker waits. QWENOX_PREFILL_SRPT: between chunks of a long prompt, hand the
+// GPU to another prompt only if it has less left (else lend to light workers
+// and keep going), instead of alternating chunk by chunk.
+static bool lend_light_only() {
+  static const bool v = !GpuModel::env_zero("QWENOX_CONC_LEND_LIGHT_ONLY");
+  return v;
+}
+static bool prefill_srpt() {
+  static const bool v = !GpuModel::env_zero("QWENOX_PREFILL_SRPT");
+  return v;
+}
+
+static void borrow_abort_check();
+static void borrow_turn(GpuModel& m);
+
 // GpuModel::yield_fn: hand the GPU to the next queued worker, then fail
 // this request if a pool overflow picked it as the victim meanwhile.
+// Between chunks of a long prompt (pf_rem() > 0) with SRPT on: yield to a
+// heavy waiter only if it has less prompt left; otherwise give light workers
+// one round each (borrow_turn: heavy waiters requeue) and keep the GPU.
 static void yield_hook(GpuModel& m) {
   if (tl_slot < 0) return;
-  if (g_turn.contended()) {
+  const int rem = m.pf_rem();
+  if (rem > 0 && prefill_srpt()) {
+    const Turnstile::Waiters w = g_turn.waiters();
+    if (w.heavy > 0 && w.min_heavy_rem < rem) {
+      g_turn.release();
+      g_turn.acquire(rem);
+      m.bind(tl_slot);
+    } else if (w.light > 0) {
+      m.heavy_rem_ = rem;
+      borrow_turn(m);  // includes the abort check
+      return;
+    }
+  } else if (g_turn.contended()) {
     g_turn.release();
-    g_turn.acquire();
+    g_turn.acquire(rem);
     m.bind(tl_slot);
   }
   bool ab;
@@ -2065,7 +2122,16 @@ static void yield_hook(GpuModel& m) {
 // around the FIFO once (borrowers may start only chunks of <= conc_rmax_
 // rows while it is up), then rebinds our slot. borrow_skip runs on a
 // borrower whose next chunk is heavy: requeue behind the owner and retry.
-static bool borrow_query() { return g_turn.contended(); }
+static bool borrow_query() {
+  if (!lend_light_only()) return g_turn.contended();
+  return g_turn.waiters().light > 0;
+}
+// GpuModel::heavy_gate_fn: the chunk about to start (rem prompt tokens left)
+// should requeue because a waiting prompt has strictly less left.
+static bool heavy_gate(GpuModel&, int rem) {
+  if (!prefill_srpt()) return false;
+  return g_turn.waiters().min_heavy_rem < rem;
+}
 static void borrow_abort_check() {
   bool ab;
   {
@@ -2074,17 +2140,22 @@ static void borrow_abort_check() {
   }
   if (ab) throw KvOverflow("aborted: KV pool needed by an earlier request");
 }
+// Both re-acquire tagged heavy with m.heavy_rem_ (set by the caller: the
+// rest of this prompt), so the owner that gets the GPU next knows a prompt
+// is waiting and how much it has left.
 static void borrow_turn(GpuModel& m) {
+  const int rem = m.heavy_rem_;
   g_borrow_light.fetch_add(1, std::memory_order_acq_rel);
   g_turn.release();
-  g_turn.acquire();
+  g_turn.acquire(rem);
   g_borrow_light.fetch_sub(1, std::memory_order_acq_rel);
   m.bind(tl_slot);
   borrow_abort_check();
 }
 static void borrow_skip(GpuModel& m) {
+  const int rem = m.heavy_rem_;
   g_turn.release();
-  g_turn.acquire();
+  g_turn.acquire(rem);
   m.bind(tl_slot);
   borrow_abort_check();
 }
@@ -2596,6 +2667,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
   }
   tl_slot = s;
   m.bind(s);
+  m.pf_end = 0;  // not ingesting a prompt yet (a thrown earlier request may have left it)
   // Leaving: the slot turns idle while this worker still owns the GPU, so a
   // starving peer never sees a finished request as busy.
   struct Lease {
@@ -2870,6 +2942,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // (spec-verify batches never see it armed). prog_base accumulates
     // across the kvsnap cut segments inside prefill_chunk.
     m.prog_total = (int)(g.ids.size() - done_upto);
+    m.pf_end = (int)g.ids.size();  // prompt ingest: scheduling sees what is left
     m.prog_base = 0;
     m.prog_last_est = 0;
     m.prog_req = g.req;
@@ -2943,6 +3016,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       cut_lap("cut-save");
     }
     m.prog_total = 0;
+    m.pf_end = 0;
     m.mtp_tap_capture = false;  // decode/verify must not capture taps
     hist = g.ids;  // prompt fully ingested on both paths
     if (use_spec || chain_mtp) mtp_live = true;  // MTP KV complete & in lockstep
@@ -3533,6 +3607,11 @@ static int run(GpuModel& m, const std::string& host, int port) {
     m.borrow_query_fn = &borrow_query;
     m.borrow_fn = &borrow_turn;
     m.borrow_skip_fn = &borrow_skip;
+    m.heavy_gate_fn = &heavy_gate;
+    fprintf(stderr, "qwenox: prefill scheduling: lend %s, between prompts %s "
+                    "(QWENOX_CONC_LEND_LIGHT_ONLY / QWENOX_PREFILL_SRPT)\n",
+            lend_light_only() ? "light-only" : "any waiter",
+            prefill_srpt() ? "shortest-remaining-first" : "alternate per chunk");
     // D2-S2a verify rendezvous: opt out with QWENOX_NO_VR=1 (serial
     // single-segment verify, the pre-S2 behavior). QWENOX_VR_WAIT_MS bounds
     // how long a submitter waits for stragglers before running the round.

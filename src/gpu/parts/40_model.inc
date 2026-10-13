@@ -176,9 +176,29 @@ struct GpuModel {
   // chunk is enqueued layer by layer, queued decode workers may borrow the
   // GPU for light rounds (chunks of at most conc_rmax_ rows) running on a
   // second, small copy of the P-row workspaces. All callbacks null -> inert.
-  bool (*borrow_query_fn)() = nullptr;      // someone queued on the turnstile?
+  bool (*borrow_query_fn)() = nullptr;      // a LIGHT worker queued on the turnstile?
   void (*borrow_fn)(GpuModel&) = nullptr;   // release+reacquire under g_borrow_light
   void (*borrow_skip_fn)(GpuModel&) = nullptr;  // heavy chunk during borrow: requeue
+  // 10-13 prefill scheduling between concurrent long prompts. A heavy worker
+  // (its next GPU work is a prompt chunk of more than conc_rmax_ rows) queues
+  // on the turnstile tagged with its remaining prompt tokens (heavy_rem_,
+  // read by borrow_fn/borrow_skip_fn right before they re-acquire), so the
+  // owner lends mid-chunk only when a light worker waits (lending to a heavy
+  // one was a per-layer sync + a hand-off it immediately gave back), and
+  // heavy_gate_fn(m, rem) = "a heavy waiter has less prompt left than rem":
+  // the chunk about to start requeues behind it (shortest remaining first;
+  // ties keep the running one, so equal prompts run first-come-first-served).
+  bool (*heavy_gate_fn)(GpuModel&, int) = nullptr;
+  int heavy_rem_ = 0;
+  // Remaining prompt tokens of the bound slot's prompt ingest (0 = not
+  // ingesting, or only a light tail of <= conc_rmax_ rows left). pf_end is the
+  // prompt end set by serve around the ingest (per-slot field).
+  int pf_end = 0;
+  int pf_rem() const {
+    if (pf_end <= 0) return 0;
+    const int r = pf_end - pos;
+    return r > conc_rmax_ ? r : 0;
+  }
   // D2-S2a: verify rendezvous pool (serve mode, nslots > 1). Non-null
   // vseg_pool_fn reroutes the spec loop's eager verify into the pool;
   // false = the pool is unavailable for this round, caller falls back to
@@ -429,6 +449,12 @@ struct GpuModel {
     int64_t pre0 = 0, pre1 = 0;  // tokens before the window (pad_id at start)
     uint8_t* fp8 = nullptr;      // staging this flight fills
     int base = -1, P = 0, buf = 0;
+    // Owner slot (bound_ at spawn). ple_fl is NOT per-slot state: with two
+    // concurrent prefills in lockstep (same chunk grid from base 0) slot B's
+    // chunk-ahead flight has the same base/P as slot A's next chunk, so a
+    // base/P-only match fed A with B's PLE rows (10-13). Hits now require
+    // owner + tokens + history pair (ple_flight_hit).
+    int slot = -1;
     bool valid = false;
     bool inline_io = false;  // Windows small batch: reads posted, no threads (ple_join waits)
     std::chrono::steady_clock::time_point start, done;
@@ -607,7 +633,7 @@ struct GpuModel {
   X(img_inj) X(img_hash_) X(d_img_emb) X(img_emb_rows) X(img_emb_cap)         \
   X(mtp_tap_capture) X(spec_snap) X(vsnap_row0_) X(ngram_verify_active)       \
   X(cut_abs) X(cut_r_) X(cut_hit) X(cut_mtp_hit) X(d_mR)                      \
-  X(prog_total) X(prog_base) X(prog_last_est) X(prog_req) X(prog_t0)          \
+  X(prog_total) X(prog_base) X(prog_last_est) X(prog_req) X(prog_t0) X(pf_end) \
   X(prog_last) X(last_spec_rounds) X(last_spec_commit) X(last_spec_rollbacks) \
   X(last_spec_proposed) X(live_spec_rounds) X(live_spec_commits)              \
   X(live_spec_proposed) X(g1_exec) X(g2_exec)                                 \
@@ -5631,6 +5657,7 @@ struct GpuModel {
                  uint8_t* fp8, int buf, const PleSegs* segs = nullptr) {
     PleFlight& fl = ple_fl;
     fl.toks = std::move(toks);
+    fl.slot = bound_;
     fl.base = base;
     fl.P = (int)fl.toks.size();
     fl.pre0 = pre0;
@@ -5777,6 +5804,17 @@ struct GpuModel {
     }
     fl.valid = true;
   }
+  // The in-flight gather is exactly this chunk's rows: same owner slot, window,
+  // tokens and the two history tokens the cat() window reads before it.
+  bool ple_flight_hit(const std::vector<int>& tokens, int base) const {
+    const PleFlight& fl = ple_fl;
+    if (!fl.valid || fl.nseg != 0 || fl.slot != bound_ || fl.base != base ||
+        fl.P != (int)tokens.size() || fl.toks != tokens)
+      return false;
+    int64_t pre0, pre1;
+    ple_pre01(chist, pre0, pre1);
+    return fl.pre0 == pre0 && fl.pre1 == pre1;
+  }
   void ple_join() {
 #ifdef _WIN32
     if (ple_fl.inline_io) {
@@ -5914,10 +5952,16 @@ struct GpuModel {
       // chunk whose per-chunk fixed cost (~0.9 s) dwarfs its token count.
       int n = ple_prefetch::chunk_size(rem, maxbatch, maxbatch_cap);
       // D1b: while the GPU is lent mid-chunk, only light rounds may start;
-      // a heavy chunk requeues behind the owner and retries.
-      while (n > conc_rmax_ && borrow_skip_fn &&
-             g_borrow_light.load(std::memory_order_acquire))
-        borrow_skip_fn(*this);
+      // a heavy chunk requeues behind the owner and retries. 10-13: it also
+      // requeues while a heavy waiter has less prompt left (heavy_gate_fn).
+      if (n > conc_rmax_ && borrow_skip_fn) {
+        const int rem = pf_end > 0 ? std::max(pf_end - (base + off), n) : N - off;
+        while (g_borrow_light.load(std::memory_order_acquire) ||
+               (heavy_gate_fn && heavy_gate_fn(*this, rem))) {
+          heavy_rem_ = rem;
+          borrow_skip_fn(*this);
+        }
+      }
       // Next chunk (same sizing rule) feeds the PLE prefetch flight: its
       // gather runs on host threads under this chunk's layer compute.
       std::vector<int> nxt;
@@ -5996,8 +6040,12 @@ struct GpuModel {
     // chunk, quiet re-ingest, or a flight mismatch). Either way the gather
     // fills staging buffer ple_par and its GPU consumer stays ordered after L0.
     if (ple_on) {
-      if (!(ple_fl.valid && ple_fl.base == base && ple_fl.P == P)) {
-        if (ple_fl.valid) {  // stale flight for another chunk: finish and drop
+      if (!ple_flight_hit(tokens, base)) {
+        if (ple_fl.valid) {  // stale flight (another chunk or slot): finish and drop
+          static const bool miss_log = getenv("QWENOX_PLE_MISS_LOG") != nullptr;
+          if (miss_log)
+            fprintf(stderr, "%s ple: drop flight slot %d base %d P %d (chunk slot %d base %d P %d)\n",
+                    log_ts(), ple_fl.slot, ple_fl.base, ple_fl.P, bound_, base, P);
           ple_join();
           ple_fl.valid = false;
         }
@@ -10177,6 +10225,8 @@ struct GpuModel {
     injp_cur = -1;
     injp_for.clear();
     ws_lend();
+    // queue back as heavy (rest of this prompt) so the lend's borrowers see it
+    heavy_rem_ = pf_end > 0 ? std::max(pf_end - base, P) : P;
     try {
       borrow_fn(*this);  // flag up; release; light borrowers run; reacquire; bind
     } catch (...) {
