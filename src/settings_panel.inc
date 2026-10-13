@@ -498,11 +498,8 @@ void check_weight(CheckLines& c, const char* label, const std::string& path,
     }
     unsigned long long size = 0;
     file_size_of(path, &size);
-    if (size < 100ull * 1024 * 1024) {
-        check_line(c, kLvFail, std::string(label) + TR("：文件异常小（", ": suspiciously small file (") +
-                                   std::to_string(size) + TR(" B）", " B): ") + path);
-        return;
-    }
+    // 不按大小判定：合法 sidecar 可以很小（转换脚本产出的 MTP 仅 ~93 MB），
+    // 真坏的文件引擎加载时会报错
     // magic 嗅探：.hgn → HGN1（src/hgn.h），.gguf → GGUF；其它扩展名跳过
     const size_t dot = path.find_last_of('.');
     const std::string ext =
