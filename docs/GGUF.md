@@ -199,7 +199,7 @@ GGUF Q4_K 11.8）；P=16384 0.168 ms/token（旧 LT 路径 0.291，GGUF 0.173）
 投机每轮耗时不变，commit/round 的差别来自 prefill 数值略变后生成的文本不同（单次 256 token，
 脚本门槛 ≥ 0.95×off）。1024 token prefill vs decode PPL 6.875 / 6.905（< 1%）。
 
-结论：hgn 的 prefill 速度追平 GGUF，decode 保持 hgn 的优势，显存比 GGUF 少约 11 GiB——
+结论：hgn 的 prefill 速度追平 GGUF，decode 保持 hgn 的优势，显存比 UD-Q4_K_XL 少约 11 GiB——
 Windows（96 GiB 上限）继续用 hgn 即可拿到这份 prefill 提速，重新编译即可。质量（KLD）仍是 hgn 的
 0.163，下一步是用 imatrix 重新量化出高质量 hgn（dense 8-bit）。
 
@@ -223,8 +223,11 @@ Unsloth `Qwen3.8-Flash-Next-UD-IQ4_XS`（3 个分片，87.2 GiB，第 1 个分�
 | lm_head（output.weight） | Q6_K | 0.49 GiB |
 | PLE n-gram 表 | IQ4_NL | 26.8 GiB（按需读盘，不进显存） |
 
-显存常驻 ≈60.4 GiB（专家 55.4 + dense 4.8 + norm 等），比 v2 hgn（62.1 GiB）还小，95 GiB arena 放 256K
-没有问题。分片里没有 MTP 头，MTP 用单独的 `mtp-*.gguf` sidecar（没有时不投机）。
+主干权重常驻 60.4 GiB（专家 55.4 + dense 4.8 + norm 等）。分片里没有 MTP 头，MTP 用单独的 `mtp-*.gguf`
+sidecar（没有时不投机），加上 Q8_0 sidecar 后权重为 63.0 GiB。v2 hgn 主体（62.1 GiB）自带 MTP 草稿头，所以
+两者实际比较的是：不带 MTP 时 UD-IQ4_XS 的 arena 用量比 v2 少 3.2 GiB，带 MTP 时多 1.3 GiB（256K 4 路：
+79.4 / 83.9 vs v2 82.6 GiB；512K 页池 2 路 93.5 vs 92.2 GiB；2026-10-13 实测）。显存上 UD-IQ4_XS 只在不用
+MTP 时占优。
 
 MTP sidecar 用 `mtp-Qwen3.8-Flash-Next-Q8_0.gguf`（4.1 GB，dense 全 Q8_0，路由专家 Q8_0）。它比 Linux 上
 用的 `…-shared-Q8_0.gguf` 多带了 `token_embd` / `output`，引擎不读这两个，草稿头沿用主干的 embed 和

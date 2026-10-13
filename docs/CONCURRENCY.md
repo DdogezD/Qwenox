@@ -15,7 +15,8 @@
 | `KV_POOL_TOKENS` | 0 | 共享 KV 页池大小，取 `max(KV_POOL_TOKENS, MAX_CONTEXT)`；默认即一条 256K |
 
 引擎读 `QWENOX_PARALLEL`，API 启动时从引擎 `INFO` 的 `kv_slots` 字段得知路数并开同样
-多的引擎连接。每多一路约多占 0.12 GiB 显存（GDN 状态 113 MB 加少量 MTP 流状态）。
+多的引擎连接。每多一路约多占 0.27 GiB 显存（Windows 实测：512K 页池下 2 路 → 8 路多 1.6 GiB，v2 与
+UD-IQ4_XS 相同），主要是 GDN 状态（113 MB）、会合 verify 的行窗口备份（48.4 MB）和 MTP 流状态。
 MTP 层的 KV/indexer keys 是共享页池里的一层（B0），和主干 KV 一样按页取用，不再每路按
 MAX_CONTEXT 预分配（旧版每路多 0.5 GiB（BF16）/ 1 GiB（FP32）；PARALLEL=4 实测省 1.63 GiB）。
 rckpt 检查点连同 MTP 层的页一起钉住，恢复后继续 MTP 投机（`tools/b0_verify.sh` 验证）。
