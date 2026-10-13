@@ -3288,6 +3288,11 @@ bool probe_engine() {
         fprintf(stderr, "qwenox-api: engine INFO unavailable (%s); continuing with "
                         "ctx=%d\n", err.c_str(), g_cfg.context);
     }
+    // No usable INFO: still build the g_slots (= 1) default connection so a
+    // request that lands before reprobe_engine_loop widens the pool finds a
+    // client (SlotGuard pops g_pool_free; an empty pool crashed the API --
+    // 10-13, API started before the engine, first request beat the re-probe).
+    if (!ok) apply_engine_info(EngineInfo{});
     log_slots();
     return ok;
 }
