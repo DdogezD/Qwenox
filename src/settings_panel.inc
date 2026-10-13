@@ -1312,8 +1312,23 @@ void layout_page1(int ver) {
             if (order[i] == r) shown = true;
         if (!shown) place_row(*r, 0, false);
     }
-    SetWindowPos(g_pc.tok_hint, nullptr, kEdX + g_art_w, y + 2, 434, 18, SWP_NOZORDER | SWP_SHOWWINDOW);
-    SetWindowPos(g_pc.ver_note, nullptr, kEdX + g_art_w, y + 24, 434, 18, SWP_NOZORDER | SWP_SHOWWINDOW);
+    // tok_hint / ver_note 是透明底 Static（HOLLOW_BRUSH），自身重绘不擦底：
+    // 改字或挪位后须让父窗口把新旧位置的并集贴回背景再画控件，否则旧文字
+    // 残留、与新文字叠印。先记下挪动前的位置。
+    HWND parent = GetParent(g_pc.ver_note);
+    auto rect_in_parent = [parent](HWND c) {
+        RECT r;
+        GetWindowRect(c, &r);
+        MapWindowPoints(nullptr, parent, reinterpret_cast<POINT*>(&r), 2);
+        return r;
+    };
+    RECT dirty = rect_in_parent(g_pc.tok_hint);
+    RECT tmp = rect_in_parent(g_pc.ver_note);
+    UnionRect(&dirty, &dirty, &tmp);
+    SetWindowPos(g_pc.tok_hint, nullptr, kEdX + g_art_w, y + 2, 434, 18,
+                 SWP_NOZORDER | SWP_SHOWWINDOW | SWP_NOCOPYBITS);
+    SetWindowPos(g_pc.ver_note, nullptr, kEdX + g_art_w, y + 24, 434, 18,
+                 SWP_NOZORDER | SWP_SHOWWINDOW | SWP_NOCOPYBITS);
     SetWindowTextW(g_pc.ver_note, ver == kVerGguf
                                       ? TR(L"GGUF：填第 1 个分片；MTP/视觉塔可留空不用",
                                            L"GGUF: enter the first shard; MTP/vision may be left off")
@@ -1322,6 +1337,12 @@ void layout_page1(int ver) {
                                                  L"V2: main + separate n-gram file; overlay ignored (cleared on save)")
                                             : TR(L"V1：w4b 单文件，n-gram 内置；overlay/MTP/视觉塔可选",
                                                  L"V1: single w4b file, built-in n-gram; overlay/MTP/vision optional"));
+    tmp = rect_in_parent(g_pc.tok_hint);
+    UnionRect(&dirty, &dirty, &tmp);
+    tmp = rect_in_parent(g_pc.ver_note);
+    UnionRect(&dirty, &dirty, &tmp);
+    RedrawWindow(parent, &dirty, nullptr,
+                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
 }
 
 void show_page(int idx) {
