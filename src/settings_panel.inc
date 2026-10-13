@@ -667,8 +667,8 @@ void check_context_page(CheckLines& c, const PanelVals& v) {
                                       " exceeds the KV pool KV_POOL_TOKENS=") +
                                    std::to_string(kv_pool) +
                                    TR("；调小上限或调大总池", "; lower the cap or grow the pool"));
-    // Windows 设备内存是硬上限 95 GiB 的 arena：512K 池（45,696 B/token ≈ 22.3 GiB）
-    // 已是权重 62.1 GiB + prefill 工作区 6.9 GiB 之后放得下的上限。有效值 = max(池, 上限)
+    // Windows 设备内存是硬上限 95 GiB 的 arena：v2 权重 512K 池实测用 92.2（2 路）–93.8（8 路）
+    // GiB，已是放得下的上限。有效值 = max(池, 上限)
     // （0 = 跟随，上限超 512K 时跟随逻辑同样会把池顶超）。
     const long pool_eff = kv_pool > maxctx ? kv_pool : maxctx;
     if (pool_eff > 524288)
@@ -840,6 +840,13 @@ void check_vram_page(CheckLines& c, const PanelVals& v, bool service_running) {
             unsigned long long s = 0;
             if (!f.empty() && file_size_of(f, &s)) extra += s;
         }
+        // 非 shared 版 MTP sidecar 自带 token_embd / output，引擎不读（草稿头沿用主干的
+        // embed 与 lm_head），不进显存：mtp-…-Q8_0.gguf 3.85 GiB 文件实测只占 2.6 GiB。
+        if (!side[0].empty()) {
+            const unsigned long long unread = gguf_tensor_bytes_in(side[0], "token_embd.weight") +
+                                              gguf_tensor_bytes_in(side[0], "output.weight");
+            if (unread < extra) extra -= unread;
+        }
         if (extra) {
             weights += extra;
             check_line(c, kLvHint, TR("GGUF sidecar（MTP/视觉塔）：", "GGUF sidecars (MTP/vision): ") +
@@ -868,9 +875,14 @@ void check_vram_page(CheckLines& c, const PanelVals& v, bool service_running) {
             (v.weights_ver == kVerV1 && file_exists(v.model))
                 ? hgn_tensor_bytes(v.model, "layers.1.ple.ngram_embedding.weight")
                 : 0;
+        // 主模型自带 MTP 草稿头（v2 主体即是）时，MTP 文件只替换同名张量、不额外占显存
+        //（v2 带不带 mtp.hgn 实测 weight arena 都是 62.1 GiB）
+        const bool model_has_mtp =
+            file_exists(v.model) && hgn_tensor_bytes(v.model, "mtp.fc_hidden.weight") > 0;
         const std::string files[] = {v.model,
                                      v.weights_ver == kVerV2 ? "" : (v.no_overlay ? "" : v.overlay),
-                                     v.no_mtp ? "" : v.mtp, v.no_vision ? "" : v.vision};
+                                     (v.no_mtp || model_has_mtp) ? "" : v.mtp,
+                                     v.no_vision ? "" : v.vision};
         std::vector<std::string> uniq;
         for (const std::string& f : files) {
             if (f.empty() || !file_exists(f)) continue;
@@ -888,6 +900,11 @@ void check_vram_page(CheckLines& c, const PanelVals& v, bool service_running) {
         }
         check_line(c, kLvHint, TR("权重文件：", "Weight files: ") + std::to_string(uniq.size()) +
                                    TR(" 个合计 ", " totaling ") + gib((double)weights) + " GiB");
+        if (model_has_mtp && !v.no_mtp && !v.mtp.empty())
+            check_line(c, kLvHint,
+                       TR("主模型已带 MTP 草稿头：MTP 文件只替换同名张量，不另计显存",
+                          "The main model already has the MTP draft head: the MTP file only "
+                          "replaces those tensors and adds no VRAM"));
         if (ngram_bytes)
             check_line(c, kLvHint,
                        TR("n-gram 表：", "n-gram table: ") + gib((double)ngram_bytes) +
@@ -903,24 +920,35 @@ void check_vram_page(CheckLines& c, const PanelVals& v, bool service_running) {
         if (ngram_embedded < weights) weights -= ngram_embedded;
     }
 
-    // 显存估算（系数来自 src/gpu/parts/40_model.inc 分配代码核算，2026-10：
-    // 45,696 B/token = 12 QSA 层 + 1 MTP 层的 BF16 KV + BTV 转置 V +
-    // index f16 twin + d_iscores；512K 实机 ≈ 22.3 GiB 吻合）。
-    const double kKvBytesPerToken = 45696.0;
+    // 显存估算（系数按 src/gpu/parts/40_model.inc 分配代码核算，并与 2026-10-13 Windows
+    // 实测 arena 用量对齐：v2 256K/4 路 82.6、512K 池/2 路 92.2、/8 路 93.8、YaRN 512K/2 路
+    // 93.3 GiB，估算误差 < 0.5 GiB）：
+    // - 页池：41,408 B/token = 12 QSA 层 + 1 MTP 层的 BF16 KV + BTV 转置 V + 索引键（含 f16 twin）
+    // - 单条上限：4,288 B/token = d_iscores（INDEX_BATCH 1024 × 4 B）+ d_ikg/d_ikgh，按 maxctx 分配
+    // - 每路 0.27 GiB：GDN 状态 + 会合 verify 行窗口备份 + MTP 流状态（2 路→8 路实测 +1.6 GiB）
+    // - 固定 0.5 GiB：其余小缓冲
+    const double kKvPoolBytesPerToken = 41408.0;
+    const double kKvCtxBytesPerToken = 4288.0;
     // 0 = 跟随 MAX_CONTEXT；std::max 与 windows.h 的 max 宏冲突，手写比较
     const double pool_tokens = (double)(kv_pool > maxctx ? kv_pool : maxctx);
-    const double kv_bytes = pool_tokens * kKvBytesPerToken;
+    const double kv_bytes = pool_tokens * kKvPoolBytesPerToken;
+    const double ctx_bytes = (double)maxctx * kKvCtxBytesPerToken;
     const double chunk = prefill > 0 ? (double)prefill : 8192.0;
     const double ws_bytes = chunk / 8192.0 * 6.9 * 1073741824.0;  // 8192≈6.9 GiB 实测
-    const double gdn_bytes = parallel * 0.12 * 1073741824.0;      // 每路 GDN 状态
-    const double total = (double)weights + kv_bytes + ws_bytes + gdn_bytes;
+    const double gdn_bytes = parallel * 0.27 * 1073741824.0;      // 每路状态
+    const double misc_bytes = 0.5 * 1073741824.0;
+    const double total = (double)weights + kv_bytes + ctx_bytes + ws_bytes + gdn_bytes + misc_bytes;
     check_line(c, kLvHint, TR("并发总池：", "KV pool: ") + std::to_string((long)pool_tokens) +
-                               TR(" token × 44.6 KiB ≈ ", " tokens × 44.6 KiB ≈ ") + gib(kv_bytes) +
+                               TR(" token × 40.4 KiB ≈ ", " tokens × 40.4 KiB ≈ ") + gib(kv_bytes) +
+                               " GiB");
+    check_line(c, kLvHint, TR("索引打分缓冲：单条上限 ", "Index score buffers: per-request cap ") +
+                               std::to_string(maxctx) +
+                               TR(" token × 4.2 KiB ≈ ", " tokens × 4.2 KiB ≈ ") + gib(ctx_bytes) +
                                " GiB");
     check_line(c, kLvHint, TR("prefill 工作区：chunk ", "Prefill workspace: chunk ") +
                                std::to_string((long)chunk) + " ≈ " + gib(ws_bytes) + " GiB");
-    check_line(c, kLvHint, TR("并发 GDN 状态：", "Parallel GDN state: ") +
-                               std::to_string(parallel) + TR(" 路 ≈ ", " streams ≈ ") +
+    check_line(c, kLvHint, TR("每路状态（GDN、verify 备份等）：", "Per-slot state (GDN, verify backup, etc.): ") +
+                               std::to_string(parallel) + TR(" 路 × 0.27 ≈ ", " slots × 0.27 ≈ ") +
                                gib(gdn_bytes) + " GiB");
     if (!hip_ok) {
         // 查不到显存也要给出估算总量 —— 它不依赖 HIP 查询，只有对比结论需要
