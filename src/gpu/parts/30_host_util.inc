@@ -592,6 +592,15 @@ static void gguf_dense_release(Checkpoint& ck) {
   if (!g_gguf_dense) return;
   size_t f = ck.release_owned([](const Tensor& t) { return t.data_size < ((size_t)1 << 20); });
   fprintf(stderr, "gguf dense: released %.2f GiB of host copies\n", f / 1073741824.0);
+#ifdef _WIN32
+  // the converted tensors' source pages (read through the shard mappings)
+  // are dead too: take them out of the working set (gguf::File::trim_resident)
+  size_t t = 0;
+  if (g_gguf) t += g_gguf->trim_resident();
+  if (g_gguf_mtp) t += g_gguf_mtp->trim_resident();
+  if (t) fprintf(stderr, "gguf dense: trimmed mapped shard pages from the working set (%.1f GiB mapped)\n",
+                 t / 1073741824.0);
+#endif
 }
 
 // --- weight arena: copy trunk tensors (except the 47.7 GiB PLE table and the

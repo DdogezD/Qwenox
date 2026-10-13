@@ -193,6 +193,27 @@ class File {
   const std::vector<std::string>& order() const { return order_; }
   const std::unordered_map<std::string, Value>& kvs() const { return kv_; }
   const std::vector<Mapping>& mappings() const { return maps_; }
+
+  // Drop the mapped pages this process has touched from its working set
+  // (Windows; no-op elsewhere). After load every weight lives in the device
+  // arena, but the pages read through the mapping (gguf_map's dense / norm
+  // conversion: ~5 GiB for UD-IQ4_XS) stay resident and show as "in use" in
+  // Task Manager. VirtualUnlock on unlocked pages removes them from the
+  // working set (documented behaviour; it reports ERROR_NOT_LOCKED): they move
+  // to the standby list -- still cached, reclaimable, and soft-faulted back if
+  // touched again (the PLE table is read with ReadFile, not through the map).
+  // Returns the mapped bytes covered.
+  size_t trim_resident() const {
+    size_t n = 0;
+#ifdef _WIN32
+    for (const auto& m : maps_)
+      if (m.base) {
+        VirtualUnlock((LPVOID)m.base, m.len);
+        n += m.len;
+      }
+#endif
+    return n;
+  }
   std::string arch() const { return kv_s("general.architecture"); }
 
  private:

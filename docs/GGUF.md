@@ -350,6 +350,16 @@ kernel 的运算顺序一致。这里按 v2 `k_ht_wmma` 的做法实现（f16 WM
 - **显存**（生产配置，引擎 `memory[ready]`）：chunk 8192 → device **89.3 GiB**（arena 估算 85.3 + 4 slack，
   权重 63.0 含 MTP 草稿头），HIP 剩 17.5 / 107.9 GiB；chunk 16384 → arena 估算 92.5 GiB，加 slack 后被 95 GiB
   上限截断，device 95.0 GiB，HIP 剩 11.4 GiB。arena 启动时一次性预留，运行中不再增长。
+- **主机内存**（`tools/gguf_vision_mem_win.sh`，生产配置起服务，进程工作集）：显存之外，引擎在系统内存里常驻
+  约 2.9 GiB（HIP 运行时、tokenizer、RAM 检查点等，与 v2 相同；跑请求后 +1 GiB 左右是 RAM 检查点 / 图片缓冲）。
+  加载期间峰值约 10.5 GiB：dense 转换的 ~5 GiB 主机副本 + 经文件映射读入的源页面，转换完立即释放。
+  早先版本这 ~5 GiB 映射页面会一直挂在工作集里（任务管理器显示"使用中" 8–9 GiB），现在加载完对分片映射调用
+  `VirtualUnlock` 移出工作集（`gguf::File::trim_resident`），页面转入 standby 缓存，可随时回收。
+  另有约 2.6 GiB 显示为 GPU"共享内存"（HIP 自己的系统内存分配），GGUF 与 v2 相同。PLE 表（26.8 GiB）按需读盘，
+  只进 standby 缓存，不算"使用中"。
+- **多模态**：GGUF 主干 + 现有 `qwen38-flash-next-vision.hgn` 视觉塔，经 API 发图片，描述正确，与 v2 一致
+  （视觉塔前向约 6 s / 1152×640 图）。mmproj `*.gguf` 视觉塔在 Linux 上已验证与 vision.hgn 逐位相同
+  （`tools/g3_vision_verify.sh`），Windows 上待有 mmproj 文件后用 `tools/gguf_vision_mem_win.sh` 复测。
 - **prefill 分段**（32K 单请求，去掉预热）：chunk 4096 / 8192 / 16384 = 1399 / 1436 / 1419 tok/s。稳态
   chunk 8192 → 16384 只快约 2.5%（5.51 → 10.75 s / 块），第一块有 PLE 冷读。Windows 默认 8192 就合适；
   `PARALLEL>1` 时实际分段是 min(`CONC_PREFILL_CHUNK`, `PREFILL_CHUNK`)。
@@ -376,6 +386,7 @@ kernel 的运算顺序一致。这里按 v2 `k_ht_wmma` 的做法实现（f16 WM
 - `tools/moe_lut_test.cu` — LUT kernel（q4cp 真实权重 `--hgn` / 合成 IQ4_NL、IQ4_XS `--synth`）vs CPU 参考
 - `tools/gguf_batch_verify_win.sh` — GGUF 多行 dense + 专家 GEMV：kernel 单测、vbench、decode、PPL、vseg 逐位、并发
 - `tools/gguf_serve_bench_win.sh` — 经 API 的并发吞吐（conc_bench 1/4/8 路），GGUF 新 / 旧 / v2
+- `tools/gguf_vision_mem_win.sh` — Windows：主机内存曲线（`tools/win_memsampler.ps1`）+ 图片请求 + mmproj vs vision.hgn 前向逐位
 - `tools/q8_wmma_test.cu`（`bash tools/ht_wmma_test.sh q8`）— `k_q8g32_wmma` 精度 / 行无关 / 切片 / 速度
 - `tools/iq4xs_conc_win.sh` — UD-IQ4_XS（Windows）：并发（conc_verify 单路 vs 8 路 + 控制面）、生产配置显存、prefill 分段
 - `tools/iq4xs_verify_win.sh` — UD-IQ4_XS（Windows）：kernel 对拍、v2 逐位不变、PPL 一致性/质量、服务端到端、速度
