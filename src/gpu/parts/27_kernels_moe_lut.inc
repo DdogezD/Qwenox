@@ -171,7 +171,22 @@ __launch_bounds__(256) __global__
   // adjacent planes at lds[0, 32K) and the stage moves to lds[32K, 32K+kStageBytes);
   // the up pass's 128 slots cannot coexist with those, so the up spill + mid
   // run in two 64-slot chunks through a single up plane over the dead stage.
-  constexpr int kMidRow = BM + 2;
+  // kPk (hipfire-style packed epilogue, i4r up-mid / down): the weight fetch
+  // puts global row 8h+l of each 16-row wave block into LDS slot 2l+h, so the
+  // WMMA C fragment (acc[j][l] = LDS slot 2l + half_id) holds 8 CONSECUTIVE
+  // rows half_id*8 + l per lane. The compute loop's LDS addressing is
+  // unchanged and every output keeps its K order -> bit-identical; the
+  // epilogues store 16 B per lane instead of transposing through LDS.
+  // MOE_LUT_NOPK restores the old fetch order + epilogues.
+#ifdef MOE_LUT_NOPK
+  constexpr bool kPk = false;
+#else
+  constexpr bool kPk = kLut == kI4R && !kPair;
+#endif
+  // kPk: row stride a multiple of 8 halves so the packed spill is one
+  // ds_write_b128 (272 B stride = 68 dwords: 8 lanes of a phase hit
+  // disjoint 4-bank groups).
+  constexpr int kMidRow = BM + (kPk ? 8 : 2);
   constexpr int kMidPlaneB = 64 * kMidRow * 2;
   constexpr int kStageOff = kMid ? (BN > 64 ? 2 * kMidPlaneB : kMidPlaneB) : 0;
   // aggr 10-05: non-kMid kernels double-buffer the LDS stage (commit of
@@ -267,7 +282,9 @@ __launch_bounds__(256) __global__
   bool f_live;
   const auto set_fetch = [&](int pass) {
     const bool upper = (kPair && (tid >> 1) >= kRows) || (kMid && pass != 0);
-    const int r = r_block + (kPair ? (tid >> 1) % kRows : (tid >> 1));
+    int lr = kPair ? (tid >> 1) % kRows : (tid >> 1);  // LDS slot of this fetch thread
+    if constexpr (kPk) lr = (lr & ~15) | ((lr & 1) << 3) | ((lr & 15) >> 1);  // slot 2l+h <- row 8h+l
+    const int r = r_block + lr;
     f_live = r < m;
     const size_t row = (size_t)expert * p.e_rows + (upper ? p.up_off : 0) + (f_live ? r : (m - 1));
     f_ptr = (upper ? p.w_up : p.w) + row * rb;
@@ -494,6 +511,22 @@ __launch_bounds__(256) __global__
     }
   };
 
+  // kMid spill of one token tile row: plane[(t) * kMidRow + wave rows] = f16(acc).
+  // kPk: this lane's 8 rows are consecutive -> one 16 B LDS store.
+  [[maybe_unused]] const auto spill_row = [&](__half* plane, int t, const v8f& a) {
+    if constexpr (kPk) {
+      __half2 h2[4];
+#pragma unroll
+      for (int q = 0; q < 4; ++q) h2[q] = __halves2half2(__float2half(a[2 * q]), __float2half(a[2 * q + 1]));
+      uint4 v;
+      __builtin_memcpy(&v, h2, 16);
+      *reinterpret_cast<uint4*>(plane + t * kMidRow + wave_id * 16 + half_id * 8) = v;
+    } else {
+#pragma unroll
+      for (int l = 0; l < 8; ++l) plane[t * kMidRow + wave_id * 16 + 2 * l + half_id] = __float2half(a[l]);
+    }
+  };
+
   for (int pass = 0; pass < (kMid ? 2 : 1); ++pass) {
     set_fetch(pass);
 #pragma unroll
@@ -529,7 +562,8 @@ __launch_bounds__(256) __global__
       // to k_i4r_mid reading guv16 back. Pass 1's plane overlaps the stage,
       // which is dead after the loop's last __syncthreads. C fragment lane
       // mapping (from the pair/down epilogues): acc[j][l] = (token j*16 +
-      // sub_lane, row wave*16 + 2*l + half_id).
+      // sub_lane, LDS slot wave*16 + 2*l + half_id); with kPk that slot holds
+      // row wave*16 + half_id*8 + l (spill_row stores the 8 rows at once).
       // BN=128: pass 0 spills all 128 gate slots into the two adjacent planes
       // at lds[0, 32K) (indexed by t directly); pass 1's up spill is chunked
       // with the mid phase below and happens there, not here.
@@ -540,10 +574,7 @@ __launch_bounds__(256) __global__
           for (int j = 0; j < kTokTiles; ++j) {
             if (j >= live_tok_tiles) break;
             const int t = j * 16 + sub_lane;
-            if (t < nrows)
-#pragma unroll
-              for (int l = 0; l < 8; ++l)
-                plane[t * kMidRow + wave_id * 16 + 2 * l + half_id] = __float2half(acc[j][l]);
+            if (t < nrows) spill_row(plane, t, acc[j]);
           }
         }
       } else {
@@ -552,10 +583,7 @@ __launch_bounds__(256) __global__
         for (int j = 0; j < kTokTiles; ++j) {
           if (j >= live_tok_tiles) break;
           const int t = j * 16 + sub_lane;
-          if (t < nrows)
-#pragma unroll
-            for (int l = 0; l < 8; ++l)
-              plane[t * kMidRow + wave_id * 16 + 2 * l + half_id] = __float2half(acc[j][l]);
+          if (t < nrows) spill_row(plane, t, acc[j]);
         }
       }
     }
@@ -599,11 +627,7 @@ __launch_bounds__(256) __global__
         for (int j = 0; j < kTokTiles; ++j) {
           if (j >= live_tok_tiles) break;
           const int t = j * 16 + sub_lane;
-          if (t >= c * 64 && t < c * 64 + 64 && t < nrows)
-#pragma unroll
-            for (int l = 0; l < 8; ++l)
-              uplane[(t - c * 64) * kMidRow + wave_id * 16 + 2 * l + half_id] =
-                  __float2half(acc[j][l]);
+          if (t >= c * 64 && t < c * 64 + 64 && t < nrows) spill_row(uplane, t - c * 64, acc[j]);
         }
         __syncthreads();
         const __half* gplane = reinterpret_cast<const __half*>(lds) + c * 64 * kMidRow;
@@ -664,9 +688,49 @@ __launch_bounds__(256) __global__
     return;
   }
 
+  const int r0 = r_block + wave_id * 16;
+  if constexpr (kPk) {
+    // Packed down epilogue: lane (token sub_lane, rows r0 + half_id*8 + 0..7).
+    // f16 pairs: one 16 B store; f32: two 16 B stores. Same values and
+    // rounding as the LDS-transpose path below.
+    const int rr = r0 + half_id * 8;
+    const bool vec = (m & 7) == 0 && rr + 8 <= m;
+#pragma unroll
+    for (int j = 0; j < kTokTiles; ++j) {
+      if (j >= live_tok_tiles) break;
+      const int t = j * 16 + sub_lane;
+      if (t >= nrows) continue;
+      const v8f& a = acc[j];
+      if constexpr (kF16Pairs) {
+        __half* o = reinterpret_cast<__half*>(out) + (size_t)(slot0 + t) * m + rr;
+        if (vec) {
+          __half2 h2[4];
+#pragma unroll
+          for (int q = 0; q < 4; ++q) h2[q] = __floats2half2_rn(a[2 * q], a[2 * q + 1]);
+          uint4 v;
+          __builtin_memcpy(&v, h2, 16);
+          *reinterpret_cast<uint4*>(o) = v;
+        } else {
+#pragma unroll
+          for (int l = 0; l < 8; ++l)
+            if (rr + l < m) o[l] = __float2half(a[l]);
+        }
+      } else {
+        float* o = out + (size_t)(slot0 + t) * m + rr;
+        if (vec) {
+          reinterpret_cast<float4*>(o)[0] = make_float4(a[0], a[1], a[2], a[3]);
+          reinterpret_cast<float4*>(o)[1] = make_float4(a[4], a[5], a[6], a[7]);
+        } else {
+#pragma unroll
+          for (int l = 0; l < 8; ++l)
+            if (rr + l < m) o[l] = a[l];
+        }
+      }
+    }
+    return;
+  }
   // Down: transpose each 16x16 tile through LDS; one 64 B row segment per slot.
   float* tile_scratch = reinterpret_cast<float*>(lds) + wave_id * 256;
-  const int r0 = r_block + wave_id * 16;
 #pragma unroll
   for (int j = 0; j < kTokTiles; ++j) {
     if (j >= live_tok_tiles) break;
