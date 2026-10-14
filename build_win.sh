@@ -191,7 +191,7 @@ build_settings() {
     mkiconres src/settings_win.rc build/settings_win.res settings_win.exe
     echo "[编译] settings_win.exe"
     SETTINGS_SRC=(-O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS src/settings_win.cpp
-                  -lws2_32 -luser32 -lshell32 -lgdi32 -lgdiplus -ldwmapi -luxtheme -lcomdlg32
+                  -lws2_32 -luser32 -lshell32 -lgdi32 -lgdiplus -ldwmapi -luxtheme -lcomdlg32 -lole32
                   "${GUI_LDFLAGS[@]}" -o settings_win.exe)
     if ! "$CXX" "${SETTINGS_SRC[@]}" ${RES[@]+"${RES[@]}"}; then
       [[ ${#RES[@]} -gt 0 ]] || exit 1

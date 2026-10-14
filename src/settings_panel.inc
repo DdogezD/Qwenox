@@ -9,7 +9,8 @@
 //          各版本只显示自己相关的文件行；GGUF 由 qwenox-win 按 weights=gguf 标记
 //          直接启动（GGUF_FILE 首分片 + GGUF_MTP_FILE + GGUF_VISION_FILE）。
 //   第 2 页 上下文与并发：MAX_CONTEXT / PARALLEL / 并发总池（KV_POOL_TOKENS）/
-//          KV_PAGED / PREFILL_CHUNK / YaRN 勾选（ROPE_FACTOR 按上限自动推导）。
+//          KV_PAGED / PREFILL_CHUNK / KV 快照（KVSNAP_MAX_GB + KVSNAP_DIR）/
+//          YaRN 勾选（ROPE_FACTOR 按上限自动推导）。
 //          ROPE_ORIGINAL_CTX 不做 UI 行（用户不该改）：校验仍从 g_conf/环境读，
 //          也不在 kManagedKeys 里，save_conf 永远不会改写 conf 中的该行。
 //   第 3 页 端口与监听：ENGINE_HOST / ENGINE_PORT / API_HOST / API_PORT。
@@ -46,6 +47,8 @@
 // NGRAM_FILE 是否与 MODEL_FILE 同文件推断 V1/V2。
 
 #include <commdlg.h>
+#include <objbase.h>    // CoInitializeEx / CoCreateInstance（KV 快照目录选择框）
+#include <shobjidl.h>   // IFileOpenDialog + FOS_PICKFOLDERS
 #include <set>
 
 namespace {
@@ -133,7 +136,8 @@ using svcconf::is_optional_file_key;
 // 环境变量覆盖提示归属的页：0 权重 / 1 上下文 / 2 端口。
 int page_of_key(const std::string& k) {
     if (k == "MAX_CONTEXT" || k == "PARALLEL" || k == "KV_POOL_TOKENS" || k == "KV_PAGED" ||
-        k == "PREFILL_CHUNK" || k == "ROPE_FACTOR" || k == "KVSNAP_MAX_GB")
+        k == "PREFILL_CHUNK" || k == "ROPE_FACTOR" || k == "KVSNAP_MAX_GB" ||
+        k == "KVSNAP_DIR")
         return 1;
     if (k == "ENGINE_HOST" || k == "ENGINE_PORT" || k == "API_HOST" || k == "API_PORT")
         return 2;
@@ -373,6 +377,7 @@ struct PanelVals {
     bool kv_paged = true;
     std::string rope_factor, rope_original;  // rope_original 无 UI 行，从 conf/环境读
     std::string kvsnap_max_gb;
+    std::string kvsnap_dir;  // KVSNAP_DIR：空 = 引擎默认 data\kvsnap
     std::string engine_host, engine_port, api_host, api_port;
 };
 
@@ -405,6 +410,7 @@ PanelVals panel_vals_from_conf() {
     v.rope_factor = cfg("ROPE_FACTOR", "1");
     v.rope_original = cfg("ROPE_ORIGINAL_CTX", "262144");
     v.kvsnap_max_gb = cfg("KVSNAP_MAX_GB", "20");
+    v.kvsnap_dir = cfg_optional("KVSNAP_DIR", "");
     v.engine_host = cfg("ENGINE_HOST", "127.0.0.1");
     v.engine_port = cfg("ENGINE_PORT", "8730");
     v.api_host = cfg("API_HOST", "0.0.0.0");
@@ -450,6 +456,9 @@ std::map<std::string, std::string> panel_vals_to_conf(const PanelVals& v) {
     m["PREFILL_CHUNK"] = v.prefill_chunk;
     m["ROPE_FACTOR"] = v.rope_factor;
     m["KVSNAP_MAX_GB"] = v.kvsnap_max_gb;
+    std::string kdir = v.kvsnap_dir;
+    while (!kdir.empty() && (kdir.back() == '\\' || kdir.back() == '/')) kdir.pop_back();
+    m["KVSNAP_DIR"] = kdir;
     m["ENGINE_HOST"] = v.engine_host;
     m["ENGINE_PORT"] = v.engine_port;
     m["API_HOST"] = v.api_host;
@@ -611,6 +620,11 @@ void check_context_page(CheckLines& c, const PanelVals& v) {
     c.text += TR("· YaRN：单请求上限超过原生 262144 时开启，扩展倍数按上限自动推导。\r\n",
                  "· YaRN: enable when the per-request cap exceeds native 262144; the scale "
                  "factor is derived from the cap automatically.\r\n");
+    c.text += TR("· KV 快照目录：留空 = 缓存放仓库内 data\\kvsnap；填目录则缓存放它下面的 "
+                 "qwenox-kvsnap 子目录（自动创建，可整个删）。\r\n",
+                 "· KV snapshot folder: empty = cache goes to data\\kvsnap inside the repo; a "
+                 "path puts the cache in its qwenox-kvsnap subfolder (auto-created, safe to "
+                 "delete wholesale).\r\n");
     long maxctx = 0, parallel = 1, kv_pool = 0, prefill = 0, rope_orig = 0;
     double factor = 1;
     bool nums_ok = true;
@@ -682,6 +696,46 @@ void check_context_page(CheckLines& c, const PanelVals& v) {
         check_line(c, kLvPass,
                    TR("数值校验：上下文/并发/YaRN 参数合法",
                       "Numeric checks: context / concurrency / YaRN parameters valid"));
+    // KV 快照目录（KVSNAP_DIR）：引擎语义见 engine_sup.cpp / start_win.sh —— 留空不动
+    // QWENOX_KVSNAP_DIR（默认 data\kvsnap）；填了则实际快照目录是其下的
+    // qwenox-kvsnap 子目录，启动时自动创建。
+    std::string kd = v.kvsnap_dir;
+    while (!kd.empty() && (kd.back() == '\\' || kd.back() == '/')) kd.pop_back();
+    if (kd.empty())
+        check_line(c, kLvPass, TR("KV 快照目录：未设置，快照在仓库内 data\\kvsnap",
+                                  "KV snapshot folder: unset; snapshots go to data\\kvsnap "
+                                  "inside the repo"));
+    else if (kvsnap == 0)
+        check_line(c, kLvHint,
+                   TR("KV 快照上限为 0：快照功能关闭，目录设置暂不生效",
+                      "KV snapshot cap is 0: snapshots are off, the folder has no effect yet"));
+    else {
+        check_line(c, kLvPass, TR("KV 快照目录：", "KV snapshot folder: ") + kd +
+                                   TR("（实际快照目录 ", " (effective snapshot directory ") + kd +
+                                       TR("\\qwenox-kvsnap，不存在时启动自动创建）",
+                                          "\\qwenox-kvsnap, auto-created at startup if missing)"));
+        // 目标卷剩余空间对照容量上限：目录尚未创建时向上找第一个已存在的祖先查
+        //（"D:\新建\目录" → "D:\新建" → "D:"，同卷不影响剩余空间）
+        ULARGE_INTEGER free_b{};
+        bool have_space = false;
+        for (std::string probe = kd;;) {
+            if (GetDiskFreeSpaceExA(probe.c_str(), &free_b, nullptr, nullptr)) {
+                have_space = true;
+                break;
+            }
+            const size_t cut = probe.find_last_of("\\/");
+            if (cut == std::string::npos) break;
+            probe.erase(cut);
+        }
+        if (have_space && (double)free_b.QuadPart < (double)kvsnap * 1073741824.0)
+            check_line(c, kLvWarn,
+                       TR("KV 快照目标盘剩余 ", "KV snapshot target disk has ") +
+                           gib((double)free_b.QuadPart) +
+                           TR(" GiB，低于容量上限 ", " GiB free, below the cap of ") +
+                           std::to_string(kvsnap) +
+                           TR(" GiB：快照存不满容量就会因空间紧张被 LRU 逐出",
+                              " GiB: snapshots will be LRU-evicted before filling the cap"));
+    }
 }
 
 // 第 3 页：监听地址与端口。service_running 时占用检查降级为提示。
@@ -1018,7 +1072,7 @@ enum PanelId : int {
     kBrGguf, kBrGgufMtp, kBrGgufVision,
     kOffOverlay, kOffMtp, kOffVision, kOffGgufMtp, kOffGgufVision,
     kEdMaxctx, kCbParallel, kEdKvPool, kCkKvPaged, kEdPrefill,
-    kCkYarn, kEdKvsnap,
+    kCkYarn, kEdKvsnap, kEdKvsnapDir, kBrKvsnapDir,
     kEdEHost, kEdEPort, kEdAHost, kEdAPort,
     kEdOut1, kEdOut2, kEdOut3, kEdReport, kEdSummary, kBtnLang,
 };
@@ -1037,6 +1091,7 @@ struct PanelCtl {
          prefill = nullptr;
     HWND yarn = nullptr;  // "YaRN 长上下文扩展" 勾选框（ROPE_FACTOR 自动推导，无编辑行）
     HWND kvsnap = nullptr;
+    HWND kvsnap_dir = nullptr, kvsnap_dir_br = nullptr;
     HWND ehost = nullptr, eport = nullptr, ahost = nullptr, aport = nullptr;
     HWND out1 = nullptr, out2 = nullptr, out3 = nullptr, report = nullptr, summary = nullptr;
 };
@@ -1187,6 +1242,7 @@ PanelVals panel_collect() {
     v.rope_original = cfg("ROPE_ORIGINAL_CTX", "262144");  // 无 UI 行，conf/环境原样读
     v.rope_factor = derive_rope_factor(get_check(g_pc.yarn), v.max_context, v.rope_original);
     v.kvsnap_max_gb = get_edit(g_pc.kvsnap);
+    v.kvsnap_dir = get_edit(g_pc.kvsnap_dir);
     v.engine_host = get_edit(g_pc.ehost);
     v.engine_port = get_edit(g_pc.eport);
     v.api_host = get_edit(g_pc.ahost);
@@ -1290,6 +1346,49 @@ bool panel_browse(HWND edit) {
     }
     set_edit(edit, make_relative(from_w(buf)));
     return true;
+}
+
+// 目录选择框（KV 快照目录用）：IFileOpenDialog + FOS_PICKFOLDERS，Win10 现代样式、
+// 可手输路径。CoInitializeEx 随每次选择配对；COM 已按其它线程模型初始化
+//（RPC_E_CHANGED_MODE）时照常继续、不负责 Uninitialize。取消/创建失败静默返回。
+bool panel_browse_dir(HWND edit) {
+    const HRESULT hr_init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    bool ok = false;
+    IFileOpenDialog* dlg = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                   IID_IFileOpenDialog, reinterpret_cast<void**>(&dlg)))) {
+        dlg->SetOptions(FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+        dlg->SetTitle(TR(L"选择 KV 快照目录", L"Select KV snapshot folder"));
+        // 当前值作为初始目录（先规范成绝对路径；解析或转换失败就按默认目录开）
+        const std::string cur = get_edit(edit);
+        if (!cur.empty()) {
+            std::wstring w = to_w(cur);
+            for (auto& c : w)
+                if (c == L'/') c = L'\\';
+            wchar_t abs[MAX_PATH];
+            const DWORD n = GetFullPathNameW(w.c_str(), MAX_PATH, abs, nullptr);
+            if (n > 0 && n < MAX_PATH) {
+                IShellItem* seed = nullptr;
+                if (SUCCEEDED(SHCreateItemFromParsingName(abs, nullptr, IID_PPV_ARGS(&seed)))) {
+                    dlg->SetFolder(seed);
+                    seed->Release();
+                }
+            }
+        }
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dlg->Show(g_panel)) && SUCCEEDED(dlg->GetResult(&item))) {
+            PWSTR path = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+                set_edit(edit, make_relative(from_w(path)));
+                ok = true;
+                CoTaskMemFree(path);
+            }
+            item->Release();
+        }
+        dlg->Release();
+    }
+    if (SUCCEEDED(hr_init)) CoUninitialize();
+    return ok;
 }
 
 // 把一个文件行排到指定 y（SWP_SHOWWINDOW），或整行隐藏
@@ -1647,6 +1746,9 @@ LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             case kBrGgufVision:
                 if (panel_browse(g_pc.row_gguf_vision.edit)) panel_recheck();
                 return 0;
+            case kBrKvsnapDir:
+                if (panel_browse_dir(g_pc.kvsnap_dir)) panel_recheck();
+                return 0;
             case kOffOverlay:
                 set_optional_row_state(g_pc.row_overlay.off, g_pc.row_overlay.edit,
                                        g_pc.row_overlay.browse);
@@ -1883,6 +1985,13 @@ PanelResult panel_run() {
     set_edit(g_pc.kvsnap, init.kvsnap_max_gb);
     plabel(1, h, kHintX, y2, TR(L"RAM 检查点容量，0 = 关闭", L"RAM checkpoint capacity, 0 = off"),
            kHintW);
+    y2 += 26;
+    plabel(1, h, kLblX, y2, TR(L"KV 快照目录", L"KV snapshot folder"));
+    g_pc.kvsnap_dir = pctl(1, h, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kEdX, y2, 354,
+                           22, L"", kEdKvsnapDir);
+    set_edit(g_pc.kvsnap_dir, init.kvsnap_dir);
+    g_pc.kvsnap_dir_br = pctl(1, h, L"Button", BS_PUSHBUTTON, kBrX, y2 - 1, kBrW, 24,
+                              TR(L"浏览…", L"Browse"), kBrKvsnapDir);
     y2 += 26;
     g_pc.out2 = pctl(1, h, L"Edit",
                      WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
