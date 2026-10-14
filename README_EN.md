@@ -289,6 +289,32 @@ MTP on, vision tower on, prefill chunk 8192):
   of headroom (capped at 95 GiB), plus ~1.3 GiB, i.e. ~88.6 GiB for v2 at 256K and ~95.7 GiB for any 512K
   configuration. The engine also uses 3–4 GiB of host memory.
 
+### Slots and VRAM
+
+VRAM goes into the page pool, not into the slot count. Measured with hgn v2 at the default prefill chunk 6144
+(2026-10-14, MTP on, vision tower on, `MAX_CONTEXT=262144`; "actual use" as in the table above, the other two
+columns are Task Manager readings in GB):
+
+| Pool | Slots | Actual use | Dedicated GPU memory | Shared GPU memory |
+| --- | --- | --- | --- | --- |
+| 256K | 1 | 79.7 GiB | 85.8 | 1.9 |
+| 256K | 2 | 80.3 GiB | 86.3 | 1.9 |
+| 512K | 1 | 89.8 GiB | 95.7 | 2.1 |
+| 512K | 2 | 90.5 GiB | 95.7 | 2.5 |
+| 512K | 4 | 91.0 GiB | 95.6 | 2.5 |
+
+- Going from 1 to 2 slots adds ~0.6 GiB, each further slot ~0.27 GiB. Growing the pool from 256K to 512K adds
+  ~10 GiB regardless of slots.
+- When comparing one slot with two, keep `KV_POOL_TOKENS` the same; if the pool changed too, the ~10 GiB
+  difference is the pool.
+- All device memory is allocated at startup. With a 512K pool, 2 × 32K and 2 × 100K concurrent requests ran to
+  completion without any of the numbers above growing and without spilling into shared memory.
+- At a 512K pool, 1 slot and several slots show the same "Dedicated GPU memory": the reserved block is already at
+  the 95 GiB cap, so the slot count does not show up there.
+- To re-measure: stop the production service, then run `bash tools/vram_conc_win.sh` in Git Bash (default: 512K
+  pool, 1/2/4 slots, ~5 minutes per configuration; `PARS="1 2" POOL=0 SHORT=1` measures a 256K pool, startup and
+  one 8K request only). The summary goes to `logs/vram_conc/summary.txt`.
+
 ## Documentation
 
 - [QUICKSTART_EN.md](docs/QUICKSTART_EN.md) — build, start, configure
