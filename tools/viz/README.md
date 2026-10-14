@@ -2,6 +2,8 @@
 
 `qwenox-viz.html` 在浏览器里实时显示模型正在做什么：每个 token 在 48 层里各选了哪 10 个专家（512 个专家的版图），每层路由有多犹豫，下一个 token 的前 5 个候选，以及 MTP 每轮 verify 收下了几个 token。
 
+另有 `qwenox-model3d.html`：模型结构的 3D 视图（48 层、GDN/全注意力、Hyper-Connection 四路残差、512 专家版图、PLE、MTP），专家版图回放一次真实请求录下的路由。单文件，浏览器直接打开，不连服务；地址加 `#v=3` 之类可直接打开某个视角。
+
 ## 使用
 
 1. 在 `service.conf` 里设 `VIZ=1`，重启服务。启动日志里会有一行 `viz: taps on`。
