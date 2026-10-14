@@ -1787,6 +1787,21 @@ struct GpuModel {
     p_vbase[s] = base;
     CK(hipMemcpyAsync(d_vbase, p_vbase + s, 4, hipMemcpyHostToDevice, g_str));
     CK(hipEventRecord(vb_ev[s], g_str));
+    vb_str[s] = g_str;
+  }
+  // Before destroying a temporary stream (the graph-capture stream, whose
+  // eager boundary ops between segments call set_vbase): retire the slots
+  // last recorded on it. A later hipEventSynchronize on an event whose
+  // stream is gone reads freed runtime memory (random access violation).
+  hipStream_t vb_str[kVbRing] = {};
+  void vb_forget_stream(hipStream_t st) {
+    for (int s = 0; s < kVbRing; s++)
+      if (vb_ev[s] && vb_str[s] == st) {
+        CK(hipEventSynchronize(vb_ev[s]));  // stream still alive: completes
+        CK(hipEventDestroy(vb_ev[s]));
+        vb_ev[s] = nullptr;  // recreated on next use
+        vb_str[s] = nullptr;
+      }
   }
 
   // Refill the rope cos/sin table only when the chunk's (base, P) changes:
@@ -10240,6 +10255,7 @@ struct GpuModel {
     g_kprof_mute = false;
     CK(hipGraphInstantiate(&g1_exec, g1, nullptr, nullptr, 0));
     CK(hipGraphInstantiate(&g2_exec, g2, nullptr, nullptr, 0));
+    vb_forget_stream(cap);
     CK(hipStreamDestroy(cap));
     graphs_ok = true;
     fprintf(stderr, "decode graphs captured (ple=%d)\n", (int)ple_on);
@@ -10415,6 +10431,7 @@ struct GpuModel {
     vg_capturing_ = false;
     // capture-phase eager boundary writes landed on cap; order the restore
     (void)hipStreamSynchronize(cap);
+    vb_forget_stream(cap);
     (void)hipStreamDestroy(cap);
     if (d_iraw && iraw_sav_sz)
       CK(hipMemcpyAsync(d_iraw, d_iraw_sav, iraw_sav_sz, hipMemcpyDeviceToDevice,
