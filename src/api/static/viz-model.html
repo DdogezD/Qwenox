@@ -38,13 +38,20 @@ button[aria-pressed=true] { background: var(--ink); color: var(--wafer); border-
 aside { position: fixed; right: 16px; top: 14px; width: 300px; background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 12px 14px; }
 aside h2 { font-size: 15px; margin: 0 0 4px; font-weight: 600; }
 aside .shape { color: var(--blue); font-size: 13px; margin-bottom: 6px; }
-aside .desc { color: var(--ink2); font-size: 13px; line-height: 1.55; }
+aside .desc { color: var(--ink2); font-size: 13px; line-height: 1.55; white-space: pre-line; }
 .legend { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); display: grid; grid-template-columns: 14px 1fr; gap: 4px 8px; font-size: 12px; color: var(--ink2); align-items: center; }
 .legend i { width: 12px; height: 12px; border-radius: 2px; display: block; }
 .tok { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); font-size: 13px; }
 .tok .line { line-height: 1.8; color: var(--ink3); word-break: break-all; }
 .tok .line b { color: var(--ink); background: rgba(217,165,49,.35); font-weight: 400; padding: 0 1px; }
 .tok .ctl { display: flex; gap: 6px; margin-top: 6px; align-items: center; color: var(--ink2); font-size: 12px; }
+.tok .src { font-size: 12px; color: var(--ink2); margin-bottom: 6px; }
+.cand { margin-top: 8px; font-size: 12px; }
+.cand .ch { color: var(--ink2); margin-bottom: 3px; }
+.cand .cr { display: grid; grid-template-columns: 1fr 48px; gap: 6px; }
+.cand .cb { position: relative; z-index: 0; padding: 1px 4px; white-space: pre; overflow: hidden; text-overflow: ellipsis; }
+.cand .cb::before { content: ""; position: absolute; inset: 0; width: var(--w); background: rgba(63,95,179,.18); z-index: -1; }
+.cand .cp { text-align: right; color: var(--ink2); }
 .hint { position: fixed; right: 16px; bottom: 16px; color: var(--ink3); font-size: 12px; text-align: right; line-height: 1.5; }
 .nogl { position: fixed; inset: 0; display: none; place-items: center; color: var(--ink2); }
 </style>
@@ -54,7 +61,7 @@ aside .desc { color: var(--ink2); font-size: 13px; line-height: 1.55; }
 <div id="labels"></div>
 <header>
   <h1>Qwenox 模型结构</h1>
-  <p>48 层，每 4 层里 3 层线性注意力（GDN）、1 层全注意力；每层 512 个专家。<br>方块大小按维度的平方根缩放。版图里点亮的专家是一次真实请求录下的路由。</p>
+  <p>48 层，每 4 层里 3 层线性注意力（GDN）、1 层全注意力；每层 512 个专家。<br>方块大小按维度的平方根缩放。引擎开着 VIZ 时，专家版图、路由器、KV 缓存、输出头和 MTP 跟着实时生成变化；没有请求时回放一段录下的路由。</p>
 </header>
 <aside>
   <h2 id="i-name">把鼠标移到方块上</h2>
@@ -68,12 +75,14 @@ aside .desc { color: var(--ink2); font-size: 13px; line-height: 1.55; }
     <i style="background:#c9c6d6"></i><span>残差流（4 条分支）</span>
   </div>
   <div class="tok">
+    <div class="src" id="src" aria-live="polite"></div>
     <div class="line" id="tokline"></div>
     <div class="ctl"><button id="play" type="button" aria-pressed="true">暂停</button><span id="tokinfo"></span></div>
+    <div class="cand" id="cand"></div>
   </div>
 </aside>
 <nav id="nav"></nav>
-<div class="hint">不连服务，所有数据都在页面里</div>
+<div class="hint">实时数据来自本机 API 的 /viz</div>
 <div class="nogl" id="nogl">这个浏览器没有 WebGL2，无法显示 3D 视图。</div>
 
 <script>
@@ -148,6 +157,8 @@ for (let c = 0; c < L / PER_COL; c++) {
 
 // ---- one layer ----
 const expertBase = [];       // per layer: index of its first expert box
+const routerBox = [], kvBoxes = [];  // live-driven boxes (router tint, cache length)
+let logitsBox = null, mtpBox = null;
 const EXP_X0 = 52, EXP_DX = 2.2, EXP_COLS = 32, EXP_ROWS = 16, EXP_W = 1.6;
 function hcBlock(name, x, top, what) {
   return box(name, x, top, 0, 26, 2.6, 7, C.hc, {
@@ -206,11 +217,11 @@ function buildLayer(l) {
     // KV cache: long along z (the context axis), paged
     const kvLen = 120;
     for (const [i, nm] of [[0, "K 缓存"], [1, "V 缓存"]])
-      box(nm, x - 3 - i * 7, top, -kvLen / 2 + 10, 5, S(512), kvLen, C.kv, {
+      kvBoxes.push(box(nm, x - 3 - i * 7, top, -kvLen / 2 + 10, 5, S(512), kvLen, C.kv, {
         cells: [1, 10, 48], shape: "上下文长度 × 2 头 × 256（bf16，每页 256 token）",
-        desc: "全注意力层的 KV 缓存，沿 z 方向是上下文。按 256 token 一页分配，多个会话共享同一个页池，也可以存到 SSD 复用。",
-      });
-    box("索引器键缓存", x - 17, top, -kvLen / 2 + 10, 2.4, S(128), kvLen, C.kv, { cells: [1, 4, 48], shape: "每 4 token 一个键", desc: "索引器用的压缩键，给块打分时只扫它。" });
+        desc: "全注意力层的 KV 缓存，沿 z 方向是上下文（长度按对数缩放）。按 256 token 一页分配，多个会话共享同一个页池，也可以存到 SSD 复用。",
+      }));
+    kvBoxes.push(box("索引器键缓存", x - 17, top, -kvLen / 2 + 10, 2.4, S(128), kvLen, C.kv, { cells: [1, 4, 48], shape: "每 4 token 一个键", desc: "索引器用的压缩键，给块打分时只扫它。" }));
     x -= 24;
     wmat("o_proj", x, top, 0, 6144, 2560, { desc: "24 个头的输出乘上输出门后投回 2560 维。" });
     label("全注意力", X - 90, Y + 2, 0, "", 0, 1600);
@@ -219,7 +230,7 @@ function buildLayer(l) {
   // --- MoE (right of the pipes) ---
   const mt = Y - 76;
   hcBlock("MoE 前 HC 读", X, mt, "read");
-  wmat("路由器 gate", X + 18 + S(2560), mt - 6, 0, 2560, 512, {
+  routerBox[l] = wmat("路由器 gate", X + 18 + S(2560), mt - 6, 0, 2560, 512, {
     desc: "给 512 个专家打分，softmax 后取前 10 个，权重再归一化到和为 1。",
   });
   box("", X + EXP_X0 + EXP_COLS * EXP_DX / 2 - 1, mt - 26, 0, EXP_COLS * EXP_DX + 2, 1.2, EXP_ROWS * EXP_DX + 2, C.tray, { pick: false });
@@ -256,14 +267,14 @@ for (let l = 0; l < L; l++) buildLayer(l);
     cells: [498, 25, 1], shape: "2560 → 248320",
     desc: "把隐藏状态投到整个词表，得到下一个 token 的 logits。decode 时它是单次最大的权重读取之一。",
   });
-  box("logits", X, top - 12 - S(2560) - 8, 0, S(248320), 2, 2, C.on, { cells: [498, 1, 1], shape: "248320", desc: "每个词一个分数；greedy 取最大，采样按温度和 top-k/top-p 抽。" });
+  logitsBox = box("logits", X, top - 12 - S(2560) - 8, 0, S(248320), 2, 2, C.on, { cells: [498, 1, 1], shape: "248320", desc: "每个词一个分数；greedy 取最大，采样按温度和 top-k/top-p 抽。" });
   label("输出头", X, top + 8, 0, "sec");
   // MTP: one extra layer that drafts the next tokens
   const MX = X + 330, MY = TOP - (PER_COL - 2) * LH;
   box("MTP 输入融合", MX, MY, 0, 26, 3, 8, C.hc, { shape: "隐藏状态 + 刚生成的 token", desc: "MTP 层拿主干最后的隐藏状态和刚生成的 token 嵌入，拼起来投影成自己的输入。" });
   wmat("MTP q/k/v", MX - 22, MY - 10, 0, 2560, 12288, { shape: "一层全注意力", desc: "MTP 草稿层本身是一层全注意力 + MoE，有自己的 KV 缓存。" });
   box("MTP 专家", MX + 50, MY - 22, 0, 40, 6, 20, C.off, { cells: [32, 1, 16], shape: "512 专家，取前 10", desc: "和主干一样的 MoE 结构（Q8 精度）。" });
-  box("MTP → 草稿 token", MX, MY - 60, 0, 60, 3, 3, C.on, {
+  mtpBox = box("MTP → 草稿 token", MX, MY - 60, 0, 60, 3, 3, C.on, {
     shape: "每轮猜 γ 个 token",
     desc: "草稿层连续猜几个 token，主干一次前向同时验证它们，猜对的全部收下。运行时视图里那根 MTP 柱状图就是每轮收下的个数。",
   });
@@ -468,6 +479,7 @@ function setHover(b) {
   let extra = "";
   if (b.kind === "expert" && b.w > 0) extra = `当前 token 选中了它，权重 ${(b.w * 100).toFixed(0)}%。`;
   else if (b.kind === "expert") extra = "当前 token 没有选它。";
+  else if (b.note) extra = b.note;
   ds.textContent = (extra ? extra + "\n" : "") + b.desc;
 }
 
@@ -487,36 +499,179 @@ function placeLabels() {
   }
 }
 
-// ---------------- recorded routing ----------------
-let tokIdx = 0, playing = !matchMedia("(prefers-reduced-motion: reduce)").matches;
+// ---------------- routing display (recorded replay + live) ----------------
+// playing: the pause button (live and replay). With reduced motion the
+// recording does not auto-advance until play is pressed; live data always runs.
+let tokIdx = 0, playing = true, demoAuto = !matchMedia("(prefers-reduced-motion: reduce)").matches;
 const playBtn = document.getElementById("play");
-playBtn.setAttribute("aria-pressed", String(playing)); playBtn.textContent = playing ? "暂停" : "播放";
-playBtn.addEventListener("click", () => { playing = !playing; playBtn.setAttribute("aria-pressed", String(playing)); playBtn.textContent = playing ? "暂停" : "播放"; });
+function syncPlayBtn() {
+  const on = playing && (mode === "live" || demoAuto);
+  playBtn.setAttribute("aria-pressed", String(on)); playBtn.textContent = on ? "暂停" : "播放";
+}
+playBtn.addEventListener("click", () => {
+  if (mode === "demo" && !demoAuto) { demoAuto = true; playing = true; } else playing = !playing;
+  syncPlayBtn();
+});
+// stage a box's instance data; the frame uploads each dirty set once
+function touch(b) { writeInst(b.set.data, b.slot, b); b.set.dirty = true; }
+for (let l = 0; l < L; l++) for (let e = 0; e < E; e++) { const b = boxes[expertBase[l] + e]; b.top = b.o[1] + b.s[1]; b.w = 0; }
+// 48 x 10 expert ids / weights (x255): selected experts rise as gold pillars
+function setRouting(ids, ws) {
+  for (let l = 0; l < L; l++) {
+    const base = expertBase[l];
+    for (let e = 0; e < E; e++) { const b = boxes[base + e]; if (b.w) { b.w = 0; b.s[1] = 2; b.o[1] = b.top - 2; b.c = C.off; touch(b); } }
+    for (let j = 0; j < K; j++) {
+      const id = ids[l * K + j]; if (id < 0 || id >= E) continue;
+      const b = boxes[base + id], w = ws[l * K + j] / 255;
+      b.w = w; b.s[1] = 3 + 22 * Math.sqrt(w); b.o[1] = b.top - 2; b.c = C.on; touch(b);
+    }
+  }
+  if (hovered && hovered.kind === "expert") { const h = hovered; hovered = null; setHover(h); }
+}
 function showToken(i) {
   tokIdx = (i + ROUTES.length) % ROUTES.length;
   const r = ROUTES[tokIdx];
-  for (let l = 0; l < L; l++) {
-    const base = expertBase[l];
-    for (let e = 0; e < E; e++) { const b = boxes[base + e]; if (b.w) { b.w = 0; b.s[1] = 2; b.o[1] = b.top - 2; b.c = C.off; } }
-    for (let j = 0; j < K; j++) {
-      const id = r.e[l * K + j]; if (id < 0) continue;
-      const b = boxes[base + id], w = r.w[l * K + j] / 255;
-      b.w = w; const h = 3 + 22 * Math.sqrt(w); b.s[1] = h; b.o[1] = b.top - 2; b.c = C.on;
-    }
-  }
-  // re-upload expert range (contiguous per layer in the opaque set)
-  for (let l = 0; l < L; l++) for (let e = 0; e < E; e++) { const b = boxes[expertBase[l] + e]; writeInst(opaque.data, b.slot, b); }
-  gl.bindBuffer(gl.ARRAY_BUFFER, opaque.ib); gl.bufferSubData(gl.ARRAY_BUFFER, 0, opaque.data);
-  const line = ROUTES.map((t, k) => k === tokIdx ? `<b>${esc(t.t)}</b>` : esc(t.t)).join("");
-  document.getElementById("tokline").innerHTML = line;
-  document.getElementById("tokinfo").textContent = `第 ${tokIdx + 1} / ${ROUTES.length} 个 token`;
-  if (hovered && hovered.kind === "expert") { const h = hovered; hovered = null; setHover(h); }
+  setRouting(r.e, r.w);
+  document.getElementById("tokline").innerHTML = ROUTES.map((t, k) => k === tokIdx ? `<b>${esc(t.t)}</b>` : esc(t.t)).join("");
+  document.getElementById("tokinfo").textContent = `录制的第 ${tokIdx + 1} / ${ROUTES.length} 个 token`;
 }
 function esc(s) { return s.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])).replace(/\n/g, "↵"); }
-for (let l = 0; l < L; l++) for (let e = 0; e < E; e++) { const b = boxes[expertBase[l] + e]; b.top = b.o[1] + b.s[1]; b.w = 0; }
-document.getElementById("tokline").addEventListener("click", () => {});
 showToken(0);
 let lastTok = 0;
+
+// ---------------- live: GET /viz from the API that served this page ----------------
+// #api=host:port points elsewhere; a local file without it only replays.
+// Same rules as /viz-live: only final positions are shown (the engine never
+// exposes the newest token, which may still be a rejected draft's row).
+const apiM = /api=([^&]+)/.exec(location.hash);
+const apiBase = apiM ? "http://" + decodeURIComponent(apiM[1]) : location.protocol.startsWith("http") ? "" : null;
+const srcEl = document.getElementById("src"), candEl = document.getElementById("cand");
+const PALE = hex("#d4d8f0");
+for (const b of routerBox) b.c0 = b.c.slice();
+for (const b of kvBoxes) { b.z1 = b.o[2] + b.s[2]; b.len0 = b.s[2]; }
+mtpBox.w0 = mtpBox.s[0]; mtpBox.cx = mtpBox.o[0] + mtpBox.s[0] / 2;
+let mode = "demo", live = null;
+syncPlayBtn();
+const liveQ = [];
+let lastLiveAt = -1e9, nextLiveAt = 0, logitsOff = 0, mtpOff = 0;
+const hexBytes = h => { const a = new Uint8Array((h || "").length >> 1); for (let i = 0; i < a.length; i++) a[i] = parseInt(h.substr(i * 2, 2), 16); return a; };
+const tokText = h => new TextDecoder("utf-8").decode(hexBytes(h));
+async function getJSON(u) { const r = await fetch(apiBase + u, { cache: "no-store" }); if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }
+
+// back to the recording; a finished request stays on screen for 6 s first
+function toDemo(msg) {
+  if (mode === "live" && (liveQ.length || performance.now() - lastLiveAt < 6000)) return;
+  srcEl.textContent = msg;
+  if (mode === "demo") return;
+  mode = "demo"; live = null; liveQ.length = 0; syncPlayBtn();
+  for (const b of routerBox) { b.c = b.c0.slice(); b.note = ""; touch(b); }
+  for (const b of kvBoxes) { b.s[2] = b.len0; b.o[2] = b.z1 - b.len0; b.note = ""; touch(b); }
+  mtpBox.s[0] = mtpBox.w0; mtpBox.o[0] = mtpBox.cx - mtpBox.w0 / 2; mtpBox.note = ""; touch(mtpBox);
+  candEl.innerHTML = "";
+  showToken(tokIdx);
+}
+
+let polling = false;
+async function poll() {
+  if (polling) return;
+  polling = true;
+  try {
+    const s = await getJSON("/viz");
+    if (!s.on) return toDemo("回放录制：引擎没开 VIZ（service.conf 设 VIZ=1 后重启服务）");
+    const act = s.slots.filter(x => x.req >= 0);
+    const pick = act.length ? act.reduce((a, b) => (b.req > a.req ? b : a)) : null;
+    const running = pick && (pick.state === 1 || pick.state === 2);
+    if (!live || !pick || live.req !== pick.req || live.slot !== pick.slot) {
+      if (!running) return toDemo("回放录制：引擎空闲，发一条消息就会切到实时");
+      live = {
+        slot: pick.slot, req: pick.req, n_prompt: pick.n_prompt, n_tok: pick.n_tok, state: pick.state,
+        next: Math.max(0, pick.n_prompt - 1, pick.n_tok - 24),  // joining late: start near the end
+        dec: new TextDecoder("utf-8"), text: [], m: new Map(),
+      };
+      liveQ.length = 0;
+      mode = "live"; syncPlayBtn();
+    }
+    for (let guard = 0; guard < 4; guard++) {
+      const d = await getJSON(`/viz?slot=${live.slot}&from=${live.next}&n=64`);
+      if (d.req !== live.req) break;
+      live.n_tok = d.n_tok; live.state = d.state;
+      for (const it of d.items) if (it.m >= 0) live.m.set(it.p, it.m);
+      let got = 0;
+      for (const it of d.items) {
+        if (it.p !== live.next || it.p >= d.final_end) break;
+        live.next++; got++;
+        if (it.p >= live.n_prompt) {
+          const t = it.sp ? tokText(it.b) : live.dec.decode(hexBytes(it.b), { stream: true });
+          live.text.push({ p: it.p, s: t });
+          if (live.text.length > 80) live.text.shift();
+        }
+        if (it.e) liveQ.push(it);
+      }
+      if (got) lastLiveAt = performance.now();
+      if (d.items.length < 64 || !got) break;
+    }
+    srcEl.textContent = `实时：第 ${live.slot + 1} 路，请求 ${live.req}，` +
+      (live.state === 3 ? "已结束" : live.state === 1 ? "预填充中" : "生成中");
+    if (live.state === 3) toDemo("回放录制：上一个请求已结束，发一条消息就会切到实时");
+  } catch (e) {
+    toDemo("回放录制：连不上 API（" + e.message + "）");
+  } finally {
+    polling = false;
+  }
+}
+if (apiBase === null) srcEl.textContent = "回放录制：本地打开，没有连服务（地址加 #api=主机:端口 可连）";
+else { srcEl.textContent = "回放录制：正在连接 API"; setInterval(poll, 300); poll(); }
+
+// spread each poll's tokens over the poll interval; a backlog (paused, tab
+// in background) is cut to the newest few
+function livePump(t) {
+  if (!liveQ.length || t < nextLiveAt) return;
+  if (liveQ.length > 24) liveQ.splice(0, liveQ.length - 6);
+  const it = liveQ.shift();
+  nextLiveAt = t + Math.max(18, Math.min(110, 300 / (liveQ.length + 1)));
+  applyLive(it, t);
+}
+function applyLive(it, t) {
+  setRouting(it.e, it.w);
+  // router tint: pale = this layer's routing is undecided (high entropy)
+  const hmax = Math.log(512);
+  for (let l = 0; l < L; l++) {
+    const b = routerBox[l], ent = it.h ? it.h[l] / 1000 : -1, mass = it.c ? it.c[l] / 1000 : -1;
+    if (ent < 0) continue;
+    const u = Math.min(1, Math.max(0, (ent - 1.5) / 3.5));
+    b.c = b.c0.map((v, i) => v + (PALE[i] - v) * u);
+    b.note = `当前 token 在这一层的路由熵 ${ent.toFixed(2)}（上限 ${hmax.toFixed(2)}），选中的 10 个专家占 ${(mass * 100).toFixed(0)}% 概率。颜色越浅，这一层越拿不准该交给谁。`;
+    touch(b);
+  }
+  // caches grow with the context (log scale: 1 token .. 256K)
+  const n = live.n_tok, len = 12 + 108 * Math.log1p(n) / Math.log1p(262144);
+  for (const b of kvBoxes) { b.s[2] = len; b.o[2] = b.z1 - len; b.note = `当前会话的上下文是 ${n} 个 token。`; touch(b); }
+  logitsBox.hl = 1; touch(logitsBox); logitsOff = t + 120;
+  // a verify round's tokens leave the engine back to back (< 3 ms apart)
+  if (it.p >= live.n_prompt) {
+    const m = live.m.get(it.p), pm = live.m.get(it.p - 1);
+    if (m !== undefined && (pm === undefined || m - pm > 3)) {
+      let k = 1;
+      while (live.m.has(it.p + k) && live.m.get(it.p + k) - live.m.get(it.p + k - 1) <= 3) k++;
+      mtpBox.s[0] = 14 * k; mtpBox.o[0] = mtpBox.cx - 7 * k; mtpBox.hl = 1;
+      mtpBox.note = `这一轮主干一次收下了 ${k} 个 token。1 表示草稿全被拒，只收下主干自己算出的那一个。`;
+      touch(mtpBox); mtpOff = t + 260;
+    }
+  }
+  document.getElementById("tokline").innerHTML =
+    live.text.map(x => x.p === it.p ? `<b>${esc(x.s)}</b>` : esc(x.s)).join("") || "（还在 prompt 里）";
+  document.getElementById("tokinfo").textContent = `位置 ${it.p + 1} / ${n}`;
+  renderCand(it);
+  if (hovered && hovered.note !== undefined && hovered.kind !== "expert") { const h = hovered; hovered = null; setHover(h); }
+}
+function renderCand(it) {
+  if (!it.k) { candEl.innerHTML = ""; return; }
+  candEl.innerHTML = '<div class="ch">下一个 token 的候选</div>' + it.k.map((id, j) => {
+    const pr = it.q[j] / 10000, s = it.kb ? tokText(it.kb[j]) : "#" + id;
+    return `<div class="cr"><span class="cb" style="--w:${Math.max(1, pr * 100).toFixed(1)}%">${esc(s) || "␠"}</span>` +
+      `<span class="cp">${(pr * 100).toFixed(pr < 0.1 ? 1 : 0)}%</span></div>`;
+  }).join("");
+}
 
 // ---------------- frame ----------------
 function frame(t) {
@@ -529,7 +684,14 @@ function frame(t) {
     cam.dist *= Math.exp(Math.log(goal.dist / cam.dist) * k);
     if (Math.abs(Math.log(goal.dist / cam.dist)) < 0.002 && Math.hypot(...sub(goal.t, cam.t)) < 0.5) goal = null;
   }
-  if (playing && t - lastTok > 450) { lastTok = t; showToken(tokIdx + 1); }
+  if (mode === "demo" && playing && demoAuto && t - lastTok > 450) { lastTok = t; showToken(tokIdx + 1); }
+  if (mode === "live" && playing) livePump(t);
+  if (logitsOff && t > logitsOff) { logitsOff = 0; logitsBox.hl = logitsBox === hovered ? 1 : 0; touch(logitsBox); }
+  if (mtpOff && t > mtpOff) { mtpOff = 0; mtpBox.hl = mtpBox === hovered ? 1 : 0; touch(mtpBox); }
+  for (const st of [opaque, transp]) if (st.dirty) {
+    st.dirty = false;
+    gl.bindBuffer(gl.ARRAY_BUFFER, st.ib); gl.bufferSubData(gl.ARRAY_BUFFER, 0, st.data);
+  }
   const e = eye();
   VP = mm(persp(FOV, W / H, Math.max(1, cam.dist * 0.01), cam.dist * 8 + 6000), lookAt(e, cam.t, [0, 1, 0]));
   gl.viewport(0, 0, cv.width, cv.height);
