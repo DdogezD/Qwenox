@@ -103,7 +103,7 @@ canvas#rounds { display: block; width: 100%; height: 110px; background: var(--pa
   <h1>Qwenox 运行时视图<small>48 层 × 512 个专家，每个 token 点亮 10 个</small></h1>
   <div class="controls">
     <label for="host">服务地址</label>
-    <input id="host" type="text" spellcheck="false" placeholder="192.168.5.12:8741">
+    <input id="host" type="text" spellcheck="false" placeholder="127.0.0.1:8731">
     <label for="slot">会话</label>
     <select id="slot"><option value="auto">跟随最新</option></select>
     <button id="mode" type="button" aria-pressed="false" title="切换版图显示：实时余辉 / 本次请求累计">累计</button>
@@ -156,8 +156,10 @@ canvas#rounds { display: block; width: 100%; height: 110px; background: var(--pa
 const L = 48, E = 512, K = 10;
 const $ = id => document.getElementById(id);
 const hostEl = $("host"), slotEl = $("slot"), modeBtn = $("mode"), followBtn = $("follow");
-// address: #host:port in the page URL, else the last one used, else the default service port
-hostEl.value = decodeURIComponent(location.hash.slice(1)) || localStorage.getItem("qv.host") || "192.168.5.12:8731";
+// address: #host:port in the page URL, else the API that served this page,
+// else (opened as a local file) the last one used
+const served = location.protocol.startsWith("http") ? location.host : "";
+hostEl.value = decodeURIComponent(location.hash.slice(1)) || served || localStorage.getItem("qv.host") || "127.0.0.1:8731";
 hostEl.addEventListener("change", () => { localStorage.setItem("qv.host", hostEl.value.trim()); reset(); });
 slotEl.addEventListener("change", () => reset());
 let cumulative = localStorage.getItem("qv.mode") === "cum";

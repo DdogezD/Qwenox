@@ -68,6 +68,9 @@ const I18N = {
     "req.note_server": "服务端分页（/reqstat/page），可翻阅全部历史；日期与 finish/drafter 为前端过滤（过滤时仅覆盖最近 1000 条）。",
     "req.note_filtered": "已设筛选：后端不支持按条件检索，仅在 /reqstat/tail 最近 1000 条内过滤分页。",
     "nav.sample": "采样", "nav.engine": "引擎",
+    "nav.viz_live": "运行视图", "nav.viz_model": "模型结构",
+    "hint.viz_live": "实时显示每个 token 选了哪些专家（需 service.conf VIZ=1）",
+    "hint.viz_model": "模型结构的 3D 视图",
     "ovr.title": "采样 / 思考参数（服务端覆盖）",
     "ovr.hint": "跟随客户端：不干预。默认值：只在客户端没传该字段时使用。" +
       "强制：不管客户端传什么都改成这个值（max_tokens 的“强制”是上限，超过才压到此值）。" +
@@ -176,6 +179,9 @@ const I18N = {
     "req.note_server": "Server-side paging (/reqstat/page) over the full history; date and finish/drafter filters are client-side (newest 1000 records only).",
     "req.note_filtered": "Filters active: the backend has no conditional search, so filtering covers only the newest 1000 records from /reqstat/tail.",
     "nav.sample": "Sampling", "nav.engine": "Engine",
+    "nav.viz_live": "Live view", "nav.viz_model": "Model",
+    "hint.viz_live": "Which experts each token routes to, live (needs VIZ=1 in service.conf)",
+    "hint.viz_model": "3D view of the model structure",
     "ovr.title": "Sampling / thinking parameters (server overrides)",
     "ovr.hint": "Follow client: no interference. Default: used only when the client omitted the field. " +
       "Force: replaces whatever the client sent (for max_tokens it is a cap: larger values clamp to it). " +
@@ -503,7 +509,8 @@ function showPage(name) {
 }
 document.getElementById("nav").addEventListener("click", (ev) => {
   const b = ev.target.closest(".nav-btn");
-  if (b) location.hash = "#/" + b.dataset.route;
+  if (b && b.dataset.open) window.open(b.dataset.open, "_blank", "noopener");
+  else if (b) location.hash = "#/" + b.dataset.route;
 });
 window.addEventListener("hashchange", () => showPage(location.hash.replace(/^#\/?/, "") || "overview"));
 
