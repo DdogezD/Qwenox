@@ -37,6 +37,15 @@
 // QWENOX_KVSNAP_QUEUE_MB, default 1024): tmp_<name> + fdatasync + rename, pages
 // before the checkpoints naming them, so a crash never publishes a torn or
 // dangling file. KVSYNC waits for the writer (tests).
+// IO: direct (O_DIRECT / FILE_FLAG_NO_BUFFERING; buffers 4 KiB aligned, the
+// write is padded and the file cut back to its size): cache files never sit
+// in the OS file cache, which on this APU competes with device memory and
+// the PLE table. A file system refusing it switches to buffered IO;
+// QWENOX_KVSNAP_DIRECT=0 forces buffered. Restores keep 4 page reads in
+// flight (QWENOX_KVSNAP_READERS); the writer runs 4 threads on a network
+// file system, 1 locally (QWENOX_KVSNAP_WRITERS overrides): per-file round
+// trips dominate a share. service.conf KVSNAP_DIR=<dir>
+// puts the cache in <dir>/qwenox-kvsnap (the launchers set the variable).
 // Restores: longest checkpoint whose tokens are a strict prefix of the
 // prompt; pages are prefetched on a second thread while the previous one is
 // copied to the device. A checkpoint saved with the MTP layer live restores
@@ -47,6 +56,7 @@
 // deleted with the last one. States shorter than QWENOX_KVSNAP_MIN (default
 // 4096 tokens) are not saved. QWENOX_KVSNAP=0 disables. Startup indexes the
 // directory, removing temporaries, pre-A4 s_* snapshot directories, and
-// orphaned/damaged files. All errors are non-fatal: the cache is an
+// orphaned/damaged files -- only names of these formats, so other files in
+// the directory are left alone. All errors are non-fatal: the cache is an
 // accelerator, never a correctness dependency.
 namespace kvsnap {

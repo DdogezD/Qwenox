@@ -291,6 +291,14 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
     for (const char* f : flags) SetEnvironmentVariableA(f, "1");
     SetEnvironmentVariableA("QWENOX_KVSNAP", kvsnap_max_gb ? "1" : "0");
     SetEnvironmentVariableA("QWENOX_KVSNAP_MAX_GB", std::to_string(kvsnap_max_gb).c_str());
+    // KVSNAP_DIR（见 service.conf）：缓存放在它下面的 qwenox-kvsnap 子目录；
+    // 留空时不动 QWENOX_KVSNAP_DIR（引擎默认 data\kvsnap，外部指定照常生效）
+    {
+        std::string kd = svcconf::cfg(conf, "KVSNAP_DIR", "");
+        while (!kd.empty() && (kd.back() == '\\' || kd.back() == '/')) kd.pop_back();
+        if (!kd.empty())
+            SetEnvironmentVariableA("QWENOX_KVSNAP_DIR", (kd + "\\qwenox-kvsnap").c_str());
+    }
     SetEnvironmentVariableA("QWENOX_RCKPT_MAX", std::to_string(rckpt_max).c_str());
     // 0 = 引擎按模式自选：不设（并删掉外部残留）
     SetEnvironmentVariableA("QWENOX_SPEC_GAMMA",

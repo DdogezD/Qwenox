@@ -139,6 +139,84 @@ static inline void* os_map_ro(const char* path, size_t len) {
 }
 static inline void os_unmap_ro(void* p, size_t) { UnmapViewOfFile(p); }
 
+// 目录在网络位置上（UNC \\server\share 或映射的网络盘符）：kvsnap 用多个写线程
+// （网络盘上每个文件的打开/落盘/改名往返占大头）
+static inline bool os_path_is_remote(const char* path) {
+  char full[MAX_PATH];
+  const DWORD n = GetFullPathNameA(path, MAX_PATH, full, nullptr);
+  if (!n || n >= MAX_PATH) return false;
+  const auto sep = [](char c) { return c == '\\' || c == '/'; };
+  if (sep(full[0]) && sep(full[1])) return true;  // UNC
+  if (full[0] && full[1] == ':') {
+    const char root[4] = {full[0], ':', '\\', 0};
+    return GetDriveTypeA(root) == DRIVE_REMOTE;
+  }
+  return false;
+}
+
+// 直通（绕过系统文件缓存）整文件读写，供 kvsnap 用；语义与 00_platform.inc 的
+// POSIX 版一致：缓冲按 OS_DIO_ALIGN 对齐且容得下 n 向上取整的长度；写按补齐长度
+// 写入再把文件截回 n，读按补齐长度请求、到 EOF 为止。返回 1 成功、0 IO 错误、
+// -1 此处不支持直通 IO（调用方退回普通 IO）。
+static const size_t OS_DIO_ALIGN = 4096;
+static inline size_t os_dio_round(size_t n) { return (n + OS_DIO_ALIGN - 1) & ~(OS_DIO_ALIGN - 1); }
+static inline int os_write_direct(const char* path, const char* p, size_t n) {
+  HANDLE h = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_INVALID_PARAMETER ? -1 : 0;
+  const size_t cap = os_dio_round(n);
+  size_t off = 0;
+  int rc = 1;
+  while (off < cap) {
+    const DWORD want = (DWORD)(cap - off < ((size_t)1 << 30) ? cap - off : (size_t)1 << 30);
+    DWORD got = 0;
+    if (!WriteFile(h, p + off, want, &got, nullptr) || !got) {
+      rc = off == 0 && GetLastError() == ERROR_INVALID_PARAMETER ? -1 : 0;
+      break;
+    }
+    off += got;
+  }
+  if (rc == 1) {
+    FILE_END_OF_FILE_INFO eof;  // 文件大小可设为任意值，只有 IO 要对齐
+    eof.EndOfFile.QuadPart = (LONGLONG)n;
+    if (!SetFileInformationByHandle(h, FileEndOfFileInfo, &eof, sizeof eof) ||
+        !FlushFileBuffers(h))
+      rc = 0;
+  }
+  if (!CloseHandle(h)) rc = 0;
+  return rc;
+}
+// 读恰好 n 字节的整个文件（大小不符返回 0）
+static inline int os_read_direct(const char* path, char* p, size_t n) {
+  HANDLE h = CreateFileA(path, GENERIC_READ,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                         OPEN_EXISTING,
+                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING |
+                             FILE_FLAG_SEQUENTIAL_SCAN,
+                         nullptr);
+  if (h == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_INVALID_PARAMETER ? -1 : 0;
+  LARGE_INTEGER sz;
+  int rc = GetFileSizeEx(h, &sz) && (uint64_t)sz.QuadPart == n ? 1 : 0;
+  const size_t cap = os_dio_round(n);
+  size_t off = 0;
+  while (rc == 1 && off < n) {
+    const DWORD want = (DWORD)(cap - off < ((size_t)1 << 30) ? cap - off : (size_t)1 << 30);
+    DWORD got = 0;
+    if (!ReadFile(h, p + off, want, &got, nullptr)) {
+      rc = off == 0 && GetLastError() == ERROR_INVALID_PARAMETER ? -1 : 0;
+      break;
+    }
+    if (!got) {
+      rc = 0;
+      break;
+    }
+    off += got;
+    if (off < n && (off & (OS_DIO_ALIGN - 1))) rc = 0;  // 文件中段短读
+  }
+  CloseHandle(h);
+  return rc;
+}
+
 static inline std::string os_last_error(const char* what) {
   DWORD e = GetLastError();
   char buf[512];

@@ -3,6 +3,11 @@ struct Cfg {
   uint64_t cap_bytes = 20ull << 30;
   size_t min_tokens = 4096;
   uint64_t queue_bytes = 1024ull << 20;  // captured but not yet written
+  bool direct = true;  // direct IO (O_DIRECT / NO_BUFFERING), buffered fallback
+  // files in flight: restore reads; writer threads (0 = auto: 4 on a network
+  // file system, 1 locally -- parallel writes slowed a local NVMe 0.8 -> 2.2 s
+  // per 1.8 GB and buy nothing there)
+  int readers = 4, writers = 0;
 };
 
 // Model identity for the cache fingerprint (set by main before serve::run).
@@ -183,11 +188,13 @@ static bool h2d(void* d, const void* h, size_t n) {
 // Pooled (page images are all one size): a fresh 100+ MB malloc per save is
 // mmap/munmap churn whose first-touch faults stalled D2H for seconds under
 // memory pressure. NOTE: never pinned -- hipHostMalloc'd memory makes D2H
-// collapse to ~7 MB/s on gfx1151.
+// collapse to ~7 MB/s on gfx1151. OS_DIO_ALIGN-aligned, capacity rounded up
+// to it: direct IO writes/reads the padded length in place.
 struct HBuf {
-  std::unique_ptr<char[]> p;
+  std::unique_ptr<char[]> p;  // raw storage; `a` is its aligned start
+  char* a = nullptr;
   size_t cap = 0, n = 0;
-  char* data() { return p.get(); }
+  char* data() { return a; }
 };
 static std::mutex g_pool_mtx;
 static std::vector<HBuf> g_pool;
@@ -209,9 +216,12 @@ static HBuf buf_get(size_t n) {
     }
   }
   HBuf b;
-  b.p.reset(new (std::nothrow) char[n ? n : 1]);
-  b.cap = b.p ? n : 0;
-  b.n = b.p ? n : 0;
+  const size_t cap = os_dio_round(n ? n : 1);
+  b.p.reset(new (std::nothrow) char[cap + OS_DIO_ALIGN]);
+  if (!b.p) return b;
+  b.a = (char*)(((uintptr_t)b.p.get() + OS_DIO_ALIGN - 1) & ~(uintptr_t)(OS_DIO_ALIGN - 1));
+  b.cap = cap;
+  b.n = n;
   return b;
 }
 static void buf_put(HBuf&& b) {
@@ -290,14 +300,39 @@ static bool rd_all(int fd, char* p, size_t n) {
   }
   return true;
 }
+// Direct IO: cache files are written once and read once per restore, so the
+// OS file cache gains nothing from them, and on this unified-memory APU every
+// byte it holds is taken from device memory and the PLE table's hot pages
+// (Windows has no DONTNEED: buffered kvsnap IO grows its standby list by the
+// whole file). A file system refusing it (tmpfs, some network/FUSE mounts)
+// switches the process to buffered IO once.
+static std::atomic<bool> g_direct{false};
+// Files in flight: restore reads (QWENOX_KVSNAP_READERS) and writer threads
+// (QWENOX_KVSNAP_WRITERS). One at a time is enough for a local NVMe; a
+// network share pays a round trip per file (open, flush, rename).
+static int g_readers = 4, g_writers = 4;
+static void direct_unsupported(const char* op) {
+  if (g_direct.exchange(false))
+    fprintf(stderr, "kvsnap: direct IO not supported for %s in %s; using buffered IO\n", op,
+            g_dir.c_str());
+}
 // tmp_<name>, fdatasync, rename: a crash never publishes a torn file.
+// `p` is an HBuf's data (aligned, padded capacity).
 static bool write_file(const std::string& name, const char* p, size_t n) {
   const std::string tmp = path_of("tmp_" + name);
-  int fd = os_open_wr(tmp.c_str());
-  if (fd < 0) return false;
-  bool ok = wr_all(fd, p, n) && os_sync(fd) == 0;
-  if (ok) os_drop_cache(fd);  // clean now: don't let the page cache keep it
-  if (os_close(fd)) ok = false;
+  bool ok = false, done = false;
+  if (g_direct.load()) {
+    const int rc = os_write_direct(tmp.c_str(), p, n);
+    if (rc < 0) direct_unsupported("writes");
+    else ok = rc == 1, done = true;
+  }
+  if (!done) {
+    int fd = os_open_wr(tmp.c_str());
+    if (fd < 0) return false;
+    ok = wr_all(fd, p, n) && os_sync(fd) == 0;
+    if (ok) os_drop_cache(fd);  // clean now: don't let the page cache keep it
+    if (os_close(fd)) ok = false;
+  }
   std::error_code ec;
   if (ok) {
     std::filesystem::rename(tmp, path_of(name), ec);
@@ -309,6 +344,16 @@ static bool write_file(const std::string& name, const char* p, size_t n) {
 // Whole file into a pooled buffer; `want` = exact expected size (0 = any,
 // bounded by `max`).
 static bool read_file(const std::string& path, HBuf& b, size_t want, size_t max = 0) {
+  if (g_direct.load()) {
+    std::error_code ec;
+    const uint64_t fsz = std::filesystem::file_size(path, ec);
+    if (ec || !fsz || (want ? fsz != want : fsz > max)) return false;
+    b = buf_get((size_t)fsz);
+    if (!b.p) return false;
+    const int rc = os_read_direct(path.c_str(), b.data(), (size_t)fsz);
+    if (rc >= 0) return rc == 1;
+    direct_unsupported("reads");  // b is reused by the buffered read below
+  }
   int fd = os_open_rd(path.c_str());
   if (fd < 0) return false;
   const int64_t fsz = os_fsize(fd);
@@ -396,10 +441,13 @@ static void touch_locked(const std::shared_ptr<CkEnt>& e) {
                                    std::filesystem::file_time_type::clock::now(), ec);
 }
 
-// ---- background writer -------------------------------------------------------
-// One detached thread writes captured images in FIFO order: a commit enqueues
-// its pages, then its MTP sections, then its checkpoints, so a checkpoint is
-// published only after the pages it names (checked again before writing).
+// ---- background writers ------------------------------------------------------
+// g_writers detached threads take captured images in FIFO order: a commit
+// enqueues its pages, then its MTP sections, then its checkpoints. Pages are
+// written in parallel; a writer taking a checkpoint first waits until no page
+// it names is still pending (those were taken earlier, so they are being
+// written), then requires them all published: a checkpoint never names a
+// page that is not on disk.
 struct Item {
   int kind = 0;  // 0 trunk page, 1 MTP section, 2 checkpoint
   uint64_t key = 0;
@@ -411,7 +459,11 @@ struct Item {
 };
 static std::deque<Item> g_q;
 static uint64_t g_q_bytes = 0;  // queued + being written
-static bool g_wbusy = false;
+static int g_wbusy = 0;         // writers holding an item
+// Wall time of page/MTP-section writes since the last checkpoint log: from
+// the first write start to the last write end (writers overlap).
+static bool g_pw_on = false;
+static std::chrono::steady_clock::time_point g_pw_t0, g_pw_t1;
 
 static void writer() {
   for (;;) {
@@ -421,14 +473,21 @@ static void writer() {
       g_cv.wait(lk, [] { return !g_q.empty(); });
       it = std::move(g_q.front());
       g_q.pop_front();
-      g_wbusy = true;
+      g_wbusy++;
     }
     const size_t len = it.buf.n;
     char* p = it.buf.data();
     std::string name;
     bool go = true;
     if (it.kind == 2) {
-      std::lock_guard<std::mutex> lk(g_mtx);
+      std::unique_lock<std::mutex> lk(g_mtx);
+      g_cv.wait_for(lk, std::chrono::seconds(60), [&] {
+        for (uint64_t k : it.ck->chunks) {
+          auto f = g_ch.find(k);
+          if (f != g_ch.end() && f->second.st == ST_PEND) return false;
+        }
+        return true;
+      });
       for (uint64_t k : it.ck->chunks) {
         auto f = g_ch.find(k);
         if (f == g_ch.end() || f->second.st != ST_PUB) go = false;
@@ -441,13 +500,18 @@ static void writer() {
     const uint64_t sum = sum64(p + hb, len - hb);
     memcpy(p + (it.kind == 2 ? offsetof(CkHdr, sum) : offsetof(ChHdr, sum)), &sum, 8);
     const auto w0 = std::chrono::steady_clock::now();
+    if (it.kind < 2) {
+      std::lock_guard<std::mutex> lk(g_mtx);
+      if (!g_pw_on) g_pw_on = true, g_pw_t0 = w0;
+    }
     const bool ok = go && write_file(name, p, len);
-    const double ws =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
+    const auto w1 = std::chrono::steady_clock::now();
+    const double ws = std::chrono::duration<double>(w1 - w0).count();
     {
       std::lock_guard<std::mutex> lk(g_mtx);
       g_q_bytes -= len;
       if (it.kind < 2) {
+        if (w1 > g_pw_t1) g_pw_t1 = w1;
         auto& mp = it.kind ? g_mt : g_ch;
         auto f = mp.find(it.key);
         if (f == mp.end() || f->second.refs == 0) {
@@ -478,15 +542,22 @@ static void writer() {
           e->bytes = len;
           e->t = now_t();
           g_total += len;
+          // "pages write": wall time of the page files written since the last
+          // checkpoint log (this commit's new pages, unless commits overlap)
+          const double pw =
+              g_pw_on ? std::chrono::duration<double>(g_pw_t1 - g_pw_t0).count() : 0.0;
           logf_locked("%s kvsnap: saved %d tokens -> %s (ckpt %.1f MB + %d new pages%s "
-                      "%.1f MB; capture %.2fs, write %.2fs%s; total %.2f GB)\n",
+                      "%.1f MB; capture %.2fs, %s IO pages write %.2fs, write %.2fs%s; "
+                      "total %.2f GB)\n",
                       log_ts(), e->n, e->name.c_str(), len / 1048576.0, it.new_ch,
-                      it.new_mt ? " + mtp" : "", it.new_b / 1048576.0, it.cap_s, ws,
+                      it.new_mt ? " + mtp" : "", it.new_b / 1048576.0, it.cap_s,
+                      g_direct.load() ? "direct" : "buffered", pw > 0 ? pw : 0.0, ws,
                       e->mtp ? ", mtp" : "", g_total / 1073741824.0);
+          g_pw_on = false;
           evict_locked(e.get());
         }
       }
-      g_wbusy = false;
+      g_wbusy--;
     }
     g_cv.notify_all();
     flush_log();  // g_mtx released: a blocked stderr no longer stalls the GPU thread
@@ -823,32 +894,49 @@ static std::shared_ptr<CkEnt> match(const std::vector<int>& prompt, uint64_t see
   return best;
 }
 
+static double secs_since(std::chrono::steady_clock::time_point t) {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
+}
 struct Rd {
   HBuf b;
   bool ok = false;
+  double rd_s = 0, sum_s = 0;  // file read, checksum
 };
 // Read + verify one page / MTP section file (runs on a prefetch thread).
 static Rd read_page(const std::string& name, bool mtp, uint64_t key, uint64_t parent,
                     int nl, int kvb, int has_ik, const int* toks, int look) {
   Rd r;
   const size_t len = sizeof(ChHdr) + (size_t)nl * page_layer_b(kvb, has_ik);
-  if (!read_file(path_of(name), r.b, len)) return r;
+  auto t = std::chrono::steady_clock::now();
+  const bool got = read_file(path_of(name), r.b, len);
+  r.rd_s = secs_since(t);
+  if (!got) return r;
   ChHdr h;
   memcpy(&h, r.b.data(), sizeof h);
+  t = std::chrono::steady_clock::now();
   r.ok = !memcmp(h.magic, mtp ? MAG_M : MAG_C, 8) && h.key == key && h.parent == parent &&
          h.nl == nl && h.kvb == kvb && h.has_ik == has_ik && h.look == look &&
          !memcmp(h.toks, toks, sizeof h.toks) &&
          h.sum == sum64(r.b.data() + sizeof h, len - sizeof h);
+  r.sum_s = secs_since(t);
   return r;
 }
+// Where a restore's time went. Page reads + checksums run on the prefetch
+// thread, overlapped with the device copies; io_wait is the GPU thread's
+// share of them (waiting for the next page).
+struct RsTime {
+  double ck_s = 0, rd_s = 0, sum_s = 0, wait_s = 0, h2d_s = 0;
+  uint64_t bytes = 0;
+};
 
 enum { RS_OK, RS_CKPT, RS_PAGE, RS_OTHER };
 // Pages stream in on a prefetch thread (read + checksum) while the previous
 // one is copied to the device. *bad_page: the trunk page that failed.
 static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& prompt,
-                        bool* mtp_out, uint64_t* bad_page, int* npages) {
+                        bool* mtp_out, uint64_t* bad_page, int* npages, RsTime& tm) {
   const Geo G = geo(m);
   HBuf cb;
+  const auto tc = std::chrono::steady_clock::now();
   if (!read_file(path_of(e.name), cb, 0, (size_t)1 << 40)) return RS_CKPT;
   struct Ret {  // pooled buffer back on every exit
     HBuf& b;
@@ -861,6 +949,8 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
       h.seed != e.seed || h.base != e.base ||
       h.sum != sum64(cb.data() + sizeof h, cb.n - sizeof h))
     return RS_CKPT;
+  tm.ck_s = secs_since(tc);
+  tm.bytes = cb.n;
   const int n = h.n, nc = h.nc, nt = n - nc * KV_PAGE;
   if (n > m.maxctx || h.kvb != G.kvb || h.has_ik != G.has_ik || h.s_b != G.s_b ||
       h.conv_b != G.conv_b || h.ring_b != G.ring_b || h.iraw_b != G.iraw_b ||
@@ -899,38 +989,57 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
                       mt ? chunks[(size_t)i] : ch[(size_t)i], mt ? 1 : G.nqsa, G.kvb,
                       G.has_ik, toks, mt ? prompt[(size_t)(i + 1) * KV_PAGE] : -1);
   };
-  std::future<Rd> fut;
-  if (njobs) fut = job(0);
+  // g_readers pages in flight: a network share is latency bound (one file
+  // at a time used a fraction of the link); pages are consumed in order.
+  std::deque<std::future<Rd>> win;
+  int next = 0;
+  auto refill = [&] {
+    while (next < njobs && (int)win.size() < g_readers) win.push_back(job(next++));
+  };
+  auto drain = [&] {  // early exit: let in-flight reads finish (their buffers die)
+    for (auto& f : win)
+      if (f.valid()) f.wait();
+    win.clear();
+  };
+  refill();
   const size_t lb = page_layer_b(G.kvb, G.has_ik);
   for (int j = 0; j < njobs; j++) {
-    Rd r = fut.get();
-    if (j + 1 < njobs) fut = job(j + 1);
+    const auto tw = std::chrono::steady_clock::now();
+    Rd r = win.front().get();
+    win.pop_front();
+    tm.wait_s += secs_since(tw);
+    tm.rd_s += r.rd_s;
+    tm.sum_s += r.sum_s;
+    if (r.ok) tm.bytes += r.b.n;
+    refill();
     const bool mt = j >= nc;
     const int i = mt ? j - nc : j;
     if (!mt && chunks[(size_t)i] != ch[(size_t)i + 1]) r.ok = false;
     if (!r.ok) {
       buf_put(std::move(r.b));
-      if (fut.valid()) fut.wait();
+      drain();
       if (!mt) {
         *bad_page = chunks[(size_t)i];
         return RS_PAGE;
       }
       want_mtp = false;  // the trunk is complete; only speculation is lost
-      break;
+      break;             // (win was drained above)
     }
     char* q = r.b.data() + sizeof(ChHdr);
     const int l0 = mt ? G.nqsa : 0, nl = mt ? 1 : G.nqsa;
     const int r0 = i * KV_PAGE, k0 = i * KV_PAGE_BLOCKS;
     bool ok = true;
+    const auto th = std::chrono::steady_clock::now();
     for (int l = l0; l < l0 + nl && ok; l++, q += lb)
       ok = xfer(m, true, kv_layer(m, 0, l), q, r0, r0 + KV_PAGE, KV_PAGE, G.row_b) &&
            xfer(m, true, kv_layer(m, 1, l), q + (size_t)KV_PAGE * G.row_b, r0,
                 r0 + KV_PAGE, KV_PAGE, G.row_b) &&
            (!G.has_ik || xfer(m, true, ik_layer(m, l), q + 2 * (size_t)KV_PAGE * G.row_b,
                               k0, k0 + KV_PAGE_BLOCKS, KV_PAGE_BLOCKS, 512));
+    tm.h2d_s += secs_since(th);
     buf_put(std::move(r.b));
     if (!ok) {
-      if (fut.valid()) fut.wait();
+      drain();
       return RS_OTHER;
     }
   }
@@ -938,6 +1047,12 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
   // checkpoint: GDN/PLE/indexer state, then the partial page of every layer
   char* src = (char*)p;
   bool ok = true;
+  const auto th = std::chrono::steady_clock::now();
+  struct Lap {  // checkpoint H2D, every exit below
+    RsTime& t;
+    std::chrono::steady_clock::time_point t0;
+    ~Lap() { t.h2d_s += secs_since(t0); }
+  } lap{tm, th};
   auto blob = [&](void* d, size_t sz, bool use) {
     if (ok && use) ok = h2d(d, src, sz);
     src += sz;
@@ -1017,7 +1132,8 @@ static bool restore(GpuModel& m, const std::shared_ptr<CkEnt>& e,
   const auto t0 = std::chrono::steady_clock::now();
   uint64_t bad = 0;
   int npages = 0;
-  const int rc = restore_body(m, *e, prompt, mtp_out, &bad, &npages);
+  RsTime tm;
+  const int rc = restore_body(m, *e, prompt, mtp_out, &bad, &npages, tm);
   {
     std::lock_guard<std::mutex> lk(g_mtx);
     e->busy--;
@@ -1044,8 +1160,14 @@ static bool restore(GpuModel& m, const std::shared_ptr<CkEnt>& e,
     return false;
   }
   hist.assign(prompt.begin(), prompt.begin() + e->n);
-  fprintf(stderr, "%s kvsnap: restored %d tokens from %s in %.2fs (%d pages)%s\n",
-          log_ts(), e->n, e->name.c_str(), s, npages, *mtp_out ? " (mtp live)" : "");
+  // ckpt = checkpoint read + verify; pages read/verify on the prefetch thread;
+  // io wait = GPU thread waiting for pages; device = H2D + derived-state rebuild
+  fprintf(stderr,
+          "%s kvsnap: restored %d tokens from %s in %.2fs (%d pages, %.0f MB, %s IO: "
+          "ckpt %.2fs, pages read %.2fs + verify %.2fs, io wait %.2fs, device %.2fs)%s\n",
+          log_ts(), e->n, e->name.c_str(), s, npages, tm.bytes / 1048576.0,
+          g_direct.load() ? "direct" : "buffered", tm.ck_s, tm.rd_s, tm.sum_s, tm.wait_s,
+          tm.h2d_s, *mtp_out ? " (mtp live)" : "");
   return true;
 }
 
@@ -1074,6 +1196,14 @@ static uint64_t fingerprint(const GpuModel& m) {
 static bool ends_with(const std::string& s, const char* suf) {
   const size_t k = strlen(suf);
   return s.size() >= k && !s.compare(s.size() - k, k, suf);
+}
+// A name this cache writes (c_*.kvc, m_*.kvm, k_*.kck). Startup cleanup only
+// ever touches these, their tmp_ temporaries and pre-A4 s_* snapshot
+// directories, so a cache dir that is shared with other files is safe.
+static bool own_name(const std::string& fn) {
+  return (!fn.rfind("c_", 0) && ends_with(fn, ".kvc")) ||
+         (!fn.rfind("m_", 0) && ends_with(fn, ".kvm")) ||
+         (!fn.rfind("k_", 0) && ends_with(fn, ".kck"));
 }
 static std::shared_ptr<CkEnt> load_ck(const std::string& fn) {
   CkHdr h;
@@ -1119,6 +1249,10 @@ static void init(GpuModel& m, Cfg& cfg) {
   g_dir = cfg.dir;
   g_cap = cfg.cap_bytes;
   g_qcap = cfg.queue_bytes;
+  const bool remote = os_path_is_remote(cfg.dir.c_str());
+  g_readers = std::max(1, std::min(cfg.readers, 32));
+  g_writers = std::max(1, std::min(cfg.writers > 0 ? cfg.writers : remote ? 4 : 1, 32));
+  g_direct = cfg.direct;
   g_fp = fingerprint(m);
   g_vis_id = g_vision_file.empty() ? 0 : file_id(g_vision_file);
   std::vector<std::shared_ptr<CkEnt>> cks;
@@ -1129,8 +1263,9 @@ static void init(GpuModel& m, Cfg& cfg) {
     std::error_code e2;
     const std::string fn = pth.filename().string();
     if (!fn.rfind("tmp_", 0)) {
-      fs::remove_all(pth, e2);
-    } else if (!fn.rfind("s_", 0) && fs::is_directory(pth, e2)) {
+      if (own_name(fn.substr(4)) && fs::is_regular_file(pth, e2)) fs::remove(pth, e2);
+    } else if (!fn.rfind("s_", 0) && fs::is_directory(pth, e2) &&
+               fs::is_regular_file(pth / "meta", e2)) {
       fs::remove_all(pth, e2);  // KVS1-3 whole-state snapshots
       legacy++;
     } else if ((!fn.rfind("c_", 0) && ends_with(fn, ".kvc")) ||
@@ -1201,11 +1336,12 @@ static void init(GpuModel& m, Cfg& cfg) {
     fprintf(stderr, "kvsnap: removed %zu unusable and %zu unreferenced files\n", bad,
             orphans);
   fprintf(stderr, "kvsnap: index %zu checkpoints, %zu pages, %zu mtp sections, %.2f GB "
-          "(cap %.1f GB, queue %.0f MB)\n",
+          "(cap %.1f GB, queue %.0f MB, %s, %d readers, %d writers)\n",
           g_ck.size(), g_ch.size(), g_mt.size(), g_total / 1073741824.0,
-          g_cap / 1073741824.0, g_qcap / 1048576.0);
+          g_cap / 1073741824.0, g_qcap / 1048576.0, remote ? "network" : "local",
+          g_readers, g_writers);
   g_on = true;
-  std::thread(writer).detach();
+  for (int i = 0; i < g_writers; i++) std::thread(writer).detach();
 }
 
 }  // namespace kvsnap
@@ -3660,9 +3796,13 @@ static int run(GpuModel& m, const std::string& host, int port) {
   if (const char* v = getenv("QWENOX_KVSNAP_MIN")) kvs.min_tokens = (size_t)atol(v);
   if (const char* v = getenv("QWENOX_KVSNAP_QUEUE_MB"))
     kvs.queue_bytes = (uint64_t)std::max(64.0, atof(v)) << 20;
+  if (const char* v = getenv("QWENOX_KVSNAP_DIRECT")) kvs.direct = strcmp(v, "0") != 0;
+  if (const char* v = getenv("QWENOX_KVSNAP_READERS")) kvs.readers = atoi(v);
+  if (const char* v = getenv("QWENOX_KVSNAP_WRITERS")) kvs.writers = atoi(v);
   if (!kvs.dir.empty()) {
-    fprintf(stderr, "kvsnap: dir %s, cap %.1f GB, min %zu tokens\n",
-            kvs.dir.c_str(), kvs.cap_bytes / 1073741824.0, kvs.min_tokens);
+    fprintf(stderr, "kvsnap: dir %s, cap %.1f GB, min %zu tokens, %s IO\n",
+            kvs.dir.c_str(), kvs.cap_bytes / 1073741824.0, kvs.min_tokens,
+            kvs.direct ? "direct" : "buffered");
     kvsnap::init(m, kvs);  // may disable it (dir unusable)
   }
   for (;;) {

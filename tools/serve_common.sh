@@ -143,6 +143,8 @@ serve_run() {
   # 的存在性（设 0 也会开），故 0 时必须不导出。
   if (( PLE_URING )); then export QWENOX_PLE_URING=1; fi
   export QWENOX_KVSNAP_MAX_GB="$KVSNAP_MAX_GB"
+  # KVSNAP_DIR 留空时不动 QWENOX_KVSNAP_DIR（引擎默认 data/kvsnap，外部指定照常生效）
+  if [[ -n "${KVSNAP_DIR:-}" ]]; then export QWENOX_KVSNAP_DIR="${KVSNAP_DIR%/}/qwenox-kvsnap"; fi
   export QWENOX_RCKPT_MAX="$RCKPT_MAX"
   # 分页 KV（A5 起默认开启）。引擎按 atoi 解析，0 即关闭；这里仍然只在开启时导出，
   # 并清掉外部环境里可能残留的值，保证 service.conf 说了算。

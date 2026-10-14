@@ -41,6 +41,73 @@ static inline void* os_map_ro(const char* path, size_t len) {
   return p == MAP_FAILED ? nullptr : p;
 }
 static inline void os_unmap_ro(void* p, size_t len) { munmap(p, len); }
+
+// A directory on a network file system (NFS/SMB/CIFS/9P/Ceph/FUSE): kvsnap
+// writes it with several threads (per-file round trips dominate there).
+static inline bool os_path_is_remote(const char* path) {
+  struct statfs sf;
+  if (statfs(path, &sf)) return false;
+  switch ((unsigned long)sf.f_type) {
+    case 0x6969UL:      // NFS
+    case 0x517BUL:      // SMB
+    case 0xFF534D42UL:  // CIFS
+    case 0xFE534D42UL:  // SMB2
+    case 0x01021997UL:  // 9P
+    case 0x00C36400UL:  // Ceph
+    case 0x65735546UL:  // FUSE (sshfs, rclone, ...)
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Direct (page-cache bypassing) whole-file IO, kvsnap. The buffer must be
+// OS_DIO_ALIGN-aligned with room for n rounded up to OS_DIO_ALIGN: writes
+// send the padded length and cut the file back to n, reads ask for it and
+// stop at EOF. Returns 1 ok, 0 IO error, -1 direct IO not supported here
+// (the caller falls back to buffered IO).
+static const size_t OS_DIO_ALIGN = 4096;
+static inline size_t os_dio_round(size_t n) { return (n + OS_DIO_ALIGN - 1) & ~(OS_DIO_ALIGN - 1); }
+static inline int os_write_direct(const char* path, const char* p, size_t n) {
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT | O_CLOEXEC, 0644);
+  if (fd < 0) return errno == EINVAL ? -1 : 0;
+  const size_t cap = os_dio_round(n);
+  size_t off = 0;
+  int rc = 1;
+  while (off < cap) {
+    const size_t want = cap - off < ((size_t)1 << 30) ? cap - off : (size_t)1 << 30;
+    const ssize_t w = pwrite(fd, p + off, want, (off_t)off);
+    if (w <= 0) {
+      rc = w < 0 && errno == EINVAL && off == 0 ? -1 : 0;
+      break;
+    }
+    off += (size_t)w;
+  }
+  if (rc == 1 && (ftruncate(fd, (off_t)n) || fdatasync(fd))) rc = 0;
+  if (close(fd)) rc = 0;
+  return rc;
+}
+// Whole file of exactly n bytes (0 if its size differs).
+static inline int os_read_direct(const char* path, char* p, size_t n) {
+  int fd = open(path, O_RDONLY | O_DIRECT | O_CLOEXEC);
+  if (fd < 0) return errno == EINVAL ? -1 : 0;
+  struct stat sb;
+  int rc = !fstat(fd, &sb) && (uint64_t)sb.st_size == n ? 1 : 0;
+  const size_t cap = os_dio_round(n);
+  size_t off = 0;
+  while (rc == 1 && off < n) {
+    const size_t want = cap - off < ((size_t)1 << 30) ? cap - off : (size_t)1 << 30;
+    const ssize_t r = pread(fd, p + off, want, (off_t)off);
+    if (r <= 0) {
+      rc = r < 0 && errno == EINVAL && off == 0 ? -1 : 0;
+      break;
+    }
+    off += (size_t)r;
+    if (off < n && (off & (OS_DIO_ALIGN - 1))) rc = 0;  // short read mid-file
+  }
+  close(fd);
+  return rc;
+}
 #endif
 
 static inline void sock_rcvtimeo(sockfd_t fd, int sec) {

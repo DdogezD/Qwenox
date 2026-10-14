@@ -131,6 +131,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <linux/io_uring.h>
