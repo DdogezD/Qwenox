@@ -636,6 +636,88 @@ __global__ __launch_bounds__(256) void k_ht_deq_bf16(const uint8_t* __restrict__
   }
 }
 
+// Same arithmetic as k_ht_deq_bf16 (bit-identical), half the LDS (32 KiB ->
+// 2x resident blocks): decoded codes are exactly f16, so they are staged as
+// f16; the column FWHT results stay in registers (16 columns x 128 rows per
+// wave) and reach the row pass through a 64-row fp32 half tile, twice.
+__global__ __launch_bounds__(256) void k_ht_deq_bf16_h(const uint8_t* __restrict__ codes,
+                                                       const float* __restrict__ suh,
+                                                       const float* __restrict__ svh,
+                                                       uint16_t* __restrict__ out, int K) {
+  __shared__ __attribute__((aligned(16))) float tt[64 * 128];  // 32 KiB, also the f16 stage
+  __half* t16 = reinterpret_cast<__half*>(tt);                 // [128][128] f16
+  const int ntx = K >> 7;
+  const int tile = blockIdx.x, ty = tile / ntx, tx = tile - ty * ntx;
+  const uint8_t* tb = codes + (size_t)tile * 8192;
+  const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+  const int prev_lane = (lane + 31) & 31;
+  // f16 stage swizzle: element (r, c) at r*128 + (c ^ 2(r&31)); a column read
+  // across 32 lanes (rows) hits 32 distinct 4 B words.
+  for (int it = 0; it < 8; it++) {
+    const int blk = it * 8 + w, g = blk >> 3, q = blk & 7;
+    const uint32_t cur = *(const uint32_t*)(tb + g * 1024 + q * 128 + lane * 4);
+    const uint32_t prev = __shfl(cur, prev_lane, 32);
+    const int r = q * 16 + (lane & 15);
+    const int c0 = g * 16 + (lane >> 4) * 8;
+    const int sw = 2 * (r & 31);
+#pragma unroll
+    for (int e = 0; e < 8; e += 2) {
+      const __half h0 = __float2half(
+          hv2::ht_val(__builtin_amdgcn_alignbit(prev, cur, 28 - 4 * e) & 0xffffu));
+      const __half h1 = __float2half(
+          hv2::ht_val(__builtin_amdgcn_alignbit(prev, cur, 28 - 4 * (e + 1)) & 0xffffu));
+      const uint32_t pk = (uint32_t)__half_as_ushort(h0) | ((uint32_t)__half_as_ushort(h1) << 16);
+      *(uint32_t*)(t16 + r * 128 + ((c0 + e) ^ sw)) = pk;
+    }
+  }
+  __syncthreads();
+  float cv[16][4];  // column pass results: cv[cc][j] = (row j*32+lane, col w*16+cc)
+#pragma unroll
+  for (int cc = 0; cc < 16; cc++) {
+    const int c = w * 16 + cc;
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const int r = j * 32 + lane;
+      cv[cc][j] = __half2float(t16[r * 128 + (c ^ (2 * (r & 31)))]);
+    }
+    hv2::fwht128(cv[cc][0], cv[cc][1], cv[cc][2], cv[cc][3], lane);
+  }
+  float su[4];
+#pragma unroll
+  for (int j = 0; j < 4; j++) su[j] = suh[tx * 128 + j * 32 + lane];
+#pragma unroll
+  for (int h = 0; h < 2; h++) {
+    __syncthreads();  // previous readers of tt (f16 stage / last half) are done
+#pragma unroll
+    for (int cc = 0; cc < 16; cc++) {
+      const int c = w * 16 + cc;
+#pragma unroll
+      for (int jj = 0; jj < 2; jj++) {
+        const int rl = jj * 32 + lane;  // local row in this half; global row h*64+rl
+        tt[rl * 128 + (c ^ (rl & 31))] = cv[cc][2 * h + jj];
+      }
+    }
+    __syncthreads();
+    for (int rr = 0; rr < 8; rr++) {
+      const int rl = w * 8 + rr, r = h * 64 + rl;
+      float v[4];
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const int c = j * 32 + lane;
+        v[j] = tt[rl * 128 + (c ^ (rl & 31))];
+      }
+      hv2::fwht128(v[0], v[1], v[2], v[3], lane);
+      const int R = ty * 128 + r;
+      const float sv = svh[R] * (1.f / 128.f);
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const int C = tx * 128 + j * 32 + lane;
+        out[(size_t)R * K + C] = f2bf(v[j] * sv * su[j]);
+      }
+    }
+  }
+}
+
 // --- q6g64 (dtype 24) --------------------------------------------------------
 // Row r at r * st (st = align16(13 C / 16)): C/2 B low nibbles (even col =
 // low), C/4 B high-2-bit plane (byte k/4, bits 2(k%4)), C/64 x (f16 scale,
@@ -992,6 +1074,42 @@ __global__ void k_q6g64_deq_bf16(const uint8_t* __restrict__ wq, uint16_t* __res
     }
     *(uint4*)(o + i8 * 8) = make_uint4(pk[0], pk[1], pk[2], pk[3]);
   }
+}
+
+// QWENOX_DEQ_BENCH: count differing 32-bit words between two buffers.
+__global__ void k_u32_mismatch(const uint32_t* __restrict__ a, const uint32_t* __restrict__ b,
+                               size_t n, unsigned long long* cnt) {
+  unsigned long long c = 0;
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (size_t)gridDim.x * blockDim.x)
+    c += a[i] != b[i];
+  if (c) atomicAdd(cnt, c);
+}
+
+// One thread per 8 columns (same arithmetic, bit-identical): adjacent lanes
+// read adjacent code bytes and write adjacent 16 B, instead of each lane
+// walking its own 128 B group.
+__global__ void k_q6g64_deq_bf16_c8(const uint8_t* __restrict__ wq, uint16_t* __restrict__ out,
+                                    int R, int C, int st) {
+  const int n8 = C >> 3;
+  const size_t gi = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (gi >= (size_t)R * n8) return;
+  const int r = (int)(gi / n8), k8 = (int)(gi % n8), g = k8 >> 3, i8 = k8 & 7;
+  const uint8_t* row = wq + (size_t)r * st;
+  const uint32_t lw = *(const uint32_t*)(row + g * 32 + i8 * 4);
+  const uint32_t hw = (uint32_t)*(const uint16_t*)(row + C / 2 + g * 16 + i8 * 2);
+  const uint32_t sb = *(const uint32_t*)(row + 3 * C / 4 + g * 4);
+  const float sc = __half2float(__ushort_as_half((unsigned short)(sb & 0xffffu)));
+  const float bi = __half2float(__ushort_as_half((unsigned short)(sb >> 16)));
+  uint32_t pk[4];
+#pragma unroll
+  for (int e = 0; e < 8; e += 2) {
+    const uint32_t c0 = ((lw >> (4 * e)) & 15u) | (((hw >> (2 * e)) & 3u) << 4);
+    const uint32_t c1 = ((lw >> (4 * (e + 1))) & 15u) | (((hw >> (2 * (e + 1))) & 3u) << 4);
+    pk[e / 2] = (uint32_t)f2bf(fmaf((float)c0, sc, bi)) |
+                ((uint32_t)f2bf(fmaf((float)c1, sc, bi)) << 16);
+  }
+  *(uint4*)(out + (size_t)r * C + (size_t)k8 * 8) = make_uint4(pk[0], pk[1], pk[2], pk[3]);
 }
 
 // --- k_q8g32_wmma: row-invariant WMMA q8g32 GEMV (GGUF Q8_0 dense, 10-13) ----

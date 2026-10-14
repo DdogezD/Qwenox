@@ -110,6 +110,180 @@ struct GpuModel {
     const char* v = getenv(k);
     return v && v[0] == '0' && v[1] == 0;
   }
+  // ---- dense dequant look-ahead (dpf, 10-14) ----------------------------------
+  // Prefill GEMMs read the dense weights as bf16. gemm_wbf16 used to dequantize
+  // each weight into d_wbf16 right before its GEMM, serialized on g_str (a
+  // per-chunk fixed cost: 15.7 us/tok at chunk 4096, 7.9 at 8192). dpf
+  // dequantizes the whole of layer l+1 on a side stream into one of two slots
+  // while layer l computes; gemm_wbf16 then returns the slot copy. Same
+  // dequant kernels and bytes -> bit-identical. Events: side waits dpf_free_[s]
+  // (g_str past the slot's previous layer) before writing slot s; g_str waits
+  // dpf_ready_[s] before the layer that reads it. QWENOX_DEQ_AHEAD=0 = off.
+  const uint16_t* wpre_override_ = nullptr;  // one-shot gemm_wbf16 result
+  bool se_merge_active_ = false;
+  // Shared expert gate + up as ONE N=1280 GEMM into the [P][1280] gate|up
+  // layout k_silu_mul_g reads (10-14). Only where gemm() would run both N=640
+  // halves on the same k_gemm_wmma 128x128 tile (P >= 1024): per-column K
+  // order is tile-independent, so gate/up/hid are bit-identical to the two
+  // calls. Weights: the two bf16 halves must be adjacent (dpf slot, or both
+  // dequantized into d_wbf16). QWENOX_SE_MERGE=0 = two GEMMs.
+  bool se_gate_up_merged(const WView& g, const WView& u, int P) {
+    static const bool on = !env_zero("QWENOX_SE_MERGE") && getenv("QWENOX_GEMM_WMMA") &&
+                           !getenv("QWENOX_GEMM_RB") && !getenv("QWENOX_GEMM_D9_OLD");
+    if (!on || P < 1024 || g.dtype == 0 || g.dtype != u.dtype || g.rows != 640 ||
+        u.rows != 640 || g.cols != 2560 || u.cols != 2560)
+      return false;
+    const size_t half = (size_t)640 * 2560;
+    const uint16_t* gp = dpf_lookup(g);
+    if (gp) {
+      if (dpf_lookup(u) != gp + half) return false;
+    } else {
+      dpf_deq(g, d_wbf16, g_str);
+      dpf_deq(u, d_wbf16 + half, g_str);
+      gp = d_wbf16;
+    }
+    WView m = g;
+    m.rows = 1280;
+    wpre_override_ = gp;
+    se_merge_active_ = true;
+    gemm(m, d_xb, d_guvb, P);
+    se_merge_active_ = false;
+    wpre_override_ = nullptr;
+    return true;
+  }
+  struct DpfW {
+    WView w;
+    size_t off;  // bytes into the slot
+  };
+  std::vector<std::vector<DpfW>> dpf_list_;                      // per layer
+  std::unordered_map<const uint8_t*, std::pair<int, size_t>> dpf_idx_;  // data -> (layer, off)
+  uint8_t* dpf_slot_[2] = {nullptr, nullptr};
+  int dpf_slot_layer_[2] = {-1, -1};
+  hipStream_t dpf_st_ = nullptr;
+  hipEvent_t dpf_free_[2] = {}, dpf_ready_[2] = {};
+  int dpf_cur_ = -1;     // layer whose slot gemm_wbf16 may read (main waited its ready event)
+  bool dpf_busy_ = false;  // a chunk's pipeline owns the slots (nested borrower chunks skip dpf)
+  size_t dpf_bytes_ = 0;   // slot size
+  // Measured 10-14 (Windows, v2, 64K): ON is SLOWER -- c4096 1522 -> 1488,
+  // c8192 1603 -> 1524, single-chunk 8K 1430 -> 1359, 2K 1241 -> 1205: the
+  // side-stream dequant kernels steal CUs / bandwidth from the main GEMMs
+  // (same finding as gufo's side-stream overlap). Opt-in QWENOX_DEQ_AHEAD=1.
+  static bool dpf_env() {
+    static const bool on = getenv("QWENOX_DEQ_AHEAD") && !env_zero("QWENOX_DEQ_AHEAD");
+    return on;
+  }
+  static int dpf_minp() {
+    static const int v = [] {
+      const char* e = getenv("QWENOX_DEQ_AHEAD_MINP");
+      return e && *e ? atoi(e) : 64;
+    }();
+    return v;
+  }
+  static bool dpf_dtype(int dt) { return dt == 5 || dt == 7 || dt == 8 || dt == 16 || dt == 24; }
+  // Build the per-layer lists (call once ckpt is loaded); returns slot bytes.
+  size_t dpf_plan() {
+    dpf_list_.assign(g_cfg.layers, {});
+    dpf_idx_.clear();
+    std::vector<std::pair<std::string, const Tensor*>> ts;
+    for (const auto& kv : ckpt.tensors()) {
+      const Tensor& t = kv.second;
+      if (!dpf_dtype((int)t.dtype)) continue;
+      if (kv.first.rfind("layers.", 0) != 0) continue;
+      ts.emplace_back(kv.first, &t);
+    }
+    std::sort(ts.begin(), ts.end());
+    size_t mx = 0;
+    std::vector<size_t> used(g_cfg.layers, 0);
+    for (const auto& e : ts) {
+      const int l = atoi(e.first.c_str() + 7);
+      if (l < 0 || l >= g_cfg.layers) continue;
+      const WView w = wview(*e.second);
+      const size_t b = (size_t)w.rows * w.cols * 2;
+      if (b > ((size_t)64 << 20) || w.rows < 2) continue;  // gemm_wbf16 would throw / gemv rows
+      dpf_list_[l].push_back({w, used[l]});
+      dpf_idx_[w.data] = {l, used[l]};
+      used[l] += (b + 255) & ~(size_t)255;
+      mx = std::max(mx, used[l]);
+    }
+    return mx;
+  }
+  // dequant w into out on stream st (same kernels as gemm_wbf16).
+  static void dpf_deq(const WView& w, uint16_t* out, hipStream_t st) {
+    const uint64_t N = w.rows, K = w.cols;
+    if (w.dtype == 5) {
+      const uint64_t tot = N * K / 32;
+      k_dequant_q4cp_bf16<<<(unsigned)((tot + 255) / 256), 256, 0, st>>>(
+          w.data + 64, w.data + 64 + N * K / 2, (const float*)w.data, out, N, K, w.scale_stride);
+    } else if (w.dtype == 7) {
+      const uint64_t tot = N * K / 64;
+      k_dequant_q8g64_bf16<<<(unsigned)((tot + 255) / 256), 256, 0, st>>>(w.data, out, N, K);
+    } else if (w.dtype == 8) {
+      const uint64_t tot = N * K / 32;
+      k_dequant_q8g32_bf16<<<(unsigned)((tot + 255) / 256), 256, 0, st>>>(
+          (const int8_t*)w.data, (const __half*)(w.data + N * K), out, N, K);
+    } else {
+      v2_deq_bf16(w, out, st);
+    }
+  }
+  void dpf_issue(int l) {
+    if (l < 0 || l >= g_cfg.layers || dpf_list_[l].empty()) return;
+    const int s = l & 1;
+    CK(hipEventRecord(dpf_free_[s], g_str));  // g_str is past every earlier reader of slot s
+    CK(hipStreamWaitEvent(dpf_st_, dpf_free_[s], 0));
+    for (const DpfW& e : dpf_list_[l]) dpf_deq(e.w, (uint16_t*)(dpf_slot_[s] + e.off), dpf_st_);
+    CK(hipEventRecord(dpf_ready_[s], dpf_st_));
+    dpf_slot_layer_[s] = l;
+  }
+  void dpf_begin(int l) {
+    const int s = l & 1;
+    if (l < 0 || l >= g_cfg.layers || dpf_slot_layer_[s] != l) {
+      dpf_cur_ = -1;
+      return;
+    }
+    CK(hipStreamWaitEvent(g_str, dpf_ready_[s], 0));
+    dpf_cur_ = l;
+  }
+  const uint16_t* dpf_lookup(const WView& w) const {
+    if (dpf_cur_ < 0) return nullptr;
+    auto it = dpf_idx_.find(w.data);
+    if (it == dpf_idx_.end() || it->second.first != dpf_cur_) return nullptr;
+    return (const uint16_t*)(dpf_slot_[dpf_cur_ & 1] + it->second.second);
+  }
+  struct DpfScope {  // owns the slots for one prefill chunk's layer loop
+    GpuModel& m;
+    bool on;
+    DpfScope(GpuModel& mm, int P) : m(mm) {
+      on = m.dpf_st_ && !m.dpf_busy_ && P >= dpf_minp() && !g_kprof_sync;
+      if (!on) return;
+      m.dpf_busy_ = true;
+      m.dpf_slot_layer_[0] = m.dpf_slot_layer_[1] = -1;
+      m.dpf_issue(0);
+      m.dpf_issue(1);
+    }
+    void layer(int l) {  // call right before enq_layer_b(l)
+      if (!on) return;
+      if (l >= 1) m.dpf_issue(l + 1);
+      m.dpf_begin(l);
+    }
+    void pause() { m.dpf_cur_ = -1; }  // before a borrow / anything outside the layer
+    ~DpfScope() {
+      if (!on) return;
+      m.dpf_cur_ = -1;
+      m.dpf_busy_ = false;
+      // the side stream may still be writing slots: later chunks re-record
+      // free events on g_str, so no extra sync is needed for correctness.
+    }
+  };
+
+  // QWENOX_ABL=moe,deq,gdn,qsa,hc2 — timing-only ablation (skips the named
+  // prefill stage; outputs are garbage). Diagnostic for cost attribution.
+  static bool abl_has(const char* what) {
+    static const std::string abl = [] {
+      const char* e = getenv("QWENOX_ABL");
+      return e ? "," + std::string(e) + "," : std::string();
+    }();
+    return !abl.empty() && abl.find("," + std::string(what) + ",") != std::string::npos;
+  }
   // B3 split-K 门控（d_skx 分配与 gemm() dispatch 共用）：k1 (2560,6144)
   // 在 P>=8192 时把 X 重排成 2 个连续 K=3072 切片跑两次 + slice1 原子加。
   // proto（tools/b3_splitk_proto.cu，logs/b3_splitk3.log）：16K 下
@@ -395,6 +569,8 @@ struct GpuModel {
   GpuMoeRouting moe_routing;
   MoeTile* d_moetiles = nullptr;
   int* d_moentiles = nullptr;
+  MoeTile* d_moetilesA = nullptr;  // hybrid tiling: <=64-slot remainder tiles
+  int* d_moentilesA = nullptr;
   // GGUF routed experts (gg_on()): P == 1 scratch used by the decode graph;
   // batches reuse the prefill workspaces (see moe_gguf).
   __half* d_gg_x16 = nullptr;   // [d] F16 x
@@ -855,6 +1031,31 @@ struct GpuModel {
       // 768 B），gdn/gr 工作区地址敏感（§13.8：P=2048 hc +20 µs/tok 的成因）。
       DALLOC(&d_dlut_tiles, (BP / 64 + 2) * sizeof(MoeTile));
       DALLOC(&d_dlut_nt, sizeof(int));
+      if (!moe_untiled && !moe_ordered) {  // hybrid MoE tiling (WS end: keep the layout above)
+        DALLOC(&d_moetilesA, (size_t)g_cfg.experts * sizeof(MoeTile));
+        DALLOC(&d_moentilesA, sizeof(int));
+      }
+      if (dpf_env()) {  // dense dequant look-ahead slots (WS end, see dpf_*)
+        dpf_bytes_ = dpf_plan();
+        if (dpf_bytes_) {
+          DALLOC(&dpf_slot_[0], dpf_bytes_);
+          DALLOC(&dpf_slot_[1], dpf_bytes_);
+          int lo = 0, hi = 0;
+          CK(hipDeviceGetStreamPriorityRange(&lo, &hi));
+          if (getenv("QWENOX_DPF_LOWPRIO"))
+            CK(hipStreamCreateWithPriority(&dpf_st_, hipStreamNonBlocking, lo));
+          else
+            CK(hipStreamCreateWithFlags(&dpf_st_, hipStreamNonBlocking));
+          fprintf(stderr, "dpf: stream priority range least=%d greatest=%d%s\n", lo, hi,
+                  getenv("QWENOX_DPF_LOWPRIO") ? " (side stream = least)" : "");
+          for (int i = 0; i < 2; i++) {
+            CK(hipEventCreateWithFlags(&dpf_free_[i], hipEventDisableTiming));
+            CK(hipEventCreateWithFlags(&dpf_ready_[i], hipEventDisableTiming));
+          }
+          fprintf(stderr, "dpf: dense dequant look-ahead on, 2 x %.1f MiB slots\n",
+                  dpf_bytes_ / 1048576.0);
+        }
+      }
     }
     int nqsa = g_cfg.layers / 4;  // 12
     kv_nl = nqsa + (mtp_kv_wanted() ? 1 : 0);
@@ -2254,6 +2455,13 @@ struct GpuModel {
   const uint16_t* gemm_wbf16(const WView& w) {
     uint64_t N = w.rows, K = w.cols;
     const uint16_t* wp = nullptr;
+    if (wpre_override_) {  // se_gate_up_merged: caller staged the bf16 weight
+      const uint16_t* p = wpre_override_;
+      wpre_override_ = nullptr;
+      return p;
+    }
+    if (w.dtype != 0)
+      if (const uint16_t* pre = dpf_lookup(w)) return pre;  // dequantized ahead (dpf)
     if (w.dtype == 0) {
       wp = (const uint16_t*)w.data;
     } else if (w.dtype == 5) {
@@ -2288,13 +2496,82 @@ struct GpuModel {
       if (N * K * 2 > ((size_t)64 << 20))
         throw std::runtime_error("gemm: weight too big for d_wbf16");
       KP_SUB("ht_deq");
-      v2_deq_bf16(w, d_wbf16, g_str);
+      if (!abl_has("deq")) v2_deq_bf16(w, d_wbf16, g_str);
       KP_SUB_END();
       wp = d_wbf16;
     } else {
       throw std::runtime_error("gemm: unsupported dtype");
     }
     return wp;
+  }
+
+  // QWENOX_DEQ_BENCH=1 (diagnostic, exits after): time one pass of the
+  // per-chunk prefill dequant over every layer v2 dense weight (ht 16 / q6g64
+  // 24) with the old and the fast kernels, and compare their bytes.
+  int deq_bench() {
+    std::vector<std::pair<std::string, WView>> ws;
+    for (const auto& kv : ckpt.tensors()) {
+      const Tensor& t = kv.second;
+      if (t.dtype != 16 && t.dtype != 24) continue;
+      if (kv.first.rfind("layers.", 0) != 0) continue;
+      const WView w = wview(t);
+      if (w.rows * w.cols * 2 > ((size_t)64 << 20)) continue;
+      ws.emplace_back(kv.first, w);
+    }
+    std::sort(ws.begin(), ws.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    uint16_t* alt = nullptr;
+    unsigned long long* d_cnt = nullptr;
+    CK(hipMalloc(&alt, (size_t)64 << 20));
+    CK(hipMalloc(&d_cnt, sizeof(unsigned long long)));
+    double bytes[2] = {0, 0};  // read+write per dtype class (0 ht, 1 q6g64)
+    int nw[2] = {0, 0};
+    for (auto& e : ws) {
+      const int c = e.second.dtype == 16 ? 0 : 1;
+      const double out = (double)e.second.rows * e.second.cols * 2;
+      const double in = c == 0 ? out / 4 : out * 13 / 32;  // 4 / 6.5 bits per weight
+      bytes[c] += in + out;
+      nw[c]++;
+    }
+    fprintf(stderr, "deq_bench: %d ht (%.2f GB r+w) + %d q6g64 (%.2f GB r+w) weights\n", nw[0],
+            bytes[0] / 1e9, nw[1], bytes[1] / 1e9);
+    const int reps = 5;
+    for (int f = 0; f < 2; f++) {
+      for (int c = 0; c < 2; c++) {
+        auto pass = [&] {
+          for (auto& e : ws)
+            if ((e.second.dtype == 16) == (c == 0)) v2_deq_bf16(e.second, d_wbf16, g_str, f);
+        };
+        pass();
+        CK(hipStreamSynchronize(g_str));
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int r = 0; r < reps; r++) pass();
+        CK(hipStreamSynchronize(g_str));
+        const double ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                .count() / reps;
+        fprintf(stderr, "deq_bench: %s %s  %.1f ms/pass  %.0f GB/s\n", f ? "fast" : "old ",
+                c ? "q6g64" : "ht   ", ms, bytes[c] / ms / 1e6);
+      }
+    }
+    unsigned long long total = 0;
+    int bad = 0;
+    for (auto& e : ws) {
+      v2_deq_bf16(e.second, d_wbf16, g_str, 0);
+      v2_deq_bf16(e.second, alt, g_str, 1);
+      CK(hipMemsetAsync(d_cnt, 0, sizeof(unsigned long long), g_str));
+      const size_t n = e.second.rows * e.second.cols / 2;
+      k_u32_mismatch<<<1024, 256, 0, g_str>>>((const uint32_t*)d_wbf16, (const uint32_t*)alt, n,
+                                              d_cnt);
+      unsigned long long h = 0;
+      CK(hipMemcpy(&h, d_cnt, sizeof h, hipMemcpyDeviceToHost));
+      if (h && bad++ < 5) fprintf(stderr, "deq_bench: MISMATCH %s: %llu words\n", e.first.c_str(), h);
+      total += h;
+    }
+    fprintf(stderr, "deq_bench: compare %zu weights, %llu differing words -> %s\n", ws.size(),
+            total, total ? "FAIL" : "PASS");
+    CK(hipFree(alt));
+    CK(hipFree(d_cnt));
+    return total ? 1 : 0;
   }
 
   void gemm(const WView& w, const float* x, float* y, int P, uint64_t xstride = 0,
@@ -2516,7 +2793,8 @@ struct GpuModel {
       // aggr: N=640 (shared gate/up, indexer proj; was hipBLASLt ~1.7 ms @16K)
       // and N=512 join the 128x128 tile route (1.33 / 1.06 ms @16K).
       const bool gw_d9 = (K == 2560 && (N == 6144 || N == 10240 || N == 12288 ||
-                                        (!d9_old0 && (N == 640 || N == 512))));
+                                        (!d9_old0 && (N == 640 || N == 512)) ||
+                                        (N == 1280 && se_merge_active_)));
       const bool gw_d9n = !gw_d9 && ((N == 10240 && K == 320) ||
                                      (N == 512 && K == 2560) || (N == 2560 && K == 640));
       if (gw_d3 || gw_d9 || gw_d9n) {
@@ -2555,6 +2833,23 @@ struct GpuModel {
     uint64_t key = (N << 40) ^ (K << 20) ^ (uint64_t)P;
     auto it = lt_algos.find(key);
     if (it == lt_algos.end()) {
+      // QWENOX_LT_MISS_LOG=1: host time spent on this miss (heuristic + the
+      // validation run's stream sync), to size the per-new-P serving cost.
+      static const bool lt_miss_log = getenv("QWENOX_LT_MISS_LOG") != nullptr;
+      const auto lt_m0 = std::chrono::steady_clock::now();
+      struct LtMissLog {
+        bool on;
+        std::chrono::steady_clock::time_point t0;
+        uint64_t N, K;
+        int P;
+        ~LtMissLog() {
+          if (on)
+            fprintf(stderr, "lt_miss N=%llu K=%llu P=%d %.2f ms\n", (unsigned long long)N,
+                    (unsigned long long)K, P,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                        .count());
+        }
+      } lt_ml{lt_miss_log, lt_m0, N, K, P};
       LtEntry e;
       hipblasLtMatmulDescCreate(&e.opd, HIPBLAS_COMPUTE_32F, HIP_R_32F);
       hipblasOperation_t opT = HIPBLAS_OP_T, opN = HIPBLAS_OP_N;
@@ -5164,8 +5459,25 @@ struct GpuModel {
       // 每专家 slot 数 >= 80 设门槛，小 P（tail chunk / 短 prompt）走原路径。
       static const bool moe_mt_env = !env_zero("QWENOX_MOE_MT");
       const bool mt = moe_mt_env && (int64_t)P * k >= 80 * E;
-      k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E, mt ? 128 : 64);
-      const int max_tiles = mt ? (P * k + 127) / 128 + E : (P * k + 63) / 64 + E;
+      // Hybrid tiling (10-14, default on, QWENOX_MOE_HYB=0 = the mt/64 rule
+      // above): full 128-slot super-tiles on the BN=128 kernels + one <=64-slot
+      // remainder per expert on the BN=64 kernels. Bit-identical to both other
+      // tilings (same per-(slot,row) K order). moe_var L20 harness, Windows:
+      // up/down per token vs production P=2048 2.94/1.58 -> 2.93/1.53 us,
+      // 4096 2.56/1.25 -> 2.47/1.26, 8192 2.30/1.14 -> 2.26/1.13.
+      static const bool moe_hyb_env = !env_zero("QWENOX_MOE_HYB") && d_moetilesA;
+      const bool hyb = moe_hyb_env && !vseg;
+      int max_tiles;
+      if (hyb) {
+        k_moe_tiles_hyb<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, d_moetilesA,
+                                              d_moentilesA, E);
+        // B tiles hold > 64 slots each (or are full 128s): <= P*k/65 of them
+        max_tiles = std::min((P * k) / 65 + 1, (P * k + 127) / 128 + E);
+      } else {
+        k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E, mt ? 128 : 64);
+        max_tiles = mt ? (P * k + 127) / 128 + E : (P * k + 63) / 64 + E;
+      }
+      const int max_tiles_a = std::min(E, P * k);
       __half* x16 = (__half*)d_xbf16b;
       __half* hid = (__half*)d_hidb;
       KP("moe:rot_in");
@@ -5173,7 +5485,12 @@ struct GpuModel {
       KP("moe:up");
       // up + mid fused (方向 3): hid = fwht(silu(g)*u*suh) 直接落盘，
       // 省掉 guv16 的写读往返和 k_i4r_mid 那次 launch，数学逐位一致。
-      if (mt)
+      if (hyb) {
+        moe_lut_up_mid_mt(pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, hid, gu.svh,
+                          dn.suh, mid, d, g_str);
+        moe_lut_up_mid(pgu, x16, d_tokidx, d_moetilesA, d_moentilesA, max_tiles_a, hid, gu.svh,
+                       dn.suh, mid, d, g_str);
+      } else if (mt)
         moe_lut_up_mid_mt(pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, hid, gu.svh,
                           dn.suh, mid, d, g_str);
       else
@@ -5187,7 +5504,12 @@ struct GpuModel {
       // mean_kld 0.106993(关) → 0.107705(开)，门槛 0.10699+0.002=0.10899 过线，
       // 默认开；QWENOX_V2_PAIRS_F16=0 回退 fp32 pairs。
       static const bool pairs_f16 = !env_zero("QWENOX_V2_PAIRS_F16");
-      if (mt)
+      if (hyb) {
+        moe_lut_down_mt(pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d, mid, g_str,
+                        pairs_f16);
+        moe_lut_down(moelut::kI4R, pdn, hid, d_moetilesA, d_moentilesA, max_tiles_a, d_guvb, d,
+                     mid, g_str, pairs_f16);
+      } else if (mt)
         moe_lut_down_mt(pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d, mid, g_str,
                         pairs_f16);
       else
@@ -5195,6 +5517,131 @@ struct GpuModel {
                      g_str, pairs_f16);
       KP("moe:reduce");
       const unsigned waves = (unsigned)P * (d / 128);
+      static const int moe_rep = [] {  // diagnostic: QWENOX_MOE_REP=<layer>
+        const char* e = getenv("QWENOX_MOE_REP");
+        return e && *e ? atoi(e) : -1;
+      }();
+      if (l == moe_rep && !vseg) {
+        auto tm = [&](const char* what, auto&& fn) {
+          CK(hipStreamSynchronize(g_str));
+          const auto t0 = std::chrono::steady_clock::now();
+          for (int r = 0; r < 10; r++) fn();
+          CK(hipStreamSynchronize(g_str));
+          const double ms =
+              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                  .count() / 10;
+          fprintf(stderr, " %s %.3f ms (%.2f us/tok)", what, ms, ms * 1000 / P);
+        };
+        std::vector<int> eo(E + 1);
+        int nt = 0;
+        CK(hipMemcpy(eo.data(), d_eoff, (E + 1) * 4, hipMemcpyDeviceToHost));
+        CK(hipMemcpy(&nt, d_moentiles, 4, hipMemcpyDeviceToHost));
+        int mx = 0, used = 0;
+        for (int e = 0; e < E; e++) {
+          mx = std::max(mx, eo[e + 1] - eo[e]);
+          used += eo[e + 1] > eo[e];
+        }
+        fprintf(stderr, "moe_rep L%d P=%d mt=%d tiles=%d/%d experts_used=%d max_rows=%d:", l, P,
+                (int)mt, nt, max_tiles, used, mx);
+        tm("shared", [&] { moe_b_shared_ey(l, P); });
+        tm("route", [&] {
+          moe_routing.run(d_topidsb, d_topwb, d_tokidx, d_pweight, d_eoff, d_pairids, P, k, E);
+          k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E, mt ? 128 : 64);
+        });
+        tm("rot_in", [&] { v2_rot(d_xb, d, x16, d, gu.suh, nullptr, d, P, true); });
+        tm("up", [&] {
+          if (mt)
+            moe_lut_up_mid_mt(pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, hid,
+                              gu.svh, dn.suh, mid, d, g_str);
+          else
+            moe_lut_up_mid(pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, hid, gu.svh,
+                           dn.suh, mid, d, g_str);
+        });
+        tm("down", [&] {
+          if (mt)
+            moe_lut_down_mt(pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d, mid, g_str,
+                            pairs_f16);
+          else
+            moe_lut_down(moelut::kI4R, pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d,
+                         mid, g_str, pairs_f16);
+        });
+        fprintf(stderr, "\n");
+        // tiling variants: V64 (cap 64, BN=64), V128 (cap 128, BN=128), HYB
+        // (k_moe_tiles_hyb: full 128-tiles BN=128 + <=64 remainders BN=64).
+        static MoeTile* tA = nullptr;
+        static int *nA = nullptr, *nB = nullptr;
+        static MoeTile* tB = nullptr;
+        static __half *hid_ref = nullptr, *pr_ref = nullptr;
+        static unsigned long long* d_cnt = nullptr;
+        const size_t hid_n = (size_t)P * k * mid, pr_n = (size_t)P * k * d;
+        if (!tA) {
+          CK(hipMalloc(&tA, (size_t)E * sizeof(MoeTile)));
+          CK(hipMalloc(&tB, ((size_t)maxbatch * k / 128 + E + 1) * sizeof(MoeTile)));
+          CK(hipMalloc(&nA, 4));
+          CK(hipMalloc(&nB, 4));
+          CK(hipMalloc(&hid_ref, (size_t)maxbatch * k * mid * 2));
+          CK(hipMalloc(&pr_ref, (size_t)maxbatch * k * d * 2));
+          CK(hipMalloc(&d_cnt, 8));
+        }
+        const int mt64 = (P * k + 63) / 64 + E, mt128 = (P * k + 127) / 128 + E;
+        auto run64 = [&](bool up, bool dn_) {
+          if (up)
+            moe_lut_up_mid(pgu, x16, d_tokidx, d_moetiles, d_moentiles, mt64, hid, gu.svh,
+                           dn.suh, mid, d, g_str);
+          if (dn_)
+            moe_lut_down(moelut::kI4R, pdn, hid, d_moetiles, d_moentiles, mt64, d_guvb, d, mid,
+                         g_str, true);
+        };
+        auto run128 = [&](bool up, bool dn_) {
+          if (up)
+            moe_lut_up_mid_mt(pgu, x16, d_tokidx, d_moetiles, d_moentiles, mt128, hid, gu.svh,
+                              dn.suh, mid, d, g_str);
+          if (dn_)
+            moe_lut_down_mt(pdn, hid, d_moetiles, d_moentiles, mt128, d_guvb, d, mid, g_str, true);
+        };
+        auto runh = [&](bool up, bool dn_) {
+          if (up) {
+            moe_lut_up_mid_mt(pgu, x16, d_tokidx, tB, nB, mt128, hid, gu.svh, dn.suh, mid, d,
+                              g_str);
+            moe_lut_up_mid(pgu, x16, d_tokidx, tA, nA, E, hid, gu.svh, dn.suh, mid, d, g_str);
+          }
+          if (dn_) {
+            moe_lut_down_mt(pdn, hid, tB, nB, mt128, d_guvb, d, mid, g_str, true);
+            moe_lut_down(moelut::kI4R, pdn, hid, tA, nA, E, d_guvb, d, mid, g_str, true);
+          }
+        };
+        auto mism = [&](const void* a, const void* b, size_t n) {
+          CK(hipMemsetAsync(d_cnt, 0, 8, g_str));
+          k_u32_mismatch<<<1024, 256, 0, g_str>>>((const uint32_t*)a, (const uint32_t*)b, n / 2,
+                                                  d_cnt);
+          unsigned long long h = 0;
+          CK(hipMemcpy(&h, d_cnt, 8, hipMemcpyDeviceToHost));
+          return h;
+        };
+        k_moe_tiles_hyb<<<1, 512, 0, g_str>>>(d_eoff, tB, nB, tA, nA, E);
+        int hnA = 0, hnB = 0;
+        CK(hipMemcpy(&hnA, nA, 4, hipMemcpyDeviceToHost));
+        CK(hipMemcpy(&hnB, nB, 4, hipMemcpyDeviceToHost));
+        // reference = V64 outputs
+        k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E, 64);
+        run64(true, true);
+        CK(hipMemcpyAsync(hid_ref, hid, hid_n * 2, hipMemcpyDeviceToDevice, g_str));
+        CK(hipMemcpyAsync(pr_ref, d_guvb, pr_n * 2, hipMemcpyDeviceToDevice, g_str));
+        fprintf(stderr, "moe_var L%d P=%d hyb tiles B=%d A=%d:", l, P, hnB, hnA);
+        tm("v64.up", [&] { run64(true, false); });
+        tm("v64.dn", [&] { run64(false, true); });
+        k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E, 128);
+        tm("v128.up", [&] { run128(true, false); });
+        tm("v128.dn", [&] { run128(false, true); });
+        const unsigned long long m128 = mism(hid, hid_ref, hid_n) + mism(d_guvb, pr_ref, pr_n);
+        tm("hyb.up", [&] { runh(true, false); });
+        tm("hyb.dn", [&] { runh(false, true); });
+        const unsigned long long mh = mism(hid, hid_ref, hid_n) + mism(d_guvb, pr_ref, pr_n);
+        fprintf(stderr, " | mismatch v128=%llu hyb=%llu\n", m128, mh);
+        // restore the production tiling for the rest of this layer
+        k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E, mt ? 128 : 64);
+        if (mt) run128(true, true); else run64(true, true);
+      }
       if (sg_fuse && Rhc) {
         if (pairs_f16)
           k_v2_reduce_rot_hc<10, __half><<<(waves + 7) / 8, 256, 0, g_str>>>(
@@ -5288,10 +5735,14 @@ struct GpuModel {
       char ub[128];
       snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.gate_proj.weight", l);
       snprintf(ub, sizeof ub, "layers.%d.mlp.shared_expert.up_proj.weight", l);
-      se_gate_up(buf, ub, d_xb, d_guvb, d_guvb + (size_t)P * 640, P, false);
+      if (se_gate_up_merged(wview(ckpt.at(buf)), wview(ckpt.at(ub)), P)) {
+        k_silu_mul_g<<<(P * 640 + 255) / 256, 256, 0, g_str>>>(d_guvb, d_hidb, 640, P);
+      } else {
+        se_gate_up(buf, ub, d_xb, d_guvb, d_guvb + (size_t)P * 640, P, false);
+        k_silu_mul<<<(P * 640 + 255) / 256, 256, 0, g_str>>>(d_guvb, d_guvb + (size_t)P * 640,
+                                                             d_hidb, P * 640);
+      }
     }
-    k_silu_mul<<<(P * 640 + 255) / 256, 256, 0, g_str>>>(d_guvb, d_guvb + (size_t)P * 640,
-                                                         d_hidb, P * 640);
     snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.down_proj.weight", l);
     gemm(wview(ckpt.at(buf)), d_hidb, d_eyb, P);
     snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert_gate.weight", l);
@@ -5413,14 +5864,65 @@ struct GpuModel {
     // skip_qsa_idx (P3-B): norm + indexer ran eagerly between graph segments
     // (enq_layer_norm_b + qsa_idx_b); start at the attention projections.
     // Callers pass it only for QSA layers.
+    // QWENOX_SEG_REP=<l1>,<l2>: diagnostic stage timing (re-runs each stage of
+    // layer l 10x after a sync; corrupts the output -- timing only).
+    static const std::string seg_rep = [] {
+      const char* e = getenv("QWENOX_SEG_REP");
+      return e ? "," + std::string(e) + "," : std::string();
+    }();
+    const bool srep = !seg_rep.empty() &&
+                      seg_rep.find("," + std::to_string(l) + ",") != std::string::npos;
+    auto stm = [&](const char* what, auto&& fn) {
+      if (!srep) return;
+      CK(hipStreamSynchronize(g_str));
+      const auto t0 = std::chrono::steady_clock::now();
+      const auto s_ic = injp_cur;
+      const auto s_if = injp_for;
+      const auto s_hw = hcw_site_;
+      const auto s_x0 = xf16_src;
+      const auto s_x1 = xf16_xs;
+      const auto s_x2 = xf16_P;
+      const auto s_x3 = xf16_K;
+      for (int r = 0; r < 10; r++) {
+        fn();
+        injp_cur = s_ic;
+        injp_for = s_if;
+        hcw_site_ = s_hw;
+        xf16_src = s_x0;
+        xf16_xs = s_x1;
+        xf16_P = s_x2;
+        xf16_K = s_x3;
+      }
+      CK(hipStreamSynchronize(g_str));
+      const double ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() /
+          10;
+      fprintf(stderr, " %s %.3f ms (%.3f us/tok)", what, ms, ms * 1000 / P);
+    };
+    if (srep) fprintf(stderr, "seg_rep L%d P=%d base=%d:", l, P, base);
     if (!skip_qsa_idx) enq_layer_norm_b(l, P, fuse_prev_mlp);
+    if (!skip_qsa_idx) stm("hc", [&] { enq_layer_norm_b(l, P, fuse_prev_mlp); });
+    if (srep && !skip_qsa_idx) {
+      float* hwn = ensure_hcnorm(attn_prefix);
+      stm("hc.mix", [&] { gr_mix_b(attn_prefix, P, hwn, false); });
+      char dbuf[160];
+      snprintf(dbuf, sizeof dbuf, "%s.input_mix_weight_down.weight", attn_prefix);
+      const WView wdn = wview(ckpt.at(dbuf));
+      stm("hc.down", [&] { gemm(wdn, d_Rhatb, d_t320b, P, 0, d_Rhatbf16); });
+      snprintf(dbuf, sizeof dbuf, "%s.input_mix_weight_up.weight", attn_prefix);
+      const WView wup = wview(ckpt.at(dbuf));
+      stm("hc.up", [&] { hc_up_fused(wup, P); });
+    }
     KP(is_qsa(l) ? "qsa" : "gdn");
+    if (is_qsa(l)) stm("qsa", [&] { qsa_b(l, l / 4, P, base, dvb); });
+    else stm("gdn", [&] { gdn_b(l, l - (l + 1) / 4, P); });
     if (is_qsa(l)) {
-      if (skip_qsa_idx)  // P3-B: indexer ran eagerly between graph segments
+      if (abl_has("qsa")) {
+      } else if (skip_qsa_idx)  // P3-B: indexer ran eagerly between graph segments
         qsa_main_b(l, l / 4, P, base, dvb);
       else
         qsa_b(l, l / 4, P, base, dvb);
-    } else
+    } else if (!abl_has("gdn"))
       gdn_b(l, l - (l + 1) / 4, P);
     if (dbg) {
       h_rms("gpu", l, "attn-x", d_xb + (size_t)(P - 1) * 2560, 2560);
@@ -5429,7 +5931,11 @@ struct GpuModel {
     snprintf(mlp_prefix, sizeof mlp_prefix,
              "layers.%d.mlp_hyper_connection", l);
     KP("hc2");
-    if (gr_scatter_norm)
+    stm("hc2", [&] {
+      if (gr_scatter_norm) gr_write_read_b(attn_prefix, mlp_prefix, P);
+    });
+    if (abl_has("hc2")) {
+    } else if (gr_scatter_norm)
       gr_write_read_b(attn_prefix, mlp_prefix, P);
     else {
       gr_write_b(attn_prefix, P);
@@ -5455,7 +5961,10 @@ struct GpuModel {
     const bool can_hcw = hcw_env && !dbg && gr_bf16 &&
                          (flush_mlp || (gr_scatter_norm && inj_fuse_on()));
     bool hcw = false;
-    if (can_hcw) {
+    stm("moe", [&] { moe_b(l, P); });
+    if (srep) fprintf(stderr, "\n");
+    if (abl_has("moe")) {
+    } else if (can_hcw) {
       gr_write_prep_b(mlp_prefix, P);
       hcw = moe_b(l, P, true);
     } else {
@@ -6013,6 +6522,11 @@ struct GpuModel {
       exit(1);
     }
     moe_dump_base_ = base;
+    {  // QWENOX_LT_FORGET=1 (diagnostic): every chunk re-pays the hipBLASLt
+       // per-P algo miss, as a serving request with a new prompt length does.
+      static const bool lt_forget = getenv("QWENOX_LT_FORGET") != nullptr;
+      if (lt_forget) lt_algos.clear();
+    }
     kv_prepare(base, base + P);  // A2/A3: back (and unshare) rows [base, base+P)
     set_vbase(base);  // P3-A: all base-reading batch kernels this chunk read d_vbase
     cut_begin_chunk(base, P);
@@ -6079,7 +6593,10 @@ struct GpuModel {
               d_img_emb, d_img_inj, d_Rb);
       }
     }
+    DpfScope dpf(*this, P);
+    dpf.layer(0);
     enq_layer_b(0, P, false, true, base);
+    dpf.pause();
     vg_dump_row("vg0", P, base);
     if (prog_total > 0) prog_probe(0, P);
     phase("embed+L0", TP);
@@ -6103,7 +6620,9 @@ struct GpuModel {
     for (int l = 1; l < g_cfg.layers; l++) {
       bool fuse_prev = gr_scatter_norm && l > 1;
       bool flush_mlp = !gr_scatter_norm || l == g_cfg.layers - 1;
+      dpf.layer(l);
       enq_layer_b(l, P, fuse_prev, flush_mlp, base);
+      dpf.pause();
       {
         char tag[8];
         snprintf(tag, sizeof tag, "pcL%d", l);

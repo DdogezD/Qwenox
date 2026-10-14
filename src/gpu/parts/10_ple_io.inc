@@ -862,6 +862,32 @@ __global__ void k_moe_tiles(const int* eoff, MoeTile* tiles, int* total, int exp
   for (int j = 0; j < count; j++) tiles[begin + j] = {e, first + j * cap, min(cap, ne - j * cap)};
 }
 
+// Hybrid MoE tiling: each expert's rows become full 128-slot super-tiles (list
+// B, BN=128 kernels); a remainder of 1..64 rows goes to list A (one BN=64 tile,
+// higher occupancy, half the activation staging), a remainder of 65..127 rows
+// stays a B tile. Every (slot, row) is still computed by exactly one tile with
+// the baseline K order, so outputs equal the cap-64 / cap-128 tilings bit for bit.
+__global__ void k_moe_tiles_hyb(const int* eoff, MoeTile* tb, int* nb, MoeTile* ta, int* na,
+                                int experts) {
+  using Scan = rocprim::block_scan<int, 512>;
+  __shared__ Scan::storage_type storage;
+  const int e = threadIdx.x;
+  const int first = e < experts ? eoff[e] : 0;
+  const int ne = e < experts ? eoff[e + 1] - first : 0;
+  const int full = ne / 128, rem = ne - full * 128;
+  const int cb = full + (rem > 64 ? 1 : 0), ca = (rem > 0 && rem <= 64) ? 1 : 0;
+  int bb, ba;
+  Scan().exclusive_scan(cb, bb, 0, storage);
+  __syncthreads();
+  Scan().exclusive_scan(ca, ba, 0, storage);
+  if (e == 511) {
+    *nb = bb + cb;
+    *na = ba + ca;
+  }
+  for (int j = 0; j < cb; j++) tb[bb + j] = {e, first + j * 128, min(128, ne - j * 128)};
+  if (ca) ta[ba] = {e, first + full * 128, rem};
+}
+
 struct GpuMoeRouting {
   int *keys_in = nullptr, *keys_out = nullptr, *values_in = nullptr, *values_out = nullptr;
   void* scratch = nullptr;

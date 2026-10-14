@@ -499,6 +499,7 @@ int main(int argc, char** argv) {
   gguf_dense_release(ckpt);
   m.ple_on = ple_on;
   m.build_graphs();
+  if (getenv("QWENOX_DEQ_BENCH")) return m.deq_bench();
   if (vseg_selftest_spec)  // D2-S1c: multi-segment verify selftest owns the run
     return m.vseg_selftest(vseg_selftest_spec) ? 0 : 1;
   if (mtp_test > 0 || spec_gen > 0) {

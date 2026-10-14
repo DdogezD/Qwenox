@@ -281,6 +281,28 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
     }
   }
   add(BP * 4 + BP * sizeof(int2));            // tokarr img_inj
+  add((size_t)g_cfg.experts * sizeof(MoeTile) + 4);  // moetilesA + count (hybrid MoE tiling)
+  {  // dpf: 2 slots of the largest layer's dense weights as bf16 (GpuModel::dpf_plan)
+    const char* e = getenv("QWENOX_DEQ_AHEAD");  // opt-in (GpuModel::dpf_env)
+    if (e && !(e[0] == '0' && e[1] == 0)) {
+      std::vector<size_t> per(g_cfg.layers, 0);
+      for (auto& kv : ck.tensors()) {
+        const Tensor& t = kv.second;
+        if (!(t.dtype == 5 || t.dtype == 7 || t.dtype == 8 || t.dtype == 16 || t.dtype == 24))
+          continue;
+        if (kv.first.rfind("layers.", 0) != 0) continue;
+        const int l = atoi(kv.first.c_str() + 7);
+        if (l < 0 || l >= g_cfg.layers) continue;
+        const size_t b = (size_t)t.numel() * 2;
+        if (b > ((size_t)64 << 20)) continue;
+        per[l] += (b + 255) & ~(size_t)255;
+      }
+      size_t mx = 0;
+      for (size_t v : per) mx = std::max(mx, v);
+      add(mx);
+      add(mx);
+    }
+  }
   // 额外序列槽（GpuModel::slots_init，仅分页 KV）：每槽一份序列状态
   if (kv_paged)
     for (int i = 1; i < eff_parallel(); i++) {
@@ -355,6 +377,12 @@ static void devarena_init(const Checkpoint& ck, int maxctx) {
   }
   CK(aerr);
   g_devarena_sz = target;
+  if (const char* f = getenv("QWENOX_ARENA_FILL")) {  // diagnostic: poison before any use
+    const int byte = (int)strtol(f, nullptr, 0) & 0xff;
+    CK(hipMemset(g_devarena, byte, target));
+    CK(hipDeviceSynchronize());
+    fprintf(stderr, "devarena: filled with 0x%02x (QWENOX_ARENA_FILL)\n", byte);
+  }
   fprintf(stderr, "devarena: %.2f GiB reserved (estimate %.2f GiB)\n",
           target / 1073741824.0, need / 1073741824.0);
 #else
@@ -1486,10 +1514,25 @@ static bool q8g32_wmma(const WView& w, const void* x, bool xbf16, uint64_t xs, f
 }
 
 // ht / q6g64 -> bf16 W[rows][cols] (prefill GEMM operand).
-static void v2_deq_bf16(const WView& w, uint16_t* out, hipStream_t st) {
+// fast (bit-identical variants): ht -> k_ht_deq_bf16_h (half LDS, 2x resident
+// blocks), q6g64 -> k_q6g64_deq_bf16_c8 (coalesced 8-column threads).
+// fast < 0 = default from QWENOX_DEQ_FAST (unset = on); =0 keeps the originals.
+static void v2_deq_bf16(const WView& w, uint16_t* out, hipStream_t st, int fast = -1) {
+  static const bool fast_env = [] {
+    const char* e = getenv("QWENOX_DEQ_FAST");
+    return !(e && e[0] == '0' && e[1] == 0);
+  }();
+  const bool f = fast < 0 ? fast_env : fast != 0;
   if (w.dtype == 16) {
     const unsigned tiles = (unsigned)((w.rows / 128) * (w.cols / 128));
-    k_ht_deq_bf16<<<tiles, 256, 0, st>>>(w.data, w.suh, w.svh, out, (int)w.cols);
+    if (f)
+      k_ht_deq_bf16_h<<<tiles, 256, 0, st>>>(w.data, w.suh, w.svh, out, (int)w.cols);
+    else
+      k_ht_deq_bf16<<<tiles, 256, 0, st>>>(w.data, w.suh, w.svh, out, (int)w.cols);
+  } else if (f) {
+    const uint64_t n8 = w.rows * (w.cols / 8);
+    k_q6g64_deq_bf16_c8<<<(unsigned)((n8 + 255) / 256), 256, 0, st>>>(
+        w.data, out, (int)w.rows, (int)w.cols, (int)w.scale_stride);
   } else {
     const uint64_t ng = w.rows * (w.cols / 64);
     k_q6g64_deq_bf16<<<(unsigned)((ng + 255) / 256), 256, 0, st>>>(
