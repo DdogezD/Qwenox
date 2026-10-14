@@ -205,7 +205,7 @@ bash build_win.sh    # 引擎、benchmark、API 托盘程序、根目录入口 s
 | `MAX_CONTEXT` | `262144` | 单条请求的输入 + 输出上限 |
 | `KV_POOL_TOKENS` | `0` | 所有并发请求共用的 KV 总量,0 表示等于 `MAX_CONTEXT`;每多 256K 约多占 9.6 GiB |
 | `PARALLEL` | `4` | 同时运行的请求数,1–8 |
-| `PREFILL_CHUNK` | `0` | 长 prompt 每段多少 token,0 表示 Linux 16384、Windows 8192 |
+| `PREFILL_CHUNK` | `0` | 长 prompt 每段多少 token,0 表示 Linux 16384、Windows 6144 |
 | `ROPE_FACTOR` | `1` | 1 为原生 256K;设为 2 并把 `MAX_CONTEXT` 改为 `524288` 即 YaRN 512K |
 | `MTP_GAMMA` | `0` | 草稿长度,0 表示自动,1–8 表示固定 |
 
@@ -257,7 +257,8 @@ MTP 开、视觉塔开、prefill chunk 8192):
   的多模态请求在运行时还要申请显存,512K 时建议 2–4 路。
 - **UD-IQ4_XS 带 MTP 比 v2 多占约 1.3 GiB**,512K 页池最多 2–4 路。
 - **w4b 只能开 256K**。
-- 页池超过 512K 时启动器会拒绝启动。prefill chunk 固定 8192:16384 放不下,稳态只快约 2.5%。
+- 上表在 prefill chunk 8192 下测得;默认的 6144 每项约少 1.7 GiB,PP 与 8192 只差约 0.5%。16384 放不下。
+- 页池超过 512K 时启动器会拒绝启动。
 - UD-Q4_K_XL 常驻 77 GiB,按上表推算 256K 就要约 97 GiB,Windows 上不支持。
 - 任务管理器的"专用 GPU 内存"显示的是启动时预留的整块:上表用量加最多 4 GiB 余量(封顶 95 GiB),
   再加约 1.3 GiB,所以 v2 256K 时约 88.6 GiB,512K 配置时都是约 95.7 GiB。引擎另占 3–4 GiB 主机内存。

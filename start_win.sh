@@ -146,8 +146,8 @@ if [[ "${1:-}" == --check ]]; then
 fi
 
 # 生产选项与 Linux start.sh 一致，唯独不设 QWENOX_PREFILL_CHUNK：
-# Windows 默认 8192（256K 下 16384 会顶破 95 GiB arena 上限，实测见
-# PORTING-WINDOWS.md；maxctx ≤ 40K 时可手动 QWENOX_PREFILL_CHUNK=16384 换 ~6% PP）。
+# Windows 默认 6144（256K 下 16384 会顶破 95 GiB arena 上限；6144 与 8192 的 PP 差
+# 约 0.5%，工作区少约 1.7 GiB，实测见 PORTING-WINDOWS.md）。
 export QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1
 export QWENOX_MOE_LT=1 QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1
 export QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 QWENOX_NOWARMUP=1

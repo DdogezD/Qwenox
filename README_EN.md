@@ -220,7 +220,7 @@ environment variable of the same name takes precedence. Restart the engine after
 | `MAX_CONTEXT` | `262144` | Input + output limit for a single request |
 | `KV_POOL_TOKENS` | `0` | Total KV shared by all concurrent requests; 0 means equal to `MAX_CONTEXT`; each extra 256K costs ~9.6 GiB |
 | `PARALLEL` | `4` | Number of requests running at once, 1–8 |
-| `PREFILL_CHUNK` | `0` | Tokens per prefill segment for long prompts; 0 means 16384 on Linux, 8192 on Windows |
+| `PREFILL_CHUNK` | `0` | Tokens per prefill segment for long prompts; 0 means 16384 on Linux, 6144 on Windows |
 | `ROPE_FACTOR` | `1` | 1 is native 256K; set 2 and `MAX_CONTEXT=524288` for YaRN 512K |
 | `MTP_GAMMA` | `0` | Draft length; 0 is automatic, 1–8 fixes it |
 
@@ -280,8 +280,9 @@ MTP on, vision tower on, prefill chunk 8192):
   multimodal requests allocate more at run time, so 2–4 slots are recommended at 512K.
 - **UD-IQ4_XS with MTP uses ~1.3 GiB more than v2**; at a 512K pool use at most 2–4 slots.
 - **w4b is limited to 256K.**
-- The launcher refuses pools above 512K. Prefill chunk is fixed at 8192: 16384 does not fit and is only ~2.5%
-  faster in steady state.
+- The table was measured at prefill chunk 8192; the default 6144 uses about 1.7 GiB less in every row, with PP
+  within ~0.5% of 8192. 16384 does not fit.
+- The launcher refuses pools above 512K.
 - UD-Q4_K_XL is 77 GiB resident; extrapolating from the table, 256K alone would need ~97 GiB, so it is not
   supported on Windows.
 - Task Manager's "Dedicated GPU memory" shows the whole block reserved at startup: the use above plus up to 4 GiB
