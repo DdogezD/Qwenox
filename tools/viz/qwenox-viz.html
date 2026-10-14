@@ -1,0 +1,570 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qwenox 运行时视图</title>
+<style>
+:root {
+  color-scheme: light;
+  --wafer: #e6e4ec;      /* page: bare silicon under the inspection lamp */
+  --die: #d6d3e0;        /* die body, unlit expert */
+  --street: #c7c3d4;     /* scribe streets between blocks */
+  --ink: #1f2133;
+  --ink2: #5b5d72;
+  --ink3: #8d8ea3;
+  --oxide-blue: #2c4ba0;
+  --oxide-mag: #a43e93;
+  --oxide-gold: #d9a531;
+  --line: #cfccda;
+  --panel: #efeef4;
+  font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--wafer); color: var(--ink); font-size: 14px; line-height: 1.5; }
+.wrap { max-width: 1440px; margin: 0 auto; padding: 18px 24px 40px; }
+
+header { display: flex; align-items: baseline; gap: 20px; flex-wrap: wrap; margin-bottom: 14px; }
+h1 { font-size: 22px; font-weight: 600; letter-spacing: .02em; margin: 0; }
+h1 small { font-weight: 400; color: var(--ink2); font-size: 14px; margin-left: 10px; letter-spacing: 0; }
+.controls { display: flex; gap: 10px; align-items: center; margin-left: auto; flex-wrap: wrap; }
+.controls label { color: var(--ink2); font-size: 13px; }
+input[type=text], select {
+  font: inherit; font-size: 13px; padding: 4px 8px; border: 1px solid var(--line);
+  background: #f6f5f9; color: var(--ink); border-radius: 3px;
+}
+input[type=text] { width: 190px; }
+button {
+  font: inherit; font-size: 13px; padding: 4px 12px; border: 1px solid var(--ink2);
+  background: transparent; color: var(--ink); border-radius: 3px; cursor: pointer;
+}
+button[aria-pressed=true] { background: var(--ink); color: var(--wafer); border-color: var(--ink); }
+:focus-visible { outline: 2px solid var(--oxide-blue); outline-offset: 2px; }
+
+.status { display: flex; gap: 28px; flex-wrap: wrap; margin: 4px 0 12px; align-items: baseline; }
+.stat b { font-size: 26px; font-weight: 600; margin-right: 4px; }
+.stat span { color: var(--ink2); font-size: 13px; }
+.msg { color: var(--oxide-mag); font-size: 13px; }
+
+/* the die: experts x layers */
+.stage { display: grid; grid-template-columns: 34px 1fr 150px; gap: 0 10px; align-items: stretch; }
+.ytick { position: relative; }
+.ytick div { position: absolute; right: 0; font-size: 11px; color: var(--ink3); transform: translateY(-50%); }
+.ytick div.qsa { color: var(--oxide-blue); }
+.diebox { position: relative; background: var(--street); padding: 6px; border-radius: 2px; }
+canvas#die { display: block; width: 100%; height: 432px; image-rendering: pixelated; }
+canvas#gauge { display: block; width: 150px; height: 432px; margin-top: 6px; }
+.xaxis { grid-column: 2; display: flex; justify-content: space-between; color: var(--ink3); font-size: 11px; padding: 4px 6px 0; }
+.legend { grid-column: 3; color: var(--ink3); font-size: 11px; padding-top: 4px; line-height: 1.35; }
+.legend i { display: inline-block; width: 10px; height: 3px; vertical-align: middle; margin-right: 4px; }
+.hover { position: absolute; pointer-events: none; background: var(--ink); color: var(--wafer); font-size: 12px; padding: 3px 7px; border-radius: 3px; white-space: nowrap; display: none; z-index: 5; }
+
+.lower { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 22px; margin-top: 22px; }
+h2 { font-size: 15px; font-weight: 600; margin: 0 0 8px; }
+h2 small { font-weight: 400; color: var(--ink2); font-size: 12px; margin-left: 8px; }
+
+.stream {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 3px; padding: 12px 14px;
+  height: 380px; overflow-y: auto; font-size: 15px; line-height: 1.9; white-space: pre-wrap; word-break: break-word;
+}
+.tk { border-radius: 2px; cursor: pointer; padding: 1px 0; }
+.tk.prompt { color: var(--ink3); }
+.tk.r1 { box-shadow: inset 0 -2px 0 rgba(44,75,160,.28); }
+.tk.r2 { box-shadow: inset 0 -2px 0 rgba(164,62,147,.40); }
+.tk.rb { margin-left: 1px; }
+.tk:hover { background: rgba(44,75,160,.12); }
+.tk.sel { background: var(--ink); color: var(--wafer); }
+.tk.sp { font-size: 11px; color: var(--ink2); border: 1px solid var(--line); padding: 0 4px; margin: 0 2px; }
+.tk.pending { opacity: .55; }
+.cut { color: var(--ink3); font-size: 12px; display: block; margin-bottom: 6px; }
+
+.insp { display: flex; flex-direction: column; gap: 20px; }
+.cand { display: grid; grid-template-columns: 1fr 64px; gap: 4px 10px; font-size: 14px; }
+.cand .bar { position: relative; padding: 2px 6px; overflow: hidden; white-space: pre; text-overflow: ellipsis; }
+.cand .bar::before { content: ""; position: absolute; inset: 0; width: var(--w); background: rgba(44,75,160,.16); z-index: -1; }
+.cand .bar.hit::before { background: rgba(217,165,49,.45); }
+.cand .p { text-align: right; color: var(--ink2); }
+.insp .note { color: var(--ink2); font-size: 12px; margin-top: 6px; }
+canvas#rounds { display: block; width: 100%; height: 110px; background: var(--panel); border: 1px solid var(--line); border-radius: 3px; }
+.empty { color: var(--ink2); font-size: 13px; }
+
+@media (max-width: 980px) {
+  .lower { grid-template-columns: 1fr; }
+  .stage { grid-template-columns: 26px 1fr; }
+  canvas#gauge, .legend { display: none; }
+}
+@media (prefers-reduced-motion: reduce) { .tk { transition: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>Qwenox 运行时视图<small>48 层 × 512 个专家，每个 token 点亮 10 个</small></h1>
+  <div class="controls">
+    <label for="host">服务地址</label>
+    <input id="host" type="text" spellcheck="false" placeholder="192.168.5.12:8741">
+    <label for="slot">会话</label>
+    <select id="slot"><option value="auto">跟随最新</option></select>
+    <button id="mode" type="button" aria-pressed="false" title="切换版图显示：实时余辉 / 本次请求累计">累计</button>
+    <button id="follow" type="button" aria-pressed="true" title="选中 token 后点这里回到最新">跟随最新 token</button>
+  </div>
+</header>
+
+<div class="status" aria-live="polite">
+  <div class="stat"><b id="s-state">–</b><span>状态</span></div>
+  <div class="stat"><b id="s-tps">–</b><span>token/s</span></div>
+  <div class="stat"><b id="s-rnd">–</b><span>平均每轮 verify 收下</span></div>
+  <div class="stat"><b id="s-pos">–</b><span>位置（prompt + 生成）</span></div>
+  <div class="msg" id="msg"></div>
+</div>
+
+<div class="stage">
+  <div class="ytick" id="ytick"></div>
+  <div class="diebox" id="diebox">
+    <canvas id="die" width="1024" height="384" aria-label="专家路由版图：横轴 512 个专家，纵轴 48 层"></canvas>
+    <div class="hover" id="hover"></div>
+  </div>
+  <canvas id="gauge" width="300" height="864" aria-label="逐层路由熵与 top-10 概率质量"></canvas>
+  <div></div>
+  <div class="xaxis"><span>专家 0</span><span>128</span><span>256</span><span>384</span><span>511</span></div>
+  <div class="legend"><i style="background:#5b5d72"></i>路由熵（越长越犹豫）<br><i style="background:#d9a531"></i>选中的 10 个专家占的概率</div>
+</div>
+
+<div class="lower">
+  <section>
+    <h2>Token 流<small>下划线颜色交替 = 一轮 verify 一起收下的 token；点一个 token 看它的路由</small></h2>
+    <div class="stream" id="stream"><span class="empty">等待请求。用任意客户端向这台服务发一条消息，这里会实时显示。</span></div>
+  </section>
+  <aside class="insp">
+    <section>
+      <h2 id="cand-title">下一个 token 的候选</h2>
+      <div class="cand" id="cand"><span class="empty">还没有数据</span></div>
+      <div class="note" id="cand-note"></div>
+    </section>
+    <section>
+      <h2>MTP 每轮收下的 token 数<small>最近 90 轮</small></h2>
+      <canvas id="rounds" width="720" height="220"></canvas>
+      <div class="note" id="rounds-note"></div>
+    </section>
+  </aside>
+</div>
+</div>
+
+<script>
+"use strict";
+const L = 48, E = 512, K = 10;
+const $ = id => document.getElementById(id);
+const hostEl = $("host"), slotEl = $("slot"), modeBtn = $("mode"), followBtn = $("follow");
+// address: #host:port in the page URL, else the last one used, else the default service port
+hostEl.value = decodeURIComponent(location.hash.slice(1)) || localStorage.getItem("qv.host") || "192.168.5.12:8731";
+hostEl.addEventListener("change", () => { localStorage.setItem("qv.host", hostEl.value.trim()); reset(); });
+slotEl.addEventListener("change", () => reset());
+let cumulative = localStorage.getItem("qv.mode") === "cum";
+modeBtn.setAttribute("aria-pressed", String(cumulative));
+modeBtn.addEventListener("click", () => {
+  cumulative = !cumulative; modeBtn.setAttribute("aria-pressed", String(cumulative));
+  localStorage.setItem("qv.mode", cumulative ? "cum" : "live");
+});
+followBtn.addEventListener("click", () => select(null));
+
+// ---------- state ----------
+let meta = null;              // /viz summary
+let cur = null;               // {slot, req, n_prompt, start}
+let items = new Map();        // p -> item (decoded)
+let finalEnd = 0, nTok = 0, state = 0;
+let nextFetch = 0;            // lowest position not yet final
+let selected = null;          // pinned position or null
+let qsa = new Set([3,7,11,15,19,23,27,31,35,39,43,47]);
+const glow = new Float32Array(L * E);   // live afterglow
+const cum = new Float32Array(L * E);    // per-request usage
+const playQ = [];                       // finalized positions waiting to flash
+let decoder = new TextDecoder("utf-8");
+let lastDecoded = -1;
+
+function api(path) { return "http://" + hostEl.value.trim() + path; }
+function hexBytes(h) {
+  const a = new Uint8Array(h.length >> 1);
+  for (let i = 0; i < a.length; i++) a[i] = parseInt(h.substr(i * 2, 2), 16);
+  return a;
+}
+function tokText(h) {
+  try { return new TextDecoder("utf-8").decode(hexBytes(h || "")); } catch { return "?"; }
+}
+
+function reset() {
+  cur = null; items.clear(); finalEnd = nTok = 0; nextFetch = 0; selected = null;
+  glow.fill(0); cum.fill(0); playQ.length = 0;
+  decoder = new TextDecoder("utf-8"); lastDecoded = -1; streamBuilt = 0; lastFlashed = null;
+  $("stream").innerHTML = '<span class="empty">等待请求。用任意客户端向这台服务发一条消息，这里会实时显示。</span>';
+  followBtn.setAttribute("aria-pressed", "true");
+}
+
+// ---------- polling ----------
+let busy = false;
+async function poll() {
+  if (busy) return;
+  busy = true;
+  try {
+    const r = await fetch(api("/viz"), { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    meta = await r.json();
+    if (!meta.on) { setMsg("引擎没有开可视化：在 service.conf 里设 VIZ=1，然后重启服务。"); return; }
+    if (meta.qsa) qsa = new Set(meta.qsa);
+    syncSlots();
+    const pick = chooseSlot();
+    if (!pick) { setMsg(""); $("s-state").textContent = "空闲"; return; }
+    if (!cur || cur.slot !== pick.slot || cur.req !== pick.req) {
+      reset();
+      const start = Math.max(0, pick.n_prompt - 256);
+      cur = { slot: pick.slot, req: pick.req, n_prompt: pick.n_prompt, start };
+      nextFetch = start;
+    }
+    state = pick.state;
+    // fetch everything not final yet, 128 positions per call
+    for (let guard = 0; guard < 8; guard++) {
+      const q = await fetch(api(`/viz?slot=${cur.slot}&from=${nextFetch}&n=128`), { cache: "no-store" });
+      if (!q.ok) throw new Error("HTTP " + q.status);
+      const d = await q.json();
+      if (d.req !== cur.req) break;
+      finalEnd = d.final_end; nTok = d.n_tok; state = d.state;
+      ingest(d.items);
+      const last = d.items.length ? d.items[d.items.length - 1].p : nextFetch;
+      if (d.items.length < 128 || last + 1 >= nTok) break;
+    }
+    setMsg("");
+    renderStatus();
+  } catch (e) {
+    setMsg("连不上 " + hostEl.value + "：确认服务在运行、地址和端口正确（" + e.message + "）");
+  } finally {
+    busy = false;
+  }
+}
+function chooseSlot() {
+  const v = slotEl.value;
+  const live = meta.slots.filter(s => s.req >= 0);
+  if (!live.length) return null;
+  if (v !== "auto") return live.find(s => String(s.slot) === v) || null;
+  return live.reduce((a, b) => (b.req > a.req ? b : a));
+}
+function syncSlots() {
+  const want = ["auto", ...meta.slots.map(s => String(s.slot))].join(",");
+  const have = [...slotEl.options].map(o => o.value).join(",");
+  if (want === have) return;
+  const v = slotEl.value;
+  slotEl.innerHTML = '<option value="auto">跟随最新</option>' +
+    meta.slots.map(s => `<option value="${s.slot}">第 ${s.slot + 1} 路</option>`).join("");
+  slotEl.value = [...slotEl.options].some(o => o.value === v) ? v : "auto";
+}
+function setMsg(t) { $("msg").textContent = t; }
+
+function ingest(list) {
+  for (const it of list) {
+    const old = items.get(it.p);
+    const fin = it.p < finalEnd;
+    it.final = fin;
+    if (!old) {
+      if (it.p === lastDecoded + 1 || lastDecoded < 0) {
+        it.text = it.sp ? tokText(it.b) : decoder.decode(hexBytes(it.b || ""), { stream: true });
+        lastDecoded = it.p;
+      } else {
+        it.text = tokText(it.b);
+      }
+    } else {
+      it.text = old.text;
+    }
+    items.set(it.p, it);
+    if (fin && (!old || !old.final)) {
+      if (it.e) {
+        for (let i = 0; i < L * K; i++) if (it.e[i] >= 0) cum[Math.floor(i / K) * E + it.e[i]] += it.w[i] / 255;
+        if (it.p >= cur.n_prompt - 1) playQ.push(it.p); // prompt routing only feeds the totals
+      }
+      if (nextFetch === it.p) nextFetch = it.p + 1;
+    }
+  }
+  // joining mid-request (or after a stall): flash only the most recent tokens,
+  // the backlog already sits in the totals
+  if (playQ.length > 24) playQ.splice(0, playQ.length - 6);
+  renderStream();
+  if (selected === null) renderInspector(latestFinal());
+}
+function latestFinal() {
+  for (let p = finalEnd - 1; p >= (cur ? cur.start : 0); p--) if (items.has(p) && items.get(p).e) return p;
+  return null;
+}
+
+// ---------- token stream ----------
+function rounds() {
+  // group generated tokens by emit time: one verify round's tokens leave
+  // the engine back to back (< 3 ms apart), rounds are ~15+ ms apart
+  const out = [];
+  let g = null, prev = -1e9;
+  for (let p = cur ? cur.n_prompt : 0; p < nTok; p++) {
+    const it = items.get(p);
+    if (!it || it.m < 0) continue;
+    if (!g || it.m - prev > 3) { g = { start: p, n: 0, t: it.m }; out.push(g); }
+    g.n++; prev = it.m;
+  }
+  return out;
+}
+let streamBuilt = 0, roundOf = new Map();
+function renderStream() {
+  const box = $("stream");
+  if (!cur) return;
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  const rs = rounds();
+  roundOf = new Map();
+  rs.forEach((g, i) => { for (let k = 0; k < g.n; k++) roundOf.set(g.start + k, i); });
+  if (streamBuilt === 0 || box.querySelector(".empty")) {
+    box.innerHTML = cur.start > 0 ? `<span class="cut">前面还有 ${cur.start} 个 prompt token 没有显示</span>` : "";
+    streamBuilt = cur.start;
+  }
+  const frag = document.createDocumentFragment();
+  for (let p = streamBuilt; p < nTok; p++) {
+    const it = items.get(p);
+    if (!it) break;
+    const s = document.createElement("span");
+    s.className = "tk";
+    s.dataset.p = p;
+    s.textContent = it.text;
+    if (it.sp) s.classList.add("sp");
+    if (p < cur.n_prompt) s.classList.add("prompt");
+    frag.appendChild(s);
+    streamBuilt = p + 1;
+  }
+  box.appendChild(frag);
+  // round banding + pending marks (cheap: only the generated tail changes)
+  for (const s of box.querySelectorAll(".tk:not(.prompt)")) {
+    const p = +s.dataset.p, r = roundOf.get(p);
+    s.classList.toggle("r1", r !== undefined && r % 2 === 0);
+    s.classList.toggle("r2", r !== undefined && r % 2 === 1);
+    s.classList.toggle("rb", r !== undefined && rs[r].start === p);
+    s.classList.toggle("pending", p >= finalEnd);
+    s.classList.toggle("sel", p === selected);
+  }
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+$("stream").addEventListener("click", ev => {
+  const s = ev.target.closest(".tk");
+  if (!s) return;
+  const p = +s.dataset.p;
+  select(selected === p ? null : p);
+});
+function select(p) {
+  selected = p;
+  followBtn.setAttribute("aria-pressed", String(p === null));
+  for (const s of $("stream").querySelectorAll(".tk.sel")) s.classList.remove("sel");
+  if (p !== null) { const s = $("stream").querySelector(`.tk[data-p="${p}"]`); if (s) s.classList.add("sel"); }
+  renderInspector(p === null ? latestFinal() : p);
+}
+
+// ---------- inspector ----------
+function renderInspector(p) {
+  const box = $("cand"), note = $("cand-note");
+  const it = p === null ? null : items.get(p);
+  if (!it || !it.k) {
+    box.innerHTML = '<span class="empty">' + (it ? "这个位置是 prompt 内部，引擎没有为它算候选（只有生成阶段和 verify 行才有）。" : "还没有数据") + "</span>";
+    note.textContent = it && it.e ? "版图显示的是它的专家路由。" : "";
+    $("cand-title").textContent = "下一个 token 的候选";
+    return;
+  }
+  const next = items.get(p + 1);
+  $("cand-title").textContent = "「" + clip(it.text) + "」之后的候选";
+  box.innerHTML = "";
+  it.k.forEach((id, j) => {
+    const pr = it.q[j] / 10000;
+    const d = document.createElement("div");
+    d.className = "bar" + (next && next.t === id ? " hit" : "");
+    d.style.setProperty("--w", Math.max(1, pr * 100).toFixed(1) + "%");
+    d.textContent = clip(it.kb ? tokText(it.kb[j]) : "#" + id) || "␠";
+    const q = document.createElement("div");
+    q.className = "p";
+    q.textContent = (pr * 100).toFixed(pr < 0.1 ? 1 : 0) + "%";
+    box.append(d, q);
+  });
+  if (!next) note.textContent = "下一个 token 还没生成。";
+  else {
+    const rank = it.k.indexOf(next.t);
+    note.textContent = rank === 0 ? "实际选了第 1 名（金色）。" :
+      rank > 0 ? `实际选了第 ${rank + 1} 名（金色），采样模式下会这样。` : "实际选中的 token 不在前 5 名里。";
+  }
+}
+function clip(s) { s = (s || "").replace(/\n/g, "↵"); return s.length > 24 ? s.slice(0, 24) + "…" : s; }
+
+// ---------- status ----------
+function renderStatus() {
+  $("s-state").textContent = ["空闲", "预填充", "生成中", "已完成"][state] || "–";
+  $("s-pos").textContent = nTok ? `${cur.n_prompt} + ${nTok - cur.n_prompt}` : "–";
+  const rs = rounds();
+  const gen = [];
+  for (let p = cur.n_prompt; p < nTok; p++) { const it = items.get(p); if (it && it.m >= 0) gen.push(it.m); }
+  if (gen.length > 4) {
+    const tail = gen.slice(-Math.min(gen.length, 120));
+    const dt = (tail[tail.length - 1] - tail[0]) / 1000;
+    $("s-tps").textContent = dt > 0 ? ((tail.length - 1) / dt).toFixed(1) : "–";
+  } else $("s-tps").textContent = "–";
+  const last = rs.slice(-90);
+  $("s-rnd").textContent = last.length ? (last.reduce((a, g) => a + g.n, 0) / last.length).toFixed(2) : "–";
+  drawRounds(last);
+}
+function drawRounds(rs) {
+  const c = $("rounds"), x = c.getContext("2d");
+  x.clearRect(0, 0, c.width, c.height);
+  const mx = Math.max(5, ...rs.map(g => g.n));
+  const bw = c.width / 90;
+  x.fillStyle = "#cfccda";
+  for (let k = 1; k <= mx; k++) x.fillRect(0, c.height - 10 - (c.height - 24) * k / mx, c.width, 1);
+  rs.forEach((g, i) => {
+    const h = (c.height - 24) * g.n / mx;
+    x.fillStyle = g.n >= 4 ? "#d9a531" : g.n >= 2 ? "#a43e93" : "#2c4ba0";
+    x.fillRect(i * bw + 1, c.height - 10 - h, bw - 2, h);
+  });
+  $("rounds-note").textContent = rs.length
+    ? "每根柱 = 一轮 verify：草稿 token 被主干一次性验证，收下几个就多高。蓝 = 只收下 1 个（草稿全被拒），紫 2–3 个，金 4 个以上。"
+    : "";
+}
+
+// ---------- the die ----------
+const die = $("die"), dx = die.getContext("2d");
+const W = die.width, H = die.height, CW = W / E, RH = H / L;   // 2 x 8 px cells
+const img = dx.createImageData(W, H);
+const lut = new Uint8ClampedArray(256 * 3);
+(function buildLut() {
+  // thin-film interference ramp: unlit die -> oxide blue -> magenta -> gold -> near white
+  const stops = [[0, [214, 211, 224]], [0.18, [44, 75, 160]], [0.45, [164, 62, 147]], [0.75, [217, 165, 49]], [1, [255, 246, 216]]];
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255;
+    let k = 0; while (k < stops.length - 2 && t > stops[k + 1][0]) k++;
+    const [t0, c0] = stops[k], [t1, c1] = stops[k + 1];
+    const u = Math.min(1, Math.max(0, (t - t0) / (t1 - t0)));
+    for (let ch = 0; ch < 3; ch++) lut[i * 3 + ch] = c0[ch] + (c1[ch] - c0[ch]) * u;
+  }
+})();
+const ytick = $("ytick");
+function buildTicks() {
+  ytick.innerHTML = "";
+  for (let l = 0; l < L; l++) {
+    if (l % 4 !== 3 && l !== 0) continue;
+    const d = document.createElement("div");
+    d.textContent = l;
+    if (qsa.has(l)) { d.className = "qsa"; d.title = "全注意力层（其余为线性注意力 GDN）"; }
+    d.style.top = `calc(6px + ${((l + 0.5) / L) * 432}px)`;
+    ytick.appendChild(d);
+  }
+}
+buildTicks();
+
+function drawDie(src, scale) {
+  const px = img.data;
+  for (let l = 0; l < L; l++) {
+    for (let e = 0; e < E; e++) {
+      const v = Math.min(255, Math.round(Math.sqrt(Math.min(1, src[l * E + e] * scale)) * 255));
+      const r = lut[v * 3], g = lut[v * 3 + 1], b = lut[v * 3 + 2];
+      const x0 = e * CW, y0 = l * RH;
+      for (let y = 0; y < RH - 1; y++) {      // last row of each layer = scribe gap
+        let o = ((y0 + y) * W + x0) * 4;
+        for (let x = 0; x < CW; x++, o += 4) { px[o] = r; px[o + 1] = g; px[o + 2] = b; px[o + 3] = 255; }
+      }
+      let o = ((y0 + RH - 1) * W + x0) * 4;
+      for (let x = 0; x < CW; x++, o += 4) { px[o] = 199; px[o + 1] = 195; px[o + 2] = 212; px[o + 3] = 255; }
+    }
+  }
+  dx.putImageData(img, 0, 0);
+  dx.fillStyle = "#c7c3d4";                // streets between 64-expert blocks
+  for (let b = 1; b < 8; b++) dx.fillRect(b * 64 * CW - 1, 0, 2, H);
+  dx.fillStyle = "rgba(44,75,160,.55)";    // full-attention layers: a mark on the die edge
+  for (const l of qsa) dx.fillRect(0, l * RH, 2, RH - 1);
+}
+const single = new Float32Array(L * E);
+function routeOf(p, into) {
+  into.fill(0);
+  const it = items.get(p);
+  if (!it || !it.e) return null;
+  for (let i = 0; i < L * K; i++) if (it.e[i] >= 0) into[Math.floor(i / K) * E + it.e[i]] = it.w[i] / 255;
+  return it;
+}
+
+// gauge: per layer entropy (ink) and top-10 mass (gold) of the shown token
+const gauge = $("gauge"), gx = gauge.getContext("2d");
+function drawGauge(it) {
+  const w = gauge.width, h = gauge.height, rh = h / L;
+  gx.clearRect(0, 0, w, h);
+  if (!it || !it.h) return;
+  const hmax = Math.log(512);
+  for (let l = 0; l < L; l++) {
+    const y = l * rh;
+    const ent = it.h[l] / 1000, mass = it.c[l] / 1000;
+    gx.fillStyle = "#5b5d72";
+    gx.fillRect(0, y + rh * 0.18, w * Math.max(0, ent / hmax), rh * 0.32);
+    gx.fillStyle = "#d9a531";
+    gx.fillRect(0, y + rh * 0.56, w * Math.max(0, Math.min(1, mass)), rh * 0.26);
+  }
+}
+
+// hover readout
+const hover = $("hover");
+die.addEventListener("mousemove", ev => {
+  const r = die.getBoundingClientRect();
+  const e = Math.floor((ev.clientX - r.left) / r.width * E), l = Math.floor((ev.clientY - r.top) / r.height * L);
+  if (e < 0 || e >= E || l < 0 || l >= L) { hover.style.display = "none"; return; }
+  const tot = cur ? cumTotal() : 0;
+  const share = tot ? (100 * cum[l * E + e] / (tot / L)).toFixed(2) : "0";
+  let wnow = "";
+  const p = selected !== null ? selected : latestFinal();
+  if (p !== null) {
+    const it = items.get(p);
+    if (it && it.e) { const j = it.e.slice(l * K, l * K + K).indexOf(e); if (j >= 0) wnow = `，当前 token 权重 ${(it.w[l * K + j] / 255 * 100).toFixed(0)}%`; }
+  }
+  hover.textContent = `第 ${l} 层${qsa.has(l) ? "（全注意力）" : ""}，专家 ${e}：本次请求承担 ${share}% 的路由${wnow}`;
+  hover.style.display = "block";
+  const br = $("diebox").getBoundingClientRect();
+  hover.style.left = Math.min(ev.clientX - br.left + 12, br.width - 330) + "px";
+  hover.style.top = (ev.clientY - br.top + 14) + "px";
+});
+die.addEventListener("mouseleave", () => { hover.style.display = "none"; });
+function cumTotal() { let s = 0; for (let i = 0; i < cum.length; i++) s += cum[i]; return s; }
+
+// animation: spread each poll's finalized tokens over the poll interval
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+let lastFrame = 0, flashAt = 0, lastFlashed = null;
+function frame(t) {
+  requestAnimationFrame(frame);
+  if (t - lastFrame < 33) return;               // ~30 fps
+  const dt = t - lastFrame; lastFrame = t;
+  const decay = reduceMotion ? 0 : Math.pow(0.5, dt / 140);
+  for (let i = 0; i < glow.length; i++) glow[i] *= decay;
+  const per = playQ.length > 40 ? 0 : 280 / Math.max(1, playQ.length);
+  while (playQ.length && t >= flashAt) {
+    const p = playQ.shift();
+    const it = items.get(p);
+    if (it && it.e) for (let i = 0; i < L * K; i++) if (it.e[i] >= 0) { const k = Math.floor(i / K) * E + it.e[i]; glow[k] = Math.max(glow[k], it.w[i] / 255 * 2.2); }
+    if (selected === null) { drawGauge(it); renderInspector(p); }
+    lastFlashed = p;
+    flashAt = t + per;
+    if (per > 0) break;
+  }
+  if (selected !== null) {
+    const it = routeOf(selected, single);
+    drawDie(single, 3);
+    drawGauge(it);
+  } else if (cumulative) {
+    let mx = 0; for (let i = 0; i < cum.length; i++) if (cum[i] > mx) mx = cum[i];
+    drawDie(cum, mx ? 1 / mx : 0);
+  } else {
+    // afterglow of recent tokens over a steady image of the latest one
+    const p = lastFlashed;
+    if (p !== null && routeOf(p, single)) {
+      for (let i = 0; i < single.length; i++) single[i] = Math.max(glow[i], single[i] * 0.55);
+      drawDie(single, 1);
+    } else {
+      drawDie(glow, 1);
+    }
+  }
+}
+requestAnimationFrame(frame);
+
+setInterval(poll, 300);
+poll();
+</script>
+</body>
+</html>

@@ -153,6 +153,7 @@
 #include "parts/07_kprof.inc"
 #include "parts/09_kernels_index.inc"
 #include "parts/10_ple_io.inc"
+#include "parts/19_viz.inc"
 #include "parts/20_kernels_gemv.inc"
 #include "parts/21_kernels_ple.inc"
 #include "parts/22_kernels_prefill.inc"

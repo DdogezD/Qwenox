@@ -100,6 +100,8 @@ class EngineClient {
     bool memory(std::string* line, std::string* err);
     // Send CSTAT and return the raw `C ...` line.
     bool cstat(std::string* line, std::string* err);
+    // Send `VIZ[ args]` and return the raw `V {json}` line (QWENOX_VIZ taps).
+    bool viz(const std::string& args, std::string* line, std::string* err);
 
     // Run one GEN to completion (or until `on_token` asks to stop). Blocks.
     // `on_wait` is called at roughly one-second intervals during prefill and

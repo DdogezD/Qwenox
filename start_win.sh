@@ -168,6 +168,8 @@ if (( KV_PAGED )); then
   if (( KV_POOL_TOKENS )); then export QWENOX_KV_POOL_TOKENS="$KV_POOL_TOKENS"; fi
 fi
 export QWENOX_PARALLEL="$PARALLEL"
+# VIZ=1：运行时可视化埋点（GET /viz，tools/viz/qwenox-viz.html）
+if (( ${VIZ:-0} )); then export QWENOX_VIZ=1; else unset QWENOX_VIZ; fi
 export QWENOX_API_MAX_IMAGES="$MAX_IMAGES"
 export QWENOX_ROPE_FACTOR="$ROPE_FACTOR"
 export QWENOX_ROPE_ORIGINAL_CTX="$ROPE_ORIGINAL_CTX"

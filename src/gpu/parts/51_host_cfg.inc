@@ -3074,6 +3074,9 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
     if (!cont) hist.clear();
     size_t done_upto = cont ? mcp : 0;
+    // QWENOX_VIZ: token log for the VIZ verb; positions < done_upto keep
+    // their records only when the slot continues its live state
+    viz::begin(s, (long long)g.req, g.ids, (int)done_upto, cont);
     // Arm the 1s prefill progress reporter for the prompt ingest only
     // (spec-verify batches never see it armed). prog_base accumulates
     // across the kvsnap cut segments inside prefill_chunk.
@@ -3223,6 +3226,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
         return false;
       }
       ngen++;
+      viz::token(s, tok);
       return true;
     };
     // CKPT pause/resume. The emit lambdas below return false on a ckpt token
@@ -3483,6 +3487,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       }
     }
     perfsnap::write_idle();  // tooltip 下一轮轮询即回归纯地址
+    viz::finish(s);
     // SSD prompt cache: capture the end-of-turn state, then commit it with
     // the cut captures (new pages + MTP sections + checkpoints go to the
     // background writer). Cancelled turns are valid too -- hist tracks
@@ -3504,6 +3509,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     mtp_live = false;
     finish(err_line());
     perfsnap::write_idle();
+    viz::finish(s);
   }
 }
 
@@ -3578,6 +3584,19 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
                (unsigned long long)ps.prompt_total, ps.tg_inst, ps.tg_avg,
                ps.accept_pct);
       alive = c.send(pb);
+    } else if (verb == "VIZ") {
+      // QWENOX_VIZ runtime taps (19_viz.inc), one JSON line:
+      //   VIZ                    -> V {"on":..,"slots":[..]}
+      //   VIZ <slot> <from> <n>  -> V {"items":[per position ..]}
+      int vs = -1, vf = 0, vn = 64;
+      std::string o;
+      if (ss >> vs) {
+        ss >> vf >> vn;
+        o = viz::range_json(vs, vf, vn);
+      } else {
+        o = viz::summary_json();
+      }
+      alive = c.send("V " + o + "\n");
     } else if (verb == "X") {
       int64_t req = 0;
       ss >> req;

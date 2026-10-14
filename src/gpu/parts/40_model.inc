@@ -604,6 +604,53 @@ struct GpuModel {
   int* d_ringpos = nullptr;
   int* p_token = nullptr;        // pinned staging for token id
   int* d_vbase = nullptr;        // P3-A: device mirror of the batch base position
+  // QWENOX_VIZ taps (19_viz.inc). Batched rows are tagged with the position
+  // source the engine kernels of the current batch use: set by enq_layer_b
+  // (dvb ? *dvb : base) and vgraph_run; enq_layer_vseg builds a per-row
+  // (slot, position) table. Single-token steps read *d_pos.
+  int vz_base_ = 0;
+  const int* vz_dvb_ = nullptr;
+  const int* vz_rowtab_ = nullptr;
+  bool vz_rows_ = false;
+  // host = the pinned host rings (fenced, top-5 and publish target); else the
+  // device mirror the router taps write.
+  // rows: the batch's row count (wrap guard, see VizTap::skip_rows).
+  // QWENOX_VIZ_PARTS bitmask (diagnostics): 1 routing, 2 top-5; default 3.
+  VizTap vz_tap(int layer, bool batched, bool host = false, int rows = 1) const {
+    VizTap t;
+    if (!viz::on()) return t;
+    static const int parts = [] {
+      const char* e = getenv("QWENOX_VIZ_PARTS");
+      return e && *e ? atoi(e) : 3;
+    }();
+    if (!(parts & (layer == g_cfg.layers ? 2 : 1))) return t;
+    uint32_t* r = host ? viz::ring(bound_) : viz::dev(bound_);
+    if (!r) return t;
+    if (batched) {
+      if (!vz_rows_) return t;
+      t.rowtab = vz_rowtab_;
+      t.dpos = vz_rowtab_ ? nullptr : vz_dvb_;
+      t.base = vz_rowtab_ || vz_dvb_ ? 0 : vz_base_;
+    } else {
+      t.dpos = d_pos;
+    }
+    t.ring = r;
+    t.sys = host;
+    t.slot = bound_;
+    t.layer = layer;
+    t.recs = viz::recs();
+    t.skip_rows = rows > viz::kRing ? rows - viz::kRing : 0;
+    return t;
+  }
+  // After the last layer's router: copy this pass's rows x layers records
+  // from the device mirror to the host rings (one launch per pass).
+  void vz_publish(int rows, bool batched) {
+    if (!viz::on()) return;
+    const VizTap d = vz_tap(0, batched, false, rows), h = vz_tap(0, batched, true, rows);
+    if (!d.ring || !h.ring) return;
+    const int n = rows * g_cfg.layers;
+    k_viz_publish<<<(n + 255) / 256, 256, 0, g_str>>>(d, h, rows, g_cfg.layers);
+  }
   int* p_vbase = nullptr;        // pinned staging for d_vbase
   int pad_id = 248044;
 
@@ -838,6 +885,7 @@ struct GpuModel {
     bound_ = s;
     ropecs_base_ = -1;   // rope cos/sin table belongs to the previous slot
     xf16_src = nullptr;  // so does the bf16 conversion cache
+    viz::ensure(s);      // QWENOX_VIZ: slot ring exists before any capture on it
   }
 
   // D2-S1c: per-slot state accessors for multi-segment verify. The bound
@@ -2196,7 +2244,9 @@ struct GpuModel {
     snprintf(buf, sizeof buf, "layers.%d.mlp.gate.weight", l);
     gemv(wview(ckpt.at(buf)), x, d_router);
     int k = g_cfg.topk;
-    k_router_topk<<<1, 512, 0, g_str>>>(d_router, d_topids, d_topw, g_cfg.experts, k);
+    k_router_topk<<<1, 512, 0, g_str>>>(d_router, d_topids, d_topw, g_cfg.experts, k,
+                                        vz_tap(l, false));
+    if (l == g_cfg.layers - 1) vz_publish(1, false);
     if (dbg) {
       int hi[16];
       float hw[16];
@@ -2458,6 +2508,10 @@ struct GpuModel {
   void enq_final() {
     gr_read("hyper_connection_mixer", d_x /*h*/);
     gemv(wview(ckpt.at("lm_head.weight")), d_x, d_logits);
+    if (viz::on()) {
+      const VizTap t = vz_tap(g_cfg.layers, false, true);
+      if (t.ring) k_viz_top5<<<1, 256, 0, g_str>>>(d_logits, g_cfg.vocab, t);
+    }
     argmax_rows(d_logits, g_cfg.vocab, 1, d_amx_cand, d_argmax, g_str);
   }
 
@@ -4876,12 +4930,14 @@ struct GpuModel {
 
   // d_routerb [P][512] -> d_topidsb/d_topwb. wave-per-token kernel (bit-
   // identical, aggr 10-05); QWENOX_ROUTER_W32=0 restores the block-per-token one.
-  void router_topk_b(int P, int k) {
+  void router_topk_b(int P, int k, VizTap vt = {}) {
     static const bool w32 = !env_zero("QWENOX_ROUTER_W32");
     if (w32 && g_cfg.experts == 512 && k == 10)
-      k_router_topk_w32<10><<<(P + 7) / 8, 256, 0, g_str>>>(d_routerb, d_topidsb, d_topwb, P);
+      k_router_topk_w32<10><<<(P + 7) / 8, 256, 0, g_str>>>(d_routerb, d_topidsb, d_topwb, P,
+                                                           vt);
     else
-      k_router_topk<<<P, 512, 0, g_str>>>(d_routerb, d_topidsb, d_topwb, g_cfg.experts, k);
+      k_router_topk<<<P, 512, 0, g_str>>>(d_routerb, d_topidsb, d_topwb, g_cfg.experts, k,
+                                          vt);
   }
   bool moe_b(int l, int P, bool try_hcw = false, bool vseg = false) {
     char buf[128];
@@ -4893,7 +4949,8 @@ struct GpuModel {
     snprintf(buf, sizeof buf, "layers.%d.mlp.gate.weight", l);
     gemm(wview(ckpt.at(buf)), d_xb, d_routerb, P);
     int k = g_cfg.topk;
-    router_topk_b(P, k);
+    router_topk_b(P, k, vz_tap(l, true, false, P));  // vseg rows: per-row table
+    if (l == g_cfg.layers - 1) vz_publish(P, true);
     // QWENOX_MOE_UNION_LOG=1: distinct experts across the P rows (P<=8, i.e.
     // verify); decides whether naive-MoE expert dedup is worth it.
     static const bool moe_union_log = getenv("QWENOX_MOE_UNION_LOG") != nullptr;
@@ -5873,6 +5930,10 @@ struct GpuModel {
   void enq_layer_b(int l, int P, bool fuse_prev_mlp = false,
                    bool flush_mlp = true, int base = 0,
                    const int* dvb = nullptr, bool skip_qsa_idx = false) {
+    vz_base_ = base;  // QWENOX_VIZ: this batch's row positions
+    vz_dvb_ = dvb;
+    vz_rowtab_ = nullptr;
+    vz_rows_ = true;
     char attn_prefix[128], mlp_prefix[128];
     snprintf(attn_prefix, sizeof attn_prefix,
              "layers.%d.attn_hyper_connection", l);
@@ -6019,6 +6080,10 @@ struct GpuModel {
   void enq_layer_vseg(int l, const int* Ps, const int* bases, const int* sl,
                       const int* voffs, int nseg, int R, bool fuse_prev_mlp,
                       bool flush_mlp) {
+    if (l == 0 && viz::on()) {  // QWENOX_VIZ: rows of several sequences
+      vz_rowtab_ = viz::rows_table(Ps, bases, sl, voffs, nseg, R);
+      vz_rows_ = vz_rowtab_ != nullptr;
+    }
     char attn_prefix[128], mlp_prefix[128];
     snprintf(attn_prefix, sizeof attn_prefix,
              "layers.%d.attn_hyper_connection", l);
@@ -7246,7 +7311,7 @@ struct GpuModel {
     gemv(wview(ckpt.at(buf)), x, d_router);
     int k = g_cfg.topk;
     k_router_topk<<<1, 512, 0, g_str>>>(d_router, d_topids, d_topw, g_cfg.experts,
-                                        k);
+                                        k, VizTap{});
     if (gg_mtp_on()) {  // GGUF sidecar experts (Q8_0)
       moe_gguf(g_ggx_mtp, x, d_topids, d_topw, d_moeacc, 1);
     } else {
@@ -7986,6 +8051,13 @@ struct GpuModel {
   // Produce logits for every batch row's final stream. Rows remain live in
   // d_Rb after prefill_batch, and the multi-row lm_head streams weights once.
   void batch_logits_device(int P) {
+    batch_logits_device_(P);
+    if (viz::on()) {  // QWENOX_VIZ: top-5 of each row (row positions as tapped)
+      const VizTap t = vz_tap(g_cfg.layers, true, true, P);
+      if (t.ring) k_viz_top5<<<P, 256, 0, g_str>>>(d_logits_b, g_cfg.vocab, t);
+    }
+  }
+  void batch_logits_device_(int P) {
     gr_read_b("hyper_connection_mixer", P);
     const WView& lw = wview(ckpt.at("lm_head.weight"));
     // QWENOX_DENSE_WMMA: k_ht_wmma takes all P <= 48 rows in one weight
@@ -10219,6 +10291,7 @@ struct GpuModel {
   // (g1_exec/g2_exec are per-slot, declared with the slot state above)
   bool graphs_ok = false;
   void build_graphs() {
+    viz::ensure(bound_);  // QWENOX_VIZ: the ring pointer is baked into the graphs
     if (dbg || perf || getenv("QWENOX_NOGRAPH")) return;
     // pre-populate lazy caches (hipMalloc/hipMemcpy are illegal during capture)
     for (int l = 0; l < g_cfg.layers; l++) {
@@ -10456,6 +10529,10 @@ struct GpuModel {
     kv_prepare(base, base + P);
     *p_vgbase = base;
     CK(hipMemcpyAsync(d_vbase, p_vgbase, 4, hipMemcpyHostToDevice, g_str));
+    vz_base_ = base;  // QWENOX_VIZ: eager parts below tag rows like the replays
+    vz_dvb_ = nullptr;
+    vz_rowtab_ = nullptr;
+    vz_rows_ = true;
     xf16_src = nullptr;  // a new batch invalidates the bf16 conversion cache
     if (ple_on) {
       if (ple_fl.valid) {  // stale flight for another chunk: finish and drop

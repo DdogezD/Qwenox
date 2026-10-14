@@ -1504,7 +1504,7 @@ __global__ void k_axpy(float* __restrict__ acc, const float* __restrict__ y, flo
 // out: ids[k], w[k] with w = p_e / sum(selected p) (official norm_topk_prob).
 // Batched: one block per token, ids/ws rows of 16.
 __global__ void k_router_topk(const float* __restrict__ logits, int* __restrict__ ids,
-                              float* __restrict__ ws, int n, int k) {
+                              float* __restrict__ ws, int n, int k, VizTap vt) {
   logits += (size_t)blockIdx.x * n;
   ids += (size_t)blockIdx.x * 16;
   ws += (size_t)blockIdx.x * 16;
@@ -1533,6 +1533,18 @@ __global__ void k_router_topk(const float* __restrict__ logits, int* __restrict_
   float inv_se = 1.f / sval[0];
   p[t] *= inv_se;
   __syncthreads();
+  float vz_ent = 0.f;
+  if (vt.ring) {  // QWENOX_VIZ only: router softmax entropy (outputs untouched)
+    const float q = p[t];
+    sval[t] = q > 0.f ? -q * __logf(q) : 0.f;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+      if (t < off) sval[t] += sval[t + off];
+      __syncthreads();
+    }
+    vz_ent = sval[0];
+    __syncthreads();
+  }
   for (int j = 0; j < k; j++) {
     sval[t] = p[t];
     sidx[t] = t;
@@ -1555,6 +1567,7 @@ __global__ void k_router_topk(const float* __restrict__ logits, int* __restrict_
     float sw = 0.f;
     for (int j = 0; j < k; j++) sw += raw[j];
     for (int j = 0; j < k; j++) ws[j] = raw[j] / sw;
+    if (vt.ring) viz::store_route(vt, blockIdx.x, ids, ws, k, sw, vz_ent);
   }
 }
 
@@ -1568,7 +1581,8 @@ __global__ void k_router_topk(const float* __restrict__ logits, int* __restrict_
 template <int k>
 __global__ void __launch_bounds__(256) k_router_topk_w32(const float* __restrict__ logits,
                                                          int* __restrict__ ids,
-                                                         float* __restrict__ ws, int P) {
+                                                         float* __restrict__ ws, int P,
+                                                         VizTap vt) {
   const int lane = threadIdx.x & 31;
   const int tok = blockIdx.x * 8 + (threadIdx.x >> 5);
   if (tok >= P) return;
@@ -1603,6 +1617,16 @@ __global__ void __launch_bounds__(256) k_router_topk_w32(const float* __restrict
   const float inv_se = 1.f / s;
 #pragma unroll
   for (int j = 0; j < 16; j++) p[j] *= inv_se;
+  float vz_ent = 0.f;
+  if (vt.ring) {  // QWENOX_VIZ only: router softmax entropy (outputs untouched)
+    float e = 0.f;
+#pragma unroll
+    for (int j = 0; j < 16; j++)
+      if (p[j] > 0.f) e -= p[j] * __logf(p[j]);
+#pragma unroll
+    for (int o = 16; o; o >>= 1) e += __shfl_xor(e, o, 32);
+    vz_ent = e;
+  }
   float raw[k];
 #pragma unroll
   for (int r = 0; r < k; r++) {
@@ -1631,6 +1655,7 @@ __global__ void __launch_bounds__(256) k_router_topk_w32(const float* __restrict
     for (int j = 0; j < k; j++) sw += raw[j];
 #pragma unroll
     for (int j = 0; j < k; j++) ws[j] = raw[j] / sw;
+    if (vt.ring) viz::store_route(vt, tok, ids, ws, k, sw, vz_ent);
   }
 }
 

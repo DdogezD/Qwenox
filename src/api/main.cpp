@@ -1926,6 +1926,74 @@ void handle_memory(const http::Request&, http::Response* r, http::Stream*) {
     r->body = json_py::dumps(j, /*spaced=*/false);
 }
 
+// GET /viz[?slot=S&from=F&n=N] — 运行时可视化数据（引擎 QWENOX_VIZ=1 时有效）。
+// 无参数：各 slot 概况；带 slot：该 slot 当前请求 [F, F+N) 位置的逐层专家路由、
+// 路由集中度/熵、top-5 候选（字段说明见 src/gpu/parts/19_viz.inc），每个位置
+// 另附 b = 该 token 的原始字节（hex，前端按流拼 UTF-8）。允许跨域读取。
+void handle_viz(const http::Request& q, http::Response* r, http::Stream*) {
+    r->set("Access-Control-Allow-Origin", "*");
+    r->set("Cache-Control", "no-store");
+    const auto qp = parse_query(q.query);
+    std::string args;
+    const auto it = qp.find("slot");
+    if (it != qp.end()) {
+        const auto num = [&](const char* k, int d) {
+            const auto f = qp.find(k);
+            return f == qp.end() ? d : atoi(f->second.c_str());
+        };
+        args = std::to_string(atoi(it->second.c_str())) + " " +
+               std::to_string(num("from", 0)) + " " + std::to_string(num("n", 64));
+    }
+    std::string line, err;
+    {
+        std::lock_guard<std::mutex> lk(g_conn_mtx);
+        if (!g_ctl.connected()) g_ctl.connect(g_cfg.engine_addr, &err);
+    }
+    if (!g_ctl.viz(args, &line, &err) || line.size() < 2 || line[0] != 'V') {
+        r->status = 502;
+        r->body = http::error_json("engine viz query failed: " + err, "server_error",
+                                   "server_error");
+        return;
+    }
+    json j = json::parse(line.substr(2), nullptr, false);
+    if (j.is_discarded()) {
+        r->status = 502;
+        r->body = http::error_json("invalid engine viz reply", "server_error", "server_error");
+        return;
+    }
+    if (g_tok_ready && j.contains("items") && j["items"].is_array()) {
+        static const char* hx = "0123456789abcdef";
+        for (auto& itm : j["items"]) {
+            if (!itm.contains("t")) continue;
+            const int t = itm["t"].get<int>();
+            const std::string b = g_tok.decode_bytes({t}, false);
+            std::string h;
+            h.reserve(b.size() * 2);
+            for (unsigned char ch : b) {
+                h += hx[ch >> 4];
+                h += hx[ch & 15];
+            }
+            itm["b"] = h;
+            if (g_tok.is_special_token(t)) itm["sp"] = 1;
+            if (itm.contains("k") && itm["k"].is_array()) {  // top-5 candidates' bytes
+                json kb = json::array();
+                for (const auto& kv : itm["k"]) {
+                    const int kt = kv.get<int>();
+                    std::string kh;
+                    if (kt >= 0)
+                        for (unsigned char ch : g_tok.decode_bytes({kt}, false)) {
+                            kh += hx[ch >> 4];
+                            kh += hx[ch & 15];
+                        }
+                    kb.push_back(kh);
+                }
+                itm["kb"] = kb;
+            }
+        }
+    }
+    r->body = j.dump();
+}
+
 // GET /power — APU 功耗与温度瞬时值（Windows ADL PMLog / Linux amdgpu hwmon +
 // k10temp），
 // 读不到的字段为 null，完全不可用时 available=false。
@@ -3595,6 +3663,7 @@ int main(int argc, char** argv) {
     srv.on("GET", "/health", handle_health);
     srv.on("GET", "/memory", handle_memory);
     srv.on("GET", "/power", handle_power);
+    srv.on("GET", "/viz", handle_viz);
     srv.on("GET", "/cache", handle_cache);
     srv.on("GET", "/reqstat/summary", handle_reqstat_summary);
     srv.on("GET", "/reqstat/tail", handle_reqstat_tail);

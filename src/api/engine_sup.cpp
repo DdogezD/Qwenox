@@ -309,6 +309,9 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
                                 ? std::to_string(kv_pool_tokens).c_str()
                                 : nullptr);
     SetEnvironmentVariableA("QWENOX_PARALLEL", std::to_string(parallel).c_str());
+    // VIZ=1（见 service.conf）：运行时可视化埋点，GET /viz 取数据
+    SetEnvironmentVariableA("QWENOX_VIZ",
+                            svcconf::cfg(conf, "VIZ", "0") == "1" ? "1" : nullptr);
     // MAX_IMAGES 同时被本进程（API 的 vision::max_images）读取：
     // SetEnvironmentVariableA 只改 Win32 环境块，本进程 CRT 的 getenv 看不到，
     // 必须用 _putenv（CRT 缓存与 Win32 块一起更新，子进程照常继承）。
