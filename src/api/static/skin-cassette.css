@@ -898,9 +898,9 @@
   [data-style="cassette"] .sidebar-foot { gap: 16px; }
 }
 
+/* 右侧装饰件（磁带轮 / 读卡机 / 寄存器灯）是推理状态指示，减少动画时照常动 */
 @media (prefers-reduced-motion: reduce) {
   [data-style="cassette"] .main, [data-style="cassette"] .page { animation: none; }
-  [data-style="cassette"] body:has(#busy-dot.busy) .reel { animation: none; }
   [data-style="cassette"] .brand-dot.busy { animation: none; }
   [data-style="cassette"] .nav-btn, [data-style="cassette"] .hw-switch-knob { transition: none; }
 }

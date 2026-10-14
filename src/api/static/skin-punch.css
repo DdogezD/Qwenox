@@ -913,15 +913,9 @@
   [data-style="punch"] .sidebar-foot { gap: 16px; }
   [data-style="punch"] .sk-scale { display: none; }
 }
+/* 右侧装饰件（磁带轮 / 读卡机 / 寄存器灯）是推理状态指示，减少动画时照常动 */
 @media (prefers-reduced-motion: reduce) {
   [data-style="punch"] .page { animation: none; }
-  [data-style="punch"] body:has(#busy-dot.busy) .dc:nth-child(5), [data-style="punch"] body:has(#busy-dot.busy) .hopper { animation: none; }
-  /* 不闪的时候推理态换一组静态图案（与空闲不同），不能全灭 */
-  [data-style="punch"] body:has(#busy-dot.busy) .lamps i { animation: none; }
-  [data-style="punch"] body:has(#busy-dot.busy) .lamps i:nth-child(3n+1) {
-    background: radial-gradient(circle at 50% 40%, #fff4d2, #ffcf6a 55%, #d9922a);
-    box-shadow: 0 0 0 1.5px #050709, 0 0 8px 1px rgba(255, 200, 90, .6);
-  }
   [data-style="punch"] .brand-dot.busy { animation: none; }
   [data-style="punch"] .nav-btn, [data-style="punch"] .hw-switch-knob, [data-style="punch"] .sk-dial, [data-style="punch"] .bar-fill { transition: none; }
 }
