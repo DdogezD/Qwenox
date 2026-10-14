@@ -5529,8 +5529,33 @@ struct GpuModel {
       // tile 一个 CTA 解码一遍），逐 bit 不变；默认开，QWENOX_MOE_MT=0 回退。
       // microbench：P=2048 亏 5%、4096 +1.8%、8192 +7.5%、16384 +5.5%——按平均
       // 每专家 slot 数 >= 80 设门槛，小 P（tail chunk / 短 prompt）走原路径。
+      // QWENOX_MOE_A4 —— 已废弃的实验开关（10-14 hipfire IU4 对照），默认关，
+      // 不要在生产或测速口径里打开：
+      //   * 精度：MoE 激活量化成 4-bit，不逐 bit。Windows KLD（bf16_c512）
+      //     0.1075 → 0.1427（=3，+0.035；=1 +0.020，=2 +0.015），远超 +0.002 门槛。
+      //   * 并发：A4 量化缓冲是进程内一份 static，两路 prefill（PARALLEL）同时开
+      //     会互相覆盖，结果错误；且强制 BN64 tile（关掉 mt/hyb）。
+      //   * 收益：64K 稳态 1609 → 1752（=3，+8.9%），不足以抵消上述代价。
+      // 代码只为留档/复测保留（k_quant_a4 / k_moe_iu4 在 27_kernels_moe_lut.inc，
+      // 原型 tools/moe_iu4_proto.cu）。取值为位掩码：1 = gate/up，2 = down，3 = 两者。
+      static const int moe_a4_env = [] {
+        const char* e = getenv("QWENOX_MOE_A4");
+        return e && *e ? atoi(e) & 3 : 0;
+      }();
+      const int a4m = (!vseg && !env_zero("QWENOX_V2_PAIRS_F16")) ? moe_a4_env : 0;
+      const bool a4 = a4m != 0, a4_up = a4m & 1, a4_dn = a4m & 2;
+      if (a4) {
+        static bool la = false;
+        if (!la) {
+          la = true;
+          fprintf(stderr,
+                  "警告: QWENOX_MOE_A4=%d 已废弃（W4A4 iu4，%s%s）：KLD 明显变差（约 +0.015~0.035），"
+                  "且与并发 prefill 不兼容（共享缓冲会互相覆盖）。仅供复测，请勿用于生产。\n",
+                  a4m, a4_up ? "up " : "", a4_dn ? "down" : "");
+        }
+      }
       static const bool moe_mt_env = !env_zero("QWENOX_MOE_MT");
-      const bool mt = moe_mt_env && (int64_t)P * k >= 80 * E;
+      const bool mt = moe_mt_env && !a4 && (int64_t)P * k >= 80 * E;
       // Hybrid tiling (10-14, default on, QWENOX_MOE_HYB=0 = the mt/64 rule
       // above): full 128-slot super-tiles on the BN=128 kernels + one <=64-slot
       // remainder per expert on the BN=64 kernels. Bit-identical to both other
@@ -5538,7 +5563,7 @@ struct GpuModel {
       // up/down per token vs production P=2048 2.94/1.58 -> 2.93/1.53 us,
       // 4096 2.56/1.25 -> 2.47/1.26, 8192 2.30/1.14 -> 2.26/1.13.
       static const bool moe_hyb_env = !env_zero("QWENOX_MOE_HYB") && d_moetilesA;
-      const bool hyb = moe_hyb_env && !vseg;
+      const bool hyb = moe_hyb_env && !vseg && !a4;
       int max_tiles;
       if (hyb) {
         k_moe_tiles_hyb<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, d_moetilesA,
@@ -5557,7 +5582,25 @@ struct GpuModel {
       KP("moe:up");
       // up + mid fused (方向 3): hid = fwht(silu(g)*u*suh) 直接落盘，
       // 省掉 guv16 的写读往返和 k_i4r_mid 那次 launch，数学逐位一致。
-      if (hyb) {
+      static uint8_t *a4x = nullptr, *a4h = nullptr;
+      static float *a4xs = nullptr, *a4hs = nullptr;
+      if (a4 && !a4x) {
+        const size_t cap = (size_t)maxbatch_cap;
+        CK(hipMalloc(&a4x, cap * d / 2));
+        CK(hipMalloc(&a4xs, cap * (d / 128) * 4));
+        CK(hipMalloc(&a4h, cap * k * mid / 2));
+        CK(hipMalloc(&a4hs, cap * k * (mid / 128) * 4));
+      }
+      if (a4_up) {
+        k_quant_a4<<<(unsigned)(((size_t)P * (d / 128) + 7) / 8), 256, 0, g_str>>>(x16, P, d, a4x,
+                                                                                  a4xs);
+        const Iu4W qgu{gu.data, gu.data + gu.rows * gu.cols / 2, 2 * mid, mid};
+        k_moe_iu4<true><<<dim3(mid / 128, max_tiles), 256, 0, g_str>>>(
+            qgu, a4x, a4xs, d_tokidx, d_moetiles, d_moentiles, hid, mid, d, gu.svh, dn.suh);
+      } else if (a4) {
+        moe_lut_up_mid(pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, hid, gu.svh, dn.suh,
+                       mid, d, g_str);
+      } else if (hyb) {
         moe_lut_up_mid_mt(pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, hid, gu.svh,
                           dn.suh, mid, d, g_str);
         moe_lut_up_mid(pgu, x16, d_tokidx, d_moetilesA, d_moentilesA, max_tiles_a, hid, gu.svh,
@@ -5576,7 +5619,17 @@ struct GpuModel {
       // mean_kld 0.106993(关) → 0.107705(开)，门槛 0.10699+0.002=0.10899 过线，
       // 默认开；QWENOX_V2_PAIRS_F16=0 回退 fp32 pairs。
       static const bool pairs_f16 = !env_zero("QWENOX_V2_PAIRS_F16");
-      if (hyb) {
+      if (a4_dn) {
+        k_quant_a4<<<(unsigned)(((size_t)P * k * (mid / 128) + 7) / 8), 256, 0, g_str>>>(
+            hid, P * k, mid, a4h, a4hs);
+        const Iu4W qdn{dn.data, dn.data + dn.rows * dn.cols / 2, d, 0};
+        k_moe_iu4<false><<<dim3(d / 128, max_tiles), 256, 0, g_str>>>(
+            qdn, a4h, a4hs, nullptr, d_moetiles, d_moentiles, (__half*)d_guvb, d, mid, nullptr,
+            nullptr);
+      } else if (a4) {
+        moe_lut_down(moelut::kI4R, pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d, mid,
+                     g_str, true);
+      } else if (hyb) {
         moe_lut_down_mt(pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d, mid, g_str,
                         pairs_f16);
         moe_lut_down(moelut::kI4R, pdn, hid, d_moetilesA, d_moentilesA, max_tiles_a, d_guvb, d,

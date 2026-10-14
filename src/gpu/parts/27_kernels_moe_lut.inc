@@ -1000,3 +1000,256 @@ static bool moe_ggx_down(int type, const uint8_t* dn, const __half* hid, const M
   p.e_rows = m;
   return moe_lut_down(type, p, hid, tiles, ntiles, max_tiles, pairs, m, k, st);
 }
+
+// --- W4A4 routed experts (QWENOX_MOE_A4) — DEPRECATED, kept for reference ---
+// 已废弃：KLD +0.015~0.035（远超 +0.002 门槛），static 缓冲与并发 prefill 不
+// 兼容；端到端只 +8.9%。默认关，不再维护，见 40_model.inc moe_b_v2 处说明。
+// hipfire-style IU4 route for hgn v2 i4r experts (10-14; prototype and A/B in
+// tools/moe_iu4_proto.cu, notes dev-docs/HIPFIRE-PREFILL-GAP-GPUONLY.md §8).
+// Activations are quantized to int4 per 128 elements (k_quant_a4) and the
+// expert GEMMs run v_wmma_i32_16x16x16_iu4 (2x the f16 WMMA rate on gfx1151;
+// i4r nibbles need only ^0x8, no decode). Trades KLD for MoE speed.
+namespace moeiu4 {
+typedef int v8i __attribute__((ext_vector_type(8)));
+typedef int v2i __attribute__((ext_vector_type(2)));
+}  // namespace moeiu4
+
+// ---------------------------------------------------------------------------
+// A4 activation quantization: one wave per (row, 128-element block).
+__global__ void __launch_bounds__(256)
+    k_quant_a4(const __half* __restrict__ x, int N, int K, uint8_t* __restrict__ q,
+               float* __restrict__ s) {
+  const int lane = threadIdx.x & 31;
+  const int nb = K / 128;
+  const long wid = (long)blockIdx.x * 8 + (threadIdx.x >> 5);
+  if (wid >= (long)N * nb) return;
+  const long row = wid / nb;
+  const int blk = (int)(wid % nb);
+  const uint2 raw = *reinterpret_cast<const uint2*>(x + row * K + blk * 128 + lane * 4);
+  const __half2 h01 = __builtin_bit_cast(__half2, raw.x), h23 = __builtin_bit_cast(__half2, raw.y);
+  float v[4] = {__low2float(h01), __high2float(h01), __low2float(h23), __high2float(h23)};
+  float amax = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor(amax, o, 32));
+  float best_s = 0.f, best_e = INFINITY;
+  if (amax > 0.f) {
+    const float cand[5] = {1.0f, 0.9f, 0.8f, 0.7f, 0.6f};
+#pragma unroll
+    for (int c = 0; c < 5; ++c) {
+      const float sc = cand[c] * amax / 7.f, inv = 1.f / sc;
+      float e = 0.f;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const float qi = fminf(fmaxf(rintf(v[i] * inv), -8.f), 7.f);
+        const float d = v[i] - qi * sc;
+        e += d * d;
+      }
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) e += __shfl_xor(e, o, 32);
+      if (e < best_e) {  // wave-uniform
+        best_e = e;
+        best_s = sc;
+      }
+    }
+  }
+  uint32_t packed = 0;
+  if (best_s > 0.f) {
+    const float inv = 1.f / best_s;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int qi = (int)fminf(fmaxf(rintf(v[i] * inv), -8.f), 7.f);
+      packed |= (uint32_t)(qi & 15) << (4 * i);
+    }
+  }
+  reinterpret_cast<uint16_t*>(q + row * (K / 2) + blk * 64)[lane] = (uint16_t)packed;
+  if (lane == 0) s[row * nb + blk] = best_s;
+}
+
+// ---------------------------------------------------------------------------
+// W4A4 routed-expert GEMM. Weight rows: i4r code plane (row stride k/2 bytes,
+// byte b = elements 2b | 2b+1 << 4, value nib-8), scale plane fp16 per 128.
+struct Iu4W {
+  const uint8_t* codes;
+  const uint8_t* sc;
+  int e_rows, up_off;
+};
+
+template <bool kUp>
+__launch_bounds__(256) __global__
+    void k_moe_iu4(Iu4W p, const uint8_t* __restrict__ x4, const float* __restrict__ xs,
+                   const int* __restrict__ tokidx, const MoeTile* __restrict__ tiles,
+                   const int* __restrict__ ntiles, __half* __restrict__ out, int m, int k,
+                   const float* __restrict__ svh_gu, const float* __restrict__ suh_dn) {
+  constexpr int BM = 128, BN = 64, T = BN / 16;
+  constexpr int kActStrideB = 80;  // 64 B codes + 16 B pad: 8-lane phases conflict-free
+  constexpr int kCodeBytes = BM * 64, kWscBytes = BM * 2, kActBytes = BN * kActStrideB,
+                kSaBytes = BN * 4;
+  constexpr int kStage = kCodeBytes + kWscBytes + kActBytes + kSaBytes;
+  constexpr int kMidRow = BM + 8;
+  constexpr int kPlaneB = BN * kMidRow * 2;
+  constexpr int kStageOff = kUp ? kPlaneB : 0;
+  constexpr int kLds = kUp ? kStageOff + (kStage > kPlaneB ? kStage : kPlaneB) : kStage;
+  __shared__ __attribute__((aligned(16))) uint8_t lds[kLds];
+  uint4* s_codes = reinterpret_cast<uint4*>(lds + kStageOff);
+  __half* s_wsc = reinterpret_cast<__half*>(lds + kStageOff + kCodeBytes);
+  uint8_t* s_act = lds + kStageOff + kCodeBytes + kWscBytes;
+  float* s_sa = reinterpret_cast<float*>(lds + kStageOff + kCodeBytes + kWscBytes + kActBytes);
+
+  if ((int)blockIdx.y >= *ntiles) return;
+  const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, sub = lane & 15, half = lane >> 4;
+  const MoeTile tile = tiles[blockIdx.y];
+  const int slot0 = tile.first, nrows = tile.count, live = (nrows + 15) / 16;
+  const int r_block = (int)blockIdx.x * BM;
+  const int nst = k / 128, nb = k / 128;
+  const size_t wrb = (size_t)k / 2, wsb = (size_t)nb * 2;
+
+  // weight fetch: thread -> LDS slot fs (2 threads/slot, 32 B each); slot
+  // 2l+h of a 16-row wave block holds local row 8h+l (packed C epilogue).
+  const int fs = tid >> 1, fpart = tid & 1;
+  const int flr = (fs & ~15) | ((fs & 1) << 3) | ((fs & 15) >> 1);
+  const uint8_t* fw;
+  const uint8_t* fsc;
+  const auto set_fetch = [&](int pass) {
+    const size_t grow = (size_t)tile.expert * p.e_rows + (pass ? p.up_off : 0) + r_block + flr;
+    fw = p.codes + grow * wrb + fpart * 32;
+    fsc = p.sc + grow * wsb;
+  };
+  // activation fetch: thread -> (token at, 16 B chunk ac)
+  const int at = tid >> 2, ac = tid & 3;
+  const uint8_t* fa = nullptr;
+  const float* fas = nullptr;
+  if (at < nrows) {
+    const int src = tokidx ? tokidx[slot0 + at] : slot0 + at;
+    fa = x4 + (size_t)src * wrb + ac * 16;
+    fas = xs + (size_t)src * nb;
+  }
+  uint4 rw0, rw1, ra;
+  uint16_t rws = 0;
+  float ras = 0.f;
+  const auto fetch = [&](int st) {
+    rw0 = reinterpret_cast<const uint4*>(fw + st * 64)[0];
+    rw1 = reinterpret_cast<const uint4*>(fw + st * 64)[1];
+    if (fpart == 0) rws = reinterpret_cast<const uint16_t*>(fsc)[st];
+    ra = fa ? *reinterpret_cast<const uint4*>(fa + st * 64) : make_uint4(0u, 0u, 0u, 0u);
+    if (ac == 0) ras = fa ? fas[st] : 0.f;
+  };
+  const auto swz = [](int slot, int c) { return slot * 4 + (c ^ ((slot >> 1) & 3)); };
+  const auto commit = [&]() {
+    constexpr uint32_t kFlip = 0x88888888u;  // offset binary -> two's complement
+    s_codes[swz(fs, fpart * 2)] = make_uint4(rw0.x ^ kFlip, rw0.y ^ kFlip, rw0.z ^ kFlip, rw0.w ^ kFlip);
+    s_codes[swz(fs, fpart * 2 + 1)] = make_uint4(rw1.x ^ kFlip, rw1.y ^ kFlip, rw1.z ^ kFlip, rw1.w ^ kFlip);
+    if (fpart == 0) s_wsc[flr] = __builtin_bit_cast(__half, rws);
+    *reinterpret_cast<uint4*>(s_act + at * kActStrideB + ac * 16) = ra;
+    if (ac == 0) s_sa[at] = ras;
+  };
+
+  moegg::v8f acc[T];
+  const int slot = wave * 16 + sub;
+  const auto compute = [&]() {
+    uint4 a[4];
+#pragma unroll
+    for (int c = 0; c < 4; ++c) a[c] = s_codes[swz(slot, c)];
+    const uint4 wsv = *reinterpret_cast<const uint4*>(s_wsc + wave * 16 + half * 8);
+    const uint32_t wsw[4] = {wsv.x, wsv.y, wsv.z, wsv.w};
+    float ws[8];
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const __half2 h = __builtin_bit_cast(__half2, wsw[q]);
+      ws[2 * q] = __low2float(h);
+      ws[2 * q + 1] = __high2float(h);
+    }
+#pragma unroll
+    for (int j = 0; j < T; ++j) {
+      if (j >= live) continue;  // block-uniform
+      const int t = j * 16 + sub;
+      const uint8_t* ap = s_act + t * kActStrideB;
+      moeiu4::v8i ci = moeiu4::v8i{0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+      for (int c = 0; c < 4; ++c) {
+        const uint4 b = *reinterpret_cast<const uint4*>(ap + c * 16);
+        ci = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, moeiu4::v2i{(int)a[c].x, (int)a[c].y}, true,
+                                                         moeiu4::v2i{(int)b.x, (int)b.y}, ci, false);
+        ci = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, moeiu4::v2i{(int)a[c].z, (int)a[c].w}, true,
+                                                         moeiu4::v2i{(int)b.z, (int)b.w}, ci, false);
+      }
+      const float sa = s_sa[t];
+#pragma unroll
+      for (int l = 0; l < 8; ++l) acc[j][l] = fmaf((float)ci[l], ws[l] * sa, acc[j][l]);
+    }
+  };
+
+  const auto spill = [&](__half* plane) {
+#pragma unroll
+    for (int j = 0; j < T; ++j) {
+      if (j >= live) break;
+      const int t = j * 16 + sub;
+      if (t >= nrows) continue;
+      __half2 h2[4];
+#pragma unroll
+      for (int q = 0; q < 4; ++q)
+        h2[q] = __halves2half2(__float2half(acc[j][2 * q]), __float2half(acc[j][2 * q + 1]));
+      uint4 v;
+      __builtin_memcpy(&v, h2, 16);
+      *reinterpret_cast<uint4*>(plane + t * kMidRow + wave * 16 + half * 8) = v;
+    }
+  };
+
+  for (int pass = 0; pass < (kUp ? 2 : 1); ++pass) {
+    set_fetch(pass);
+#pragma unroll
+    for (int j = 0; j < T; ++j) acc[j] = moegg::v8f{0, 0, 0, 0, 0, 0, 0, 0};
+    fetch(0);
+    for (int st = 0; st < nst; ++st) {
+      commit();
+      __syncthreads();
+      if (st + 1 < nst) fetch(st + 1);
+      compute();
+      __syncthreads();
+    }
+    if constexpr (kUp) spill(reinterpret_cast<__half*>(lds) + (pass ? kPlaneB / 2 : 0));
+  }
+
+  if constexpr (kUp) {
+    __syncthreads();
+    const __half* gplane = reinterpret_cast<const __half*>(lds);
+    const __half* uplane = gplane + kPlaneB / 2;
+    for (int s = wave; s < nrows; s += 8) {  // == k_moe_lut kMid mid_slot
+      const __half* gr = gplane + s * kMidRow;
+      const __half* ur = uplane + s * kMidRow;
+      float g[4], u[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        g[j] = __half2float(gr[j * 32 + lane]);
+        u[j] = __half2float(ur[j * 32 + lane]);
+      }
+      hv2::fwht128(g[0], g[1], g[2], g[3], lane);
+      hv2::fwht128(u[0], u[1], u[2], u[3], lane);
+      float v[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int i = r_block + j * 32 + lane;
+        const float gg = g[j] * hv2::kRs128 * svh_gu[i];
+        const float uu = u[j] * hv2::kRs128 * svh_gu[m + i];
+        v[j] = gg / (1.f + expf(-gg)) * uu * suh_dn[i];
+      }
+      hv2::fwht128(v[0], v[1], v[2], v[3], lane);
+      __half* o = out + (size_t)(slot0 + s) * m + r_block;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) o[j * 32 + lane] = __float2half(v[j] * hv2::kRs128);
+    }
+  } else {
+    const int rr = r_block + wave * 16 + half * 8;
+#pragma unroll
+    for (int j = 0; j < T; ++j) {
+      if (j >= live) break;
+      const int t = j * 16 + sub;
+      if (t >= nrows) continue;
+      __half2 h2[4];
+#pragma unroll
+      for (int q = 0; q < 4; ++q) h2[q] = __floats2half2_rn(acc[j][2 * q], acc[j][2 * q + 1]);
+      uint4 v;
+      __builtin_memcpy(&v, h2, 16);
+      *reinterpret_cast<uint4*>(out + (size_t)(slot0 + t) * m + rr) = v;
+    }
+  }
+}
