@@ -115,6 +115,47 @@ The engine uses `tools/run_capped.sh`, with a default memory cap of 86 GiB and a
 If there is no progress in logs, engine I/O, or GPU GTT allocation for 60 seconds during loading, startup stops; the maximum
 startup time is 360 seconds. Exit only cleans up the processes started this time.
 
+### Anthropic Messages API
+
+Besides the OpenAI endpoints, the API serves the Anthropic protocol:
+`POST /v1/messages` and `POST /v1/messages/count_tokens`. Point Anthropic
+clients such as Claude Code at `http://<host>:8731` (for example
+`ANTHROPIC_BASE_URL=http://<host>:8731`). The `x-api-key`,
+`anthropic-version` and `anthropic-beta` headers are accepted but not checked,
+and the `model` field does not select a model.
+
+The request is translated into a chat body and runs through the same template,
+tool parser and server overrides as `/v1/chat/completions` (override entries
+apply by their chat field names). Field mapping:
+
+| Anthropic | This server |
+|---|---|
+| `system` (string or text blocks) | system message |
+| `text` / `image` (base64) / plain-text `document` blocks | user content; URL images are not fetched (400) |
+| `tool_use` / `tool_result` blocks | assistant `tool_calls` / tool messages |
+| `thinking` blocks in history | `reasoning_content` (`redacted_thinking` ignored) |
+| trailing assistant message | prefill: the reply continues from it, the prefill is not echoed, no thinking is produced |
+| `thinking.type` enabled/adaptive/disabled | `enable_thinking`; `budget_tokens` ignored |
+| `output_config.effort` | `reasoning_effort` |
+| `tools[].input_schema` | function parameters; server tools without `input_schema` (web_search etc.) are ignored |
+| `tool_choice` auto/any/tool/none | auto/required/named function/none |
+| `stop_sequences` | `stop`; a match gives `stop_reason=stop_sequence` and fills `stop_sequence` |
+
+`temperature`, `top_p`, `top_k` and `max_tokens` pass through unchanged; this
+server's chat extensions (`min_p`, `seed`, `enable_thinking`,
+`tool_call_format`, ...) are accepted in the request as well.
+
+Responses carry Anthropic `thinking` (empty `signature`), `text` and `tool_use`
+content blocks; `stop_reason` is `end_turn` / `max_tokens` / `stop_sequence` /
+`tool_use`; `usage.cache_read_input_tokens` is the KV prefix-cache hit and
+`input_tokens` the remainder. Streaming emits `message_start`,
+`content_block_start` / `content_block_delta` (`thinking_delta`, `text_delta`,
+`input_json_delta`) / `content_block_stop`, `message_delta` and `message_stop`,
+with `ping` events while queued or prefilling. Errors use
+`{"type":"error","error":{"type":...,"message":...}}`, sent as an `error` event
+once the stream has started. `count_tokens` renders the same template and
+returns `input_tokens`.
+
 ## Build Environment
 
 Verified environment: Ubuntu, `gfx1151` GPU, ROCm HIP 7.x / AMD clang.

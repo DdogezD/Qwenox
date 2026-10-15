@@ -149,6 +149,42 @@ curl -X POST http://127.0.0.1:8731/admin/overrides -H 'Content-Type: application
 加载阶段持续 60 秒没有日志、引擎 I/O 或 GPU GTT 分配进展会停止;最长
 启动时间 360 秒。退出只清理本次启动的进程。
 
+### Anthropic Messages 接口
+
+除 OpenAI 接口外,API 还提供 Anthropic 协议:`POST /v1/messages` 和
+`POST /v1/messages/count_tokens`。Claude Code 等 Anthropic 客户端把基址设为
+`http://<主机>:8731` 即可(例如 `ANTHROPIC_BASE_URL=http://<主机>:8731`),
+`x-api-key` / `anthropic-version` / `anthropic-beta` 请求头接受但不校验,
+`model` 字段不参与选模型。
+
+请求转成 chat 请求体后走与 `/v1/chat/completions` 相同的模板、工具解析和
+服务端覆盖(覆盖表按 chat 字段生效)。字段对应:
+
+| Anthropic | 本服务 |
+|---|---|
+| `system`(字符串或 text 块) | system 消息 |
+| `text` / `image`(base64)/ 纯文本 `document` 块 | 用户内容;URL 图片不拉取,返回 400 |
+| `tool_use` / `tool_result` 块 | assistant `tool_calls` / tool 消息 |
+| 历史中的 `thinking` 块 | `reasoning_content`(`redacted_thinking` 忽略) |
+| 末条 assistant 消息 | 预填:回复从它续写,不回显预填内容,不输出思考 |
+| `thinking.type` enabled/adaptive/disabled | `enable_thinking`;`budget_tokens` 忽略 |
+| `output_config.effort` | `reasoning_effort` |
+| `tools[].input_schema` | 函数参数;无 `input_schema` 的服务端工具(web_search 等)忽略 |
+| `tool_choice` auto/any/tool/none | auto/required/指定函数/none |
+| `stop_sequences` | `stop`;命中时 `stop_reason=stop_sequence` 并回填 `stop_sequence` |
+
+`temperature`、`top_p`、`top_k`、`max_tokens` 同名透传;本服务的 chat 扩展字段
+(`min_p`、`seed`、`enable_thinking`、`tool_call_format` 等)也可直接写在请求里。
+
+响应按 Anthropic 格式返回 `thinking`(`signature` 为空串)、`text`、`tool_use`
+内容块;`stop_reason` 为 `end_turn` / `max_tokens` / `stop_sequence` / `tool_use`;
+`usage.cache_read_input_tokens` 是 KV 前缀缓存命中的 token 数,
+`input_tokens` 为其余部分。流式按 `message_start`、`content_block_start` /
+`content_block_delta`(`thinking_delta`、`text_delta`、`input_json_delta`)/
+`content_block_stop`、`message_delta`、`message_stop` 输出,排队和 prefill 期间发
+`ping`。错误使用 `{"type":"error","error":{"type":...,"message":...}}`,流已开始后
+以 `error` 事件发出。`count_tokens` 按同一模板渲染后返回 `input_tokens`。
+
 ## 编译环境
 
 验证环境:Ubuntu,`gfx1151` GPU,ROCm HIP 7.x / AMD clang。

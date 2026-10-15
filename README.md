@@ -6,7 +6,7 @@
 
 Qwenox 是 Qwen3.8-Flash-Next(177B MoE,qwen4_exp 架构)的本地推理引擎,为 AMD Strix Halo
 (Ryzen AI Max+ 395,gfx1151)这类 128 GB 统一内存的 APU 编写,Linux 和 Windows 都能运行。
-对外提供 OpenAI 兼容 API(流式输出、工具调用、图片输入)和网页控制台。
+对外提供 OpenAI 兼容 API 和 Anthropic Messages API(流式输出、工具调用、图片输入)以及网页控制台。
 
 几个关键做法:
 
@@ -126,7 +126,7 @@ hf download Qwen/Qwen3.8-Flash-Next tokenizer.json --local-dir ./models/tokenize
 
 Linux 和 Windows 用同一份源码、同一个 `models/` 目录和同一份 `service.conf`。按上一节下载权重,
 把路径填进 `service.conf`,再按自己的系统编译、启动。启动后 API 在 `http://<主机>:8731/v1`
-(标准 OpenAI 接口,支持流式),浏览器打开 `http://<主机>:8731/` 是控制台。
+(标准 OpenAI 接口,支持流式;Anthropic 客户端用 `http://<主机>:8731/v1/messages`),浏览器打开 `http://<主机>:8731/` 是控制台。
 
 ### 填写权重路径
 

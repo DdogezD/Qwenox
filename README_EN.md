@@ -6,8 +6,8 @@
 
 Qwenox is a local inference engine for Qwen3.8-Flash-Next (177B MoE, qwen4_exp architecture). It is written
 for AMD Strix Halo (Ryzen AI Max+ 395, gfx1151) and similar 128 GB unified-memory APUs, and runs on both
-Linux and Windows. It serves an OpenAI-compatible API (streaming, tool calls, image input) and a web
-console.
+Linux and Windows. It serves an OpenAI-compatible API and the Anthropic Messages API (streaming, tool calls, image input)
+and a web console.
 
 Key design points:
 
@@ -135,7 +135,7 @@ The shards land in subdirectories; put their paths into `service.conf` as descri
 
 Linux and Windows share the same source tree, the same `models/` directory and the same `service.conf`.
 Download the weights as described above, put their paths into `service.conf`, then build and start for your
-OS. Once running, the API is at `http://<host>:8731/v1` (standard OpenAI interface, streaming supported), and
+OS. Once running, the API is at `http://<host>:8731/v1` (standard OpenAI interface, streaming supported; Anthropic clients use `http://<host>:8731/v1/messages`), and
 `http://<host>:8731/` in a browser opens the console.
 
 ### Weight paths
