@@ -115,7 +115,7 @@ constexpr UINT_PTR kTimerStatus = 1;
 constexpr uint64_t kPerfTtlMs = 6000;  // 三个 2s 轮询周期：数据必须会过期
 
 enum MenuId : UINT {
-    kIdConsole = 1, kIdCopyUrl, kIdEngStart, kIdEngStop,
+    kIdConsole = 1, kIdCopyUrl, kIdAutoStart, kIdEngStart, kIdEngStop,
     kIdEngineLog, kIdApiLog, kIdLogDir, kIdQuit
 };
 
@@ -299,6 +299,45 @@ void register_app_id() {
     SetCurrentProcessExplicitAppUserModelID(L"Qwenox");
 }
 
+// ---- 开机自启（HKCU Run 项，写当前 exe 路径；只拉起托盘，引擎仍手动启动）----
+// HKCU 无需管理员权限；值缺失 = 关，存在 = 开（不比对路径，改名重指向即覆盖）。
+bool autostart_get() {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+                      L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 0,
+                      KEY_READ, &key) != ERROR_SUCCESS)
+        return false;
+    const DWORD n = RegQueryValueExW(key, L"Qwenox", nullptr, nullptr, nullptr, nullptr);
+    RegCloseKey(key);
+    return n == ERROR_SUCCESS;
+}
+
+std::string autostart_set(bool on) {  // 空串 = 成功，否则为错误描述
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER,
+                        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 0,
+                        nullptr, 0, KEY_WRITE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        return "RegCreateKeyEx: " + std::to_string(GetLastError());
+    LONG r = ERROR_SUCCESS;
+    if (on) {
+        wchar_t path[MAX_PATH]{};
+        const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH)
+            r = ERROR_BAD_PATHNAME;
+        else {
+            const std::wstring cmd = L"\"" + std::wstring(path, n) + L"\"";
+            r = RegSetValueExW(key, L"Qwenox", 0, REG_SZ,
+                               reinterpret_cast<const BYTE*>(cmd.data()),
+                               static_cast<DWORD>((cmd.size() + 1) * sizeof(wchar_t)));
+        }
+    } else {
+        r = RegDeleteValueW(key, L"Qwenox");
+        if (r == ERROR_FILE_NOT_FOUND) r = ERROR_SUCCESS;  // 本来就没开
+    }
+    RegCloseKey(key);
+    return r == ERROR_SUCCESS ? std::string() : "RegSet/DeleteValue: " + std::to_string(r);
+}
+
 void tray_balloon(const std::wstring& title, const std::wstring& text) {
     if (!g_tray_added) return;
     g_nid.uFlags = NIF_INFO;
@@ -369,6 +408,19 @@ void on_menu(UINT id) {
             copy_text(to_w(g_base_url + "/v1"));
             tray_balloon(TR(L"已复制", L"Copied"), to_w(g_base_url + "/v1"));
             break;
+        case kIdAutoStart: {
+            const bool want = !autostart_get();
+            const std::string err = autostart_set(want);
+            if (!err.empty())
+                msgbox(TR("设置开机自启失败：", "Failed to set autostart: ") + err,
+                       MB_OK | MB_ICONERROR);
+            else
+                tray_balloon(want ? TR(L"已开启开机自启", L"Autostart enabled")
+                                  : TR(L"已关闭开机自启", L"Autostart disabled"),
+                             TR(L"下次登录 Windows 时自动拉起托盘。",
+                                L"The tray will start automatically at next login."));
+            break;
+        }
         case kIdEngStart: engine_start(); break;
         case kIdEngStop: engine_stop(); break;
         case kIdEngineLog:
@@ -400,6 +452,8 @@ void show_menu() {
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, kIdConsole, TR(L"打开控制台", L"Open console"));
     AppendMenuW(m, MF_STRING, kIdCopyUrl, TR(L"复制 API 地址", L"Copy API URL"));
+    AppendMenuW(m, MF_STRING | (autostart_get() ? MF_CHECKED : 0), kIdAutoStart,
+                TR(L"开机自启", L"Launch on startup"));
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     const bool can_start = g_eng.state == "stopped" || g_eng.state == "exited";
     const bool can_stop = (g_eng.state == "running" && !g_eng.external) ||
