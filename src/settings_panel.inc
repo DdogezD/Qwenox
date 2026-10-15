@@ -8,6 +8,8 @@
 //   第 1 页 权重：V1（w4b 单文件）/ V2（主体+独立 n-gram）/ GGUF 版本选择，
 //          各版本只显示自己相关的文件行；GGUF 由 qwenox-win 按 weights=gguf 标记
 //          直接启动（GGUF_FILE 首分片 + GGUF_MTP_FILE + GGUF_VISION_FILE）。
+//          V2 另有"prefill 4-bit 加速"勾选框（MOE_A4，勾 = 3 / 不勾 = 0，会降低
+//          prompt 部分精度，检查区出 [警告] 说明代价；V1/GGUF 不显示、原值保留）。
 //   第 2 页 上下文与并发：MAX_CONTEXT / PARALLEL / 并发总池（KV_POOL_TOKENS）/
 //          KV_PAGED / PREFILL_CHUNK / KV 快照（KVSNAP_MAX_GB + KVSNAP_DIR）/
 //          YaRN 勾选（ROPE_FACTOR 按上限自动推导）。
@@ -378,8 +380,12 @@ struct PanelVals {
     std::string rope_factor, rope_original;  // rope_original 无 UI 行，从 conf/环境读
     std::string kvsnap_max_gb;
     std::string kvsnap_dir;  // KVSNAP_DIR：空 = 引擎默认 data\kvsnap
+    std::string moe_a4 = "0";  // MOE_A4：0 关，1–3 开（只对 V2 生效）
     std::string engine_host, engine_port, api_host, api_port;
 };
+
+// MOE_A4（prefill MoE 4-bit 激活，见 service.conf）：1–3 为开，其它一律视为关。
+bool moe_a4_on(const std::string& s) { return s == "1" || s == "2" || s == "3"; }
 
 PanelVals panel_vals_from_conf() {
     PanelVals v;
@@ -411,6 +417,7 @@ PanelVals panel_vals_from_conf() {
     v.rope_original = cfg("ROPE_ORIGINAL_CTX", "262144");
     v.kvsnap_max_gb = cfg("KVSNAP_MAX_GB", "20");
     v.kvsnap_dir = cfg_optional("KVSNAP_DIR", "");
+    v.moe_a4 = cfg("MOE_A4", "0");
     v.engine_host = cfg("ENGINE_HOST", "127.0.0.1");
     v.engine_port = cfg("ENGINE_PORT", "8730");
     v.api_host = cfg("API_HOST", "0.0.0.0");
@@ -459,6 +466,7 @@ std::map<std::string, std::string> panel_vals_to_conf(const PanelVals& v) {
     std::string kdir = v.kvsnap_dir;
     while (!kdir.empty() && (kdir.back() == '\\' || kdir.back() == '/')) kdir.pop_back();
     m["KVSNAP_DIR"] = kdir;
+    m["MOE_A4"] = v.moe_a4;
     m["ENGINE_HOST"] = v.engine_host;
     m["ENGINE_PORT"] = v.engine_port;
     m["API_HOST"] = v.api_host;
@@ -578,6 +586,13 @@ void check_weights_page(CheckLines& c, const PanelVals& v) {
             check_line(c, kLvPass,
                        TR("overlay：V2 不使用（保存时置空，引擎本就会跳过）",
                           "overlay: unused with V2 (cleared on save; the engine skips it anyway)"));
+            if (moe_a4_on(v.moe_a4))
+                check_line(c, kLvWarn,
+                           TR("prefill 4-bit 加速已开启：prompt 处理约快 9%，代价是精度降低——"
+                              "prompt 部分逐 token KLD 0.108 → 0.143；生成的 token 走 decode，不受影响",
+                              "4-bit prefill speedup on: prompt processing ~9% faster at the cost of "
+                              "precision (prompt per-token KLD 0.108 -> 0.143); generated tokens go "
+                              "through decode and are unaffected"));
         } else {
             check_line(c, kLvPass,
                        TR("n-gram 表：与主模型同文件（V1 内置）",
@@ -1075,6 +1090,7 @@ enum PanelId : int {
     kCkYarn, kEdKvsnap, kEdKvsnapDir, kBrKvsnapDir,
     kEdEHost, kEdEPort, kEdAHost, kEdAPort,
     kEdOut1, kEdOut2, kEdOut3, kEdReport, kEdSummary, kBtnLang,
+    kCkMoeA4,
 };
 
 struct FileRow {
@@ -1087,6 +1103,7 @@ struct PanelCtl {
     FileRow row_model, row_ngram, row_overlay, row_mtp, row_vision;
     FileRow row_gguf, row_gguf_mtp, row_gguf_vision, row_tok;
     HWND tok_hint = nullptr, ver_note = nullptr;
+    HWND moe_a4 = nullptr;  // V2 专属勾选框：prefill 4-bit 加速（MOE_A4）
     HWND maxctx = nullptr, parallel = nullptr, kv_pool = nullptr, kv_paged = nullptr,
          prefill = nullptr;
     HWND yarn = nullptr;  // "YaRN 长上下文扩展" 勾选框（ROPE_FACTOR 自动推导，无编辑行）
@@ -1101,6 +1118,7 @@ PanelResult g_panel_result = kPanelClose;
 bool g_panel_done = false;
 bool g_service_running = false;     // 打开时探测：服务运行中（端口占用/显存检查降级为提示）
 int g_weights_ver = kVerV1;         // 当前显示的权重版本（布局用）
+std::string g_moe_a4_init = "0";    // 打开时 conf 的 MOE_A4（勾着保存时保留手设的 1/2）
 bool g_pool_touched = false;        // 用户手动改过并发总池框（false = 跟随单请求上限显示）
 bool g_pool_guard = false;          // 程序自己在写总池框（防 EN_CHANGE 误置 touched）
 AllChecks g_last_checks;
@@ -1243,6 +1261,13 @@ PanelVals panel_collect() {
     v.rope_factor = derive_rope_factor(get_check(g_pc.yarn), v.max_context, v.rope_original);
     v.kvsnap_max_gb = get_edit(g_pc.kvsnap);
     v.kvsnap_dir = get_edit(g_pc.kvsnap_dir);
+    // MOE_A4：勾选框只在 V2 显示。勾着保存时保留 conf 里手设的 1/2，否则写 3（两段都量化）；
+    // V1/GGUF 时引擎本就忽略该项，原值照留（非法值归 0，免得启动器拒绝启动）。
+    const std::string a4_keep = moe_a4_on(g_moe_a4_init) ? g_moe_a4_init : "0";
+    if (v.weights_ver == kVerV2)
+        v.moe_a4 = get_check(g_pc.moe_a4) ? (a4_keep != "0" ? a4_keep : "3") : "0";
+    else
+        v.moe_a4 = a4_keep;
     v.engine_host = get_edit(g_pc.ehost);
     v.engine_port = get_edit(g_pc.eport);
     v.api_host = get_edit(g_pc.ahost);
@@ -1452,9 +1477,20 @@ void layout_page1(int ver) {
     RECT dirty = rect_in_parent(g_pc.tok_hint);
     RECT tmp = rect_in_parent(g_pc.ver_note);
     UnionRect(&dirty, &dirty, &tmp);
+    tmp = rect_in_parent(g_pc.moe_a4);
+    UnionRect(&dirty, &dirty, &tmp);
+    tmp = rect_in_parent(g_pc.out1);
+    UnionRect(&dirty, &dirty, &tmp);
     SetWindowPos(g_pc.tok_hint, nullptr, kEdX + g_art_w, y + 2, 434, 18,
                  SWP_NOZORDER | SWP_SHOWWINDOW | SWP_NOCOPYBITS);
     SetWindowPos(g_pc.ver_note, nullptr, kEdX + g_art_w, y + 24, 434, 18,
+                 SWP_NOZORDER | SWP_SHOWWINDOW | SWP_NOCOPYBITS);
+    // V2 专属：prefill 4-bit 加速勾选框排在版本说明下一行，检查区随之下移一行
+    const bool a4_row = ver == kVerV2;
+    SetWindowPos(g_pc.moe_a4, nullptr, kEdX + g_art_w, y + 46, 434, 20,
+                 SWP_NOZORDER | SWP_NOCOPYBITS | (a4_row ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
+    const int out_y = a4_row ? y + 72 : 254;
+    SetWindowPos(g_pc.out1, nullptr, 12 + g_art_w, out_y, 624, kListBottom - out_y,
                  SWP_NOZORDER | SWP_SHOWWINDOW | SWP_NOCOPYBITS);
     SetWindowTextW(g_pc.ver_note, ver == kVerGguf
                                       ? TR(L"GGUF：填第 1 个分片；MTP/视觉塔可留空不用",
@@ -1467,6 +1503,10 @@ void layout_page1(int ver) {
     tmp = rect_in_parent(g_pc.tok_hint);
     UnionRect(&dirty, &dirty, &tmp);
     tmp = rect_in_parent(g_pc.ver_note);
+    UnionRect(&dirty, &dirty, &tmp);
+    tmp = rect_in_parent(g_pc.moe_a4);
+    UnionRect(&dirty, &dirty, &tmp);
+    tmp = rect_in_parent(g_pc.out1);
     UnionRect(&dirty, &dirty, &tmp);
     RedrawWindow(parent, &dirty, nullptr,
                  RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
@@ -1775,6 +1815,7 @@ LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             case kCkKvPaged: panel_recheck(); return 0;
             case kCkYarn: panel_recheck(); return 0;
+            case kCkMoeA4: panel_recheck(); return 0;
             default: break;
         }
     }
@@ -1924,6 +1965,14 @@ PanelResult panel_run() {
                          TR(L"目录内需包含 tokenizer.json", L"Folder must contain tokenizer.json"),
                          0);
     g_pc.ver_note = pctl(0, h, L"Static", SS_LEFTNOWORDWRAP, kEdX, 232, 434, 18, L"", 0);
+    // 位置与显隐由 layout_page1 按版本决定（只在 V2 显示）
+    g_moe_a4_init = init.moe_a4;
+    g_pc.moe_a4 = pctl(0, h, L"Button", BS_AUTOCHECKBOX | WS_TABSTOP, kEdX, 254, 434, 20,
+                       TR(L"prefill 4-bit 加速（快约 9%，会降低精度）",
+                          L"4-bit prefill speedup (~9% faster, lowers precision)"),
+                       kCkMoeA4);
+    SendMessageW(g_pc.moe_a4, BM_SETCHECK, moe_a4_on(init.moe_a4) ? BST_CHECKED : BST_UNCHECKED,
+                 0);
     g_pc.out1 = pctl(0, h, L"Edit",
                      WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
                      12, 254, 624, kListBottom - 254, L"", kEdOut1);
