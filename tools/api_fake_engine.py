@@ -22,6 +22,50 @@ POOL = 0
 TRACE = []
 TRACE_LOCK = threading.Lock()
 
+# Think-guard scenarios (api_think_guard_test.py), keyed by max_tokens rounded
+# up to a multiple of 100 so a resume (max_tokens minus what the first run
+# generated) maps back to its scenario. A resume prompt ends with the closer
+# the API appends, "</think>\n\n" = [248069, 271]. GUARDLOG returns every
+# such GEN.
+GUARD_THINK = [9764, 728, 1716, 279, 8831, 13]  # "Let me check the weather."
+GUARD_CALL = [248058, 198, 27, 1628, 27362, 67017, 29, 198, 27, 15704, 28, 8656, 29,
+              198, 98116, 198, 510, 15704, 29, 198, 510, 1628, 29, 198,
+              248059]  # <tool_call> get_weather(city=北京) </tool_call>
+GUARD_HI = [12675]
+GUARD_LOG = []
+GUARD_RESUMES = {}
+
+
+def guard_scenario(key, resumed, max_tokens):
+    """(tokens, reason) for a think-guard scenario GEN."""
+    if key == 7100:  # A: the turn ends inside the unclosed think block
+        return (GUARD_HI if resumed else GUARD_THINK), "done"
+    if key == 7200:  # B: "</think>\n\n" and no answer
+        return (GUARD_HI if resumed else [248069, 271]), "done"
+    if key == 7300:  # B: "</think> " (whitespace-only answer)
+        return (GUARD_HI if resumed else [248069, 220]), "done"
+    if key == 7400:  # A, and the first resume ends at once
+        if not resumed:
+            GUARD_RESUMES[key] = 0
+            return GUARD_THINK, "done"
+        count = GUARD_RESUMES.get(key, 0)
+        GUARD_RESUMES[key] = count + 1
+        return ([] if count == 0 else GUARD_HI), "done"
+    if key == 7500:  # C: a complete tool call at the end of the reasoning
+        return (GUARD_HI if resumed else GUARD_THINK + [271] + GUARD_CALL), "done"
+    if key == 7600:  # think-only, but cut by max_tokens: not the guard's case
+        return GUARD_THINK, "length"
+    if key == 7700:  # think-only text; the request is not in a think block
+        return GUARD_THINK, "done"
+    if key == 7800:  # honours max_tokens (think_guard_test_cut)
+        if resumed:
+            return GUARD_HI, "done"
+        tokens = (GUARD_THINK * 1300)[:max_tokens]
+        return tokens, ("length" if len(tokens) == max_tokens else "done")
+    if key == 7900:  # think-only text that a client stop string cuts
+        return GUARD_THINK, "done"
+    return None
+
 
 def handle(conn):
     pending = b""
@@ -95,6 +139,11 @@ def handle(conn):
                 with TRACE_LOCK:
                     send_line(conn, json.dumps(TRACE))
                 continue
+            if line == "GUARDLOG":
+                with TRACE_LOCK:
+                    send_line(conn, json.dumps(GUARD_LOG))
+                    GUARD_LOG.clear()
+                continue
             if line.startswith("X "):
                 record_cancel(int(line.split()[1]))
                 continue
@@ -145,6 +194,20 @@ def handle(conn):
             seed = int(fields[fields.index("SAMPLE") + 5]) if "SAMPLE" in fields else 0
             if seed in (616161, 616162, 616163):
                 cancellable(req, seed)
+                continue
+
+            max_tokens = int(fields[2])
+            guard_key = (max_tokens + 99) // 100 * 100
+            if 7100 <= guard_key <= 7900:
+                resumed = ids[-2:] == [248069, 271] and guard_key != 7700
+                tokens, reason = guard_scenario(guard_key, resumed, max_tokens)
+                with TRACE_LOCK:
+                    GUARD_LOG.append({"key": guard_key, "resumed": resumed,
+                                      "max_tokens": max_tokens, "seed": seed,
+                                      "sampled": "SAMPLE" in fields, "tail": ids[-40:]})
+                for token in tokens:
+                    send_line(conn, f"T {req} {token} -0.1")
+                send_line(conn, f"D {req} {reason} {n_ids} {len(tokens)} 1.0 2.0 0 0 0 0 0")
                 continue
 
             if "424242" in fields:

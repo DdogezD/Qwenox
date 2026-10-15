@@ -31,6 +31,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <string>
@@ -661,6 +662,10 @@ struct GenSpec {
     std::vector<std::array<int, 3>> mrope_grids;
     std::vector<std::vector<float>> patches;
     std::vector<long long> snaps;  // SNAPS hints: semantic boundary token cuts
+    // Test hook (request field think_guard_test_cut): the first run stops
+    // after this many tokens as if the model had ended its turn there, so the
+    // think guard can be exercised on a real model. 0 = off.
+    int think_guard_test_cut = 0;
 };
 
 struct GenOutcome {
@@ -678,15 +683,27 @@ struct GenOutcome {
     bool hit_stop = false;
     std::string stop_hit;  // the stop sequence that ended the turn (hit_stop)
     bool client_gone = false;
+    std::vector<int> tokens;  // generated ids (the think guard resumes from them)
+    // Think guard (run_generation_guarded): "" when it did not act, else
+    // "resumed_unclosed" / "resumed_empty_answer" / "resume_failed" /
+    // "tool_call_from_reasoning".
+    std::string guard;
+    // tool_call_from_reasoning: the complete <tool_call> block(s) the model
+    // wrote at the end of its reasoning; the caller feeds them to the tool
+    // parser after the answer so they are made as real calls.
+    std::string reasoning_calls;
 };
 
 // on_delta receives each incremental piece of text; returning false aborts the
 // generation (stop sequence matched, or the HTTP client vanished). May be
-// empty for non-streaming use.
+// empty for non-streaming use. `held` runs the generation on a slot the
+// caller already holds (the think guard keeps one slot across its runs);
+// null acquires one here.
 GenOutcome run_generation(GenSpec& spec,
                           const std::function<bool(const std::string&)>& on_delta,
                           const std::string& log_tag,
-                          const std::function<bool()>& on_wait = {}) {
+                          const std::function<bool()>& on_wait = {},
+                          SlotGuard* held = nullptr) {
     GenOutcome out;
     std::function<bool()> wait_callback;
     if (on_wait) {
@@ -696,12 +713,17 @@ GenOutcome run_generation(GenSpec& spec,
             return keep_waiting;
         };
     }
-    SlotGuard slot(wait_callback);
-    if (!slot.acquired()) {
+    std::optional<SlotGuard> own_slot;
+    SlotGuard* slot = held;
+    if (slot == nullptr) {
+        own_slot.emplace(wait_callback);
+        slot = &*own_slot;
+    }
+    if (!slot->acquired()) {
         out.client_gone = true;
         return out;
     }
-    qwenox::EngineClient& eng = slot.engine();
+    qwenox::EngineClient& eng = slot->engine();
     std::string err;
     if (!engine_ready(eng, &err)) {
         fprintf(stderr, "REQ %s 502 engine connect failed: %s\n", log_tag.c_str(), err.c_str());
@@ -836,6 +858,7 @@ GenOutcome run_generation(GenSpec& spec,
     out.commit = r.commit;
     out.proposed = r.proposed;
     out.logprobs = std::move(r.logprobs);
+    out.tokens = std::move(r.tokens);
 
     if (r.reason == "error") {
         // Concurrent requests share one KV pool; when it runs out the engine
@@ -888,6 +911,8 @@ GenOutcome run_generation(GenSpec& spec,
                   (!p.patches.empty() ? 0x100u : 0u);
         reqstat::record(e);
     }
+    // Hand the image patches back: the think guard may resume this prompt.
+    spec.patches = std::move(p.patches);
     return out;
 }
 
@@ -1015,6 +1040,14 @@ void apply_sampling(const json& body, GenSpec* spec) {
         spec->seed = rng();  // the engine's RNG is counter-based: a seed is required
     }
 
+    // Test hook for the think guard (see GenSpec::think_guard_test_cut).
+    if (body.contains("think_guard_test_cut") && !body["think_guard_test_cut"].is_null()) {
+        const long long cut = integer_field(body, "think_guard_test_cut", 0);
+        if (cut < 0 || cut > std::numeric_limits<int>::max())
+            http::fail(400, "think_guard_test_cut must be a non-negative integer");
+        spec->think_guard_test_cut = static_cast<int>(cut);
+    }
+
     if (body.contains("logit_bias") && body["logit_bias"].is_object()) {
         if (body["logit_bias"].size() > 20480)
             http::fail(400, "logit_bias has more than 20480 entries");
@@ -1074,6 +1107,7 @@ json usage_json(const GenOutcome& o, const std::vector<int>& prompt_ids) {
     u["total_tokens"] = pt + o.n_gen;
     if (o.n_cached > 0) u["prompt_tokens_details"] = {{"cached_tokens", o.n_cached}};
     if (o.clamped_from > 0) u["clamped_from"] = o.clamped_from;
+    if (!o.guard.empty()) u["think_guard"] = o.guard;
     return u;
 }
 
@@ -2624,6 +2658,236 @@ class ThinkSplitter {
     bool split_ = false, content_started_ = false;
 };
 
+// ----------------------------------------------------------- think guard ---
+// The model sometimes ends its turn with nothing but reasoning: no answer, no
+// tool call, finish_reason "stop". Clients then show a reasoning-only reply
+// and an agent loop stalls on it. Three shapes, all only when the reply
+// opened inside <think> and ended normally (not at max_tokens, not on a
+// client stop string) with a blank answer:
+//
+//   A  the turn ended inside the unclosed think block. The server writes
+//      Qwen's thinking-budget sentence and </think> into the stream (so the
+//      client's text matches the model's context), then resumes on the same
+//      slot from prompt + generated ids + that closer.
+//   B  the model closed </think> and ended without an answer. The client
+//      already has the </think>; the resume context swaps it for the budget
+//      sentence + </think> (the bare context would replay the same end of
+//      turn under greedy) and the answer streams on.
+//   C  the reasoning ends with complete <tool_call> block(s) for declared
+//      tools. They are handed back in GenOutcome::reasoning_calls and the
+//      caller makes them as real calls; the text stays in the reasoning,
+//      where it was already streamed. No resume.
+//
+// A resume that ends at once (blank, finish "stop") is retried with a fresh
+// seed when sampling, at most twice; greedy would replay the same tokens, so
+// it is not retried. When nothing comes back the reply stays as it was
+// (guard = "resume_failed"). The resume holds the slot it ran on, so its
+// prefix is still in that slot's KV and only the closer is prefilled.
+// QWENOX_THINK_GUARD=0 turns all of this off.
+
+struct ThinkGuardCtx {
+    bool thinking = false;               // the reply opens inside <think>
+    const ToolSetup* tools = nullptr;    // shape C needs the declared tools
+    std::string tool_format = "xml";
+};
+
+bool think_guard_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("QWENOX_THINK_GUARD");
+        return e == nullptr || std::strcmp(e, "0") != 0;
+    }();
+    return on;
+}
+
+bool is_blank_text(const std::string& s) {
+    return s.find_first_not_of(" \t\r\n\f\v") == std::string::npos;
+}
+
+// Qwen's own sentence for closing a think block early (its thinking-budget
+// recipe), so the model reads the cut as "answer now".
+const char* const kThinkBudgetSentence =
+    "Considering the limited time by the user, I have to give the solution based on "
+    "the thinking directly now.";
+
+// The complete trailing <tool_call> block(s) of `reasoning`, if they parse as
+// calls of declared tools with nothing else in between; "" otherwise.
+std::string trailing_reasoning_calls(const std::string& reasoning, const ThinkGuardCtx& g) {
+    if (g.tools == nullptr || !g.tools->enabled()) return {};
+    static const std::string kOpen = "<tool_call>", kClose = "</tool_call>";
+    auto rtrim_len = [](const std::string& s, size_t n) {
+        while (n > 0 && std::isspace(static_cast<unsigned char>(s[n - 1]))) --n;
+        return n;
+    };
+    auto ends_with_close = [&](size_t n) {
+        return n >= kClose.size() && reasoning.compare(n - kClose.size(), kClose.size(), kClose) == 0;
+    };
+    const size_t end = rtrim_len(reasoning, reasoning.size());
+    if (!ends_with_close(end)) return {};
+    size_t begin = reasoning.rfind(kOpen, end - kClose.size());
+    if (begin == std::string::npos) return {};
+    for (;;) {  // take in parallel calls written back to back
+        const size_t before = rtrim_len(reasoning, begin);
+        if (!ends_with_close(before)) break;
+        const size_t prev = reasoning.rfind(kOpen, before - kClose.size());
+        if (prev == std::string::npos) break;
+        begin = prev;
+    }
+    std::string block = reasoning.substr(begin, end - begin);
+    toolparse::StreamParser parser(g.tools->tools, nullptr, true, g.tool_format, "");
+    parser.feed(block);
+    parser.finish();
+    if (parser.calls().empty() || parser.has_partial_call() || !is_blank_text(parser.content()))
+        return {};
+    return block;
+}
+
+GenOutcome run_generation_guarded(GenSpec& spec, const ThinkGuardCtx& g,
+                                  const std::function<bool(const std::string&)>& on_delta,
+                                  const std::string& log_tag,
+                                  const std::function<bool()>& on_wait = {}) {
+    const int test_cut = spec.think_guard_test_cut;
+    if (!g.thinking || !think_guard_enabled() || !g_tok_ready) {
+        return run_generation(spec, on_delta, log_tag, on_wait);
+    }
+    SlotGuard slot(on_wait);
+    if (!slot.acquired()) {
+        GenOutcome gone;
+        gone.client_gone = true;
+        return gone;
+    }
+
+    const int max_tokens = spec.max_tokens;
+    if (test_cut > 0) spec.max_tokens = test_cut;
+    GenOutcome out = run_generation(spec, on_delta, log_tag, on_wait, &slot);
+    spec.max_tokens = max_tokens;
+    if (test_cut > 0 && out.reason == "length" && !out.client_gone &&
+        (max_tokens <= 0 || test_cut < max_tokens)) {
+        out.reason = "stop";  // test hook: treat the cut as the model's own end of turn
+        fprintf(stderr, "REQ %s think guard test: first run cut at %d tokens\n",
+                log_tag.c_str(), test_cut);
+    }
+    if (out.client_gone || out.reason != "stop" || out.hit_stop) return out;
+
+    std::string reasoning, answer;
+    split_reasoning(out.text, true, &reasoning, &answer);
+    if (!is_blank_text(answer)) return out;
+
+    // C: a finished tool call left inside the reasoning.
+    std::string calls = trailing_reasoning_calls(reasoning, g);
+    if (!calls.empty()) {
+        out.guard = "tool_call_from_reasoning";
+        out.reasoning_calls = std::move(calls);
+        fprintf(stderr, "REQ %s think guard: tool call written inside the reasoning, "
+                        "made as a call\n", log_tag.c_str());
+        return out;
+    }
+
+    // A / B: build the resume context.
+    static const int think_close_id = g_tok.added_token_id("</think>");
+    size_t marker = std::string::npos;
+    for (const char* m : {"</think>", "</thinking>", "</ think>", "</think >"}) {
+        const size_t at = out.text.find(m);
+        if (at != std::string::npos && (marker == std::string::npos || at < marker)) marker = at;
+    }
+    const bool unclosed = marker == std::string::npos;
+    std::vector<int> context = out.tokens;
+    std::string closer;
+    if (unclosed) {
+        const size_t nl = out.text.size() - out.text.find_last_not_of('\n') - 1;
+        closer = out.text.empty() ? "" : std::string(nl >= 2 ? 0 : 2 - nl, '\n');
+        closer += kThinkBudgetSentence;
+        closer += "\n</think>\n\n";
+    } else {
+        // The close must be the model's own </think> token to cut the
+        // context there; a spelled-out variant is left as it is.
+        const auto it = std::find(context.rbegin(), context.rend(), think_close_id);
+        if (think_close_id < 0 || it == context.rend()) return out;
+        context.erase(std::next(it).base(), context.end());
+        const std::string before = out.text.substr(0, marker);
+        const size_t nl = before.size() - before.find_last_not_of('\n') - 1;
+        closer = before.empty() ? "" : std::string(nl >= 2 ? 0 : 2 - nl, '\n');
+        closer += kThinkBudgetSentence;
+        closer += "\n</think>\n\n";
+    }
+    const std::vector<int> closer_ids = g_tok.encode(closer);
+    context.insert(context.end(), closer_ids.begin(), closer_ids.end());
+    // The resume needs room for the context and at least a short answer;
+    // without it the engine would refuse the resume mid-stream.
+    if (static_cast<long long>(spec.ids.size() + context.size()) + 16 >
+        static_cast<long long>(g_cfg.context)) {
+        fprintf(stderr, "REQ %s think guard: empty answer, but no context left to resume\n",
+                log_tag.c_str());
+        return out;
+    }
+    if (unclosed) {
+        if (on_delta && !on_delta(closer)) {
+            out.client_gone = true;
+            return out;
+        }
+        out.text += closer;
+    }
+    fprintf(stderr, "REQ %s think guard: reply ended %s with no answer, resuming "
+                    "(%zu generated + %zu closer tokens)\n",
+            log_tag.c_str(), unclosed ? "inside <think>" : "right after </think>",
+            out.tokens.size(), closer_ids.size());
+
+    // Resume on the same slot. spec is borrowed and restored: callers read
+    // spec.ids (prompt size) afterwards.
+    std::vector<int> prompt_ids = spec.ids;
+    spec.ids.insert(spec.ids.end(), context.begin(), context.end());
+    std::vector<long long> snaps = std::move(spec.snaps);
+    spec.snaps.clear();  // the hints index the original prompt only
+    const unsigned long long seed = spec.seed;
+    if (max_tokens > 0) {
+        const long long left = max_tokens - out.n_gen;
+        spec.max_tokens = static_cast<int>(std::max<long long>(left, 1));
+    }
+    const int attempts = spec.sample ? 3 : 1;
+    bool answered = false;
+    int resume_cached = 0;
+    long long resume_prompt = 0;
+    for (int attempt = 1; attempt <= attempts && !answered; ++attempt) {
+        if (attempt > 1) {
+            // splitmix64 step: same seed => the same early end of turn
+            unsigned long long z = (spec.seed += 0x9E3779B97F4A7C15ull);
+            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+            z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+            spec.seed = z ^ (z >> 31);
+        }
+        GenOutcome rest = run_generation(spec, on_delta, log_tag, on_wait, &slot);
+        resume_cached = rest.n_cached;
+        resume_prompt = rest.n_prompt;
+        out.text += rest.text;
+        out.n_gen += rest.n_gen;
+        out.prefill_ms += rest.prefill_ms;
+        out.decode_ms += rest.decode_ms;
+        out.rounds += rest.rounds;
+        out.commit += rest.commit;
+        out.proposed += rest.proposed;
+        out.logprobs.insert(out.logprobs.end(), rest.logprobs.begin(), rest.logprobs.end());
+        out.reason = rest.reason;
+        out.hit_stop = rest.hit_stop;
+        out.stop_hit = rest.stop_hit;
+        if (rest.client_gone) {
+            out.client_gone = true;
+            break;
+        }
+        answered = !is_blank_text(rest.text) || rest.reason != "stop" || rest.hit_stop;
+        if (!answered)
+            fprintf(stderr, "REQ %s think guard: resume %d/%d came back empty\n",
+                    log_tag.c_str(), attempt, attempts);
+    }
+    spec.ids = std::move(prompt_ids);
+    spec.snaps = std::move(snaps);
+    spec.max_tokens = max_tokens;
+    spec.seed = seed;
+    out.guard = answered ? (unclosed ? "resumed_unclosed" : "resumed_empty_answer")
+                         : "resume_failed";
+    fprintf(stderr, "REQ %s think guard: %s (resume prompt=%lld cached=%d)\n", log_tag.c_str(),
+            out.guard.c_str(), resume_prompt, resume_cached);
+    return out;
+}
+
 // Semantic boundary hints (SNAPS): token positions where a future
 // re-rendered prompt is likely to share a prefix with this one — the end of
 // every earlier message and the end of the last message's content (just
@@ -2780,9 +3044,11 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
         return chunk(std::move(delta), nullptr);
     };
 
+    const ThinkGuardCtx guard{rr.thinking_enabled && !tool_setup.choice.forced(), &tool_setup,
+                              tool_format};
     if (!stream) {
-        GenOutcome o = run_generation(
-            spec, nullptr, id,
+        GenOutcome o = run_generation_guarded(
+            spec, guard, nullptr, id,
             [st]() { return st == nullptr || !st->disconnected(); });
         std::string reasoning, answer;
         if (tool_setup.choice.forced())
@@ -2794,6 +3060,7 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
         tool_setup.choice.name);
         parser.feed(tool_setup.choice.parser_prefix(tool_format));
         parser.feed(answer);
+        parser.feed(o.reasoning_calls);
         parser.finish();
         json msg;
         msg["role"] = "assistant";
@@ -2858,8 +3125,8 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
         if (st->disconnected()) return false;
         return send_frame(st, text_chunk("content", ""));
     };
-    GenOutcome o = run_generation(
-        spec,
+    GenOutcome o = run_generation_guarded(
+        spec, guard,
         [&](const std::string& d) {
             if (st->disconnected()) return false;
             if (tool_setup.choice.forced()) return dispatch_tool_events(parser.feed(d));
@@ -2876,6 +3143,7 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
         splitter.finish(&rp, &ct);
         if (!rp.empty() && !send_frame(st, text_chunk("reasoning_content", rp))) return;
         if (!dispatch_tool_events(parser.feed(ct))) return;
+        if (!dispatch_tool_events(parser.feed(o.reasoning_calls))) return;
     }
     if (!dispatch_tool_events(parser.finish())) return;
     const std::string finish = (o.reason == "length" || parser.has_partial_call())
@@ -3029,6 +3297,7 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
             response["usage"] = {{"input_tokens", pt},
                                  {"output_tokens", outcome->n_gen},
                                  {"total_tokens", pt + outcome->n_gen}};
+            if (!outcome->guard.empty()) response["usage"]["think_guard"] = outcome->guard;
             if (status == "incomplete")
                 response["incomplete_details"] = {
                     {"reason", outcome->reason == "length" ? "max_output_tokens"
@@ -3037,9 +3306,11 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
         return response;
     };
 
+    const ThinkGuardCtx guard{rr.thinking_enabled && !tool_setup.choice.forced(), &tool_setup,
+                              tool_format};
     if (!stream) {
-        GenOutcome o = run_generation(
-            spec, nullptr, id,
+        GenOutcome o = run_generation_guarded(
+            spec, guard, nullptr, id,
             [st]() { return st == nullptr || !st->disconnected(); });
         std::string reasoning, answer;
         if (tool_setup.choice.forced())
@@ -3051,6 +3322,7 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
         tool_setup.choice.name);
         parser.feed(tool_setup.choice.parser_prefix(tool_format));
         parser.feed(answer);
+        parser.feed(o.reasoning_calls);
         parser.finish();
 
         const bool incomplete = o.reason == "length" || parser.has_partial_call();
@@ -3218,8 +3490,8 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
         // SSE comment as a protocol-neutral keep-alive during queue/prefill.
         return st->send_raw(": keep-alive\n\n");
     };
-    GenOutcome o = run_generation(
-        spec,
+    GenOutcome o = run_generation_guarded(
+        spec, guard,
         [&](const std::string& delta) {
             if (st->disconnected()) return false;
             if (tool_setup.choice.forced()) return dispatch_tool_events(parser.feed(delta));
@@ -3233,6 +3505,7 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
         std::string reasoning_delta, content_delta;
         splitter.finish(&reasoning_delta, &content_delta);
         if (!dispatch_tool_events(parser.feed(content_delta))) return;
+        if (!dispatch_tool_events(parser.feed(o.reasoning_calls))) return;
     }
     if (!dispatch_tool_events(parser.finish())) return;
     if (!finish_message() || !ensure_created()) return;
@@ -3492,7 +3765,7 @@ json anthropic_to_chat(const json& in, std::string* prefill) {
                           "enable_thinking", "preserve_thinking", "preserve_reasoning",
                           "auto_disable_thinking_with_tools", "reasoning_effort",
                           "tool_call_format", "max_tool_arg_chars", "max_tool_response_chars",
-                          "add_vision_id"})
+                          "add_vision_id", "think_guard_test_cut"})
         if (in.contains(k)) out[k] = in[k];
     if (in.contains("stop_sequences") && !in["stop_sequences"].is_null()) {
         if (!in["stop_sequences"].is_array())
@@ -3683,10 +3956,12 @@ void messages_impl(const http::Request& q, http::Response* r, http::Stream* st) 
                                      ? o->n_prompt
                                      : static_cast<long long>(spec.ids.size());
         const long long cached = o != nullptr ? o->n_cached : 0;
-        return json{{"input_tokens", prompt - cached},
-                    {"cache_creation_input_tokens", 0},
-                    {"cache_read_input_tokens", cached},
-                    {"output_tokens", o != nullptr ? o->n_gen : 0}};
+        json u{{"input_tokens", prompt - cached},
+               {"cache_creation_input_tokens", 0},
+               {"cache_read_input_tokens", cached},
+               {"output_tokens", o != nullptr ? o->n_gen : 0}};
+        if (o != nullptr && !o->guard.empty()) u["think_guard"] = o->guard;
+        return u;
     };
     auto stop_reason = [](const GenOutcome& o, bool partial_call, bool has_calls) {
         if (o.reason == "length" || partial_call) return "max_tokens";
@@ -3715,15 +3990,17 @@ void messages_impl(const http::Request& q, http::Response* r, http::Stream* st) 
             p.tool_format, tool_setup.choice.name);
     };
 
+    const ThinkGuardCtx guard{p.thinking, &tool_setup, p.tool_format};
     if (!stream) {
-        GenOutcome o = run_generation(
-            spec, nullptr, id,
+        GenOutcome o = run_generation_guarded(
+            spec, guard, nullptr, id,
             [st]() { return st == nullptr || !st->disconnected(); });
         std::string reasoning, answer;
         split_reasoning(o.text, p.thinking, &reasoning, &answer);
         toolparse::StreamParser parser = make_parser();
         parser.feed(tool_setup.choice.parser_prefix(p.tool_format));
         parser.feed(answer);
+        parser.feed(o.reasoning_calls);
         parser.finish();
         json content = json::array();
         if (!reasoning.empty())
@@ -3843,8 +4120,8 @@ void messages_impl(const http::Request& q, http::Response* r, http::Stream* st) 
         if (!ensure_started()) return false;
         return send_anthropic_event(st, "ping", json{{"type", "ping"}});
     };
-    GenOutcome o = run_generation(
-        spec,
+    GenOutcome o = run_generation_guarded(
+        spec, guard,
         [&](const std::string& delta) {
             if (st->disconnected()) return false;
             if (!p.thinking) return dispatch_tool_events(parser.feed(delta));
@@ -3860,6 +4137,7 @@ void messages_impl(const http::Request& q, http::Response* r, http::Stream* st) 
         splitter.finish(&reasoning_delta, &content_delta);
         if (!emit_thinking(reasoning_delta)) return;
         if (!dispatch_tool_events(parser.feed(content_delta))) return;
+        if (!dispatch_tool_events(parser.feed(o.reasoning_calls))) return;
     }
     if (!dispatch_tool_events(parser.finish())) return;
     // A tool block still open_kind here was cut off mid-call.
