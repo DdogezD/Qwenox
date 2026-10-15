@@ -44,6 +44,14 @@ NEED_HIP=0
 [[ "$TARGET" == all || "$TARGET" == engine || "$TARGET" == bench || "$TARGET" == test ]] && NEED_HIP=1
 [[ "$NEED_HIP" == 0 || -x "$HIPCC" ]] || { echo "找不到 TheRock hipcc: $HIPCC（设 THEROCK=...）" >&2; exit 1; }
 
+# 版本号：唯一来源是根目录 VERSION（见 src/version.h）。宏值不带引号，
+# 由 version.h 字符串化——hipcc.exe 转发参数时会吃掉引号。
+QWENOX_VER="$(tr -d ' \r\n' < VERSION 2>/dev/null || true)"
+[[ "$QWENOX_VER" =~ ^[0-9A-Za-z.-]+$ ]] || { echo "VERSION 文件缺失或格式不对（应形如 0.0.8）" >&2; exit 1; }
+QWENOX_GITREV="$(git rev-parse --short=7 HEAD 2>/dev/null || echo nogit)"
+VER_FLAGS=(-DQWENOX_VERSION_RAW="$QWENOX_VER" -DQWENOX_GIT_RAW="$QWENOX_GITREV")
+echo "[版本] $QWENOX_VER ($QWENOX_GITREV)"
+
 mkdir -p build
 # MSVC 运行时（微软官方可再分发），覆盖没装 VC++ Redistributable 的裸机
 for d in msvcp140.dll vcruntime140.dll vcruntime140_1.dll; do
@@ -84,7 +92,7 @@ fi  # NEED_HIP
 # _CRT_NONSTDC_NO_DEPRECATE：屏蔽 MSVC 头文件对 strdup 等 POSIX 名的
 # deprecated 标记（_CRT_NONSTDC_DEPRECATE → __declspec(deprecated)）。
 FLAGS=(-O3 -std=c++17 --offload-arch="$GPU_ARCH" -D_CRT_SECURE_NO_WARNINGS
-       -D_CRT_NONSTDC_NO_DEPRECATE
+       -D_CRT_NONSTDC_NO_DEPRECATE "${VER_FLAGS[@]}"
        -I"$TR/include" -Lbuild/winlibs -lrocblas -lhipblaslt)
 
 build_engine() {
@@ -136,7 +144,7 @@ build_api() {
     gen_static_inc
     gui_ldflags
     echo "[编译] build/qwenox-win.exe"
-    "$CXX" -O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS -Isrc/api -Ithird_party -I"$TR/include" \
+    "$CXX" -O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS "${VER_FLAGS[@]}" -Isrc/api -Ithird_party -I"$TR/include" \
       src/api/http.cpp src/api/engine_client.cpp src/api/tokenizer.cpp \
       src/api/chat_template.cpp src/api/json_py.cpp src/api/toolparse.cpp \
       src/api/vision.cpp src/api/reqstat.cpp src/api/reqstat_read.cpp \

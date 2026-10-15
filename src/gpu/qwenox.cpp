@@ -146,6 +146,7 @@
 #include "../ple_prefetch.h"
 #include "../kv_admission.h"
 #include "../perfsnap.h"
+#include "../version.h"
 
 #include "parts/00_platform.inc"
 #include "parts/05_config.inc"

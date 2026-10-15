@@ -17,6 +17,7 @@
 
 #include "../launch_win_icon.inc"  // kIconIco：托盘图标（tools/win_icon.py 生成）
 #include "../service_conf.h"
+#include "../version.h"
 #include "engine_sup.h"
 #include "http.h"
 #include "tray_win.h"
@@ -476,6 +477,7 @@ void on_menu(UINT id) {
 void show_menu() {
     HMENU m = CreatePopupMenu();
     if (!m) return;
+    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"Qwenox v" QWENOX_VERSION);  // C++11：宽+窄字面量拼接为宽
     AppendMenuW(m, MF_STRING | MF_GRAYED, 0, state_text().c_str());
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, kIdConsole, TR(L"打开控制台", L"Open console"));

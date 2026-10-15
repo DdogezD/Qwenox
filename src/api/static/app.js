@@ -583,6 +583,7 @@ async function refreshHealth() {
         (h.queued ? (LANG === "zh" ? "（排队 " : " (queued ") + fmtInt(h.queued) + (LANG === "zh" ? "）" : ")") : "")],
     ]);
     const rows = [
+      [LANG === "zh" ? "版本" : "Version", h.version ? "v" + h.version + (h.build ? " (" + h.build + ")" : "") : "—"],
       [t("health.model"), h.model || "—"],
       [t("health.context"), fmtInt(h.context)],
       [t("health.slots"), fmtInt(h.slots) + " × " + fmtInt(h.slot_ctx) +

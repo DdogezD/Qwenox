@@ -50,6 +50,7 @@
 
 #include "../service_conf.h"
 #include "../engine_net.h"
+#include "../version.h"
 #include "chat_template.h"
 #include "engine_client.h"
 #include "engine_sup.h"
@@ -2389,6 +2390,8 @@ static void init_web_dir() {
 void handle_health(const http::Request&, http::Response* r, http::Stream*) {
     json j;
     j["status"] = "ok";
+    j["version"] = QWENOX_VERSION;
+    j["build"] = QWENOX_GIT;
     j["model"] = g_cfg.model;
     j["tokenizer"] = g_tok_ready;  // false = 词表缺失，推理端点 503
     j["endpoints"] = json::array(
@@ -4618,8 +4621,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "qwenox-api: listen: %s\n", err.c_str());
         return gexit(1);
     }
-    fprintf(stderr, "qwenox-api: listening on :%d model=%s ctx=%d slots=%d\n", srv.port(),
-            g_cfg.model.c_str(), g_cfg.context, g_slots);
+    fprintf(stderr, "qwenox-api %s: listening on :%d model=%s ctx=%d slots=%d\n",
+            QWENOX_VERSION_FULL, srv.port(), g_cfg.model.c_str(), g_cfg.context, g_slots);
     // 双击运行时给用户一个可直接点的入口
     fprintf(stderr, "qwenox-api: console: http://127.0.0.1:%d/\n", srv.port());
 

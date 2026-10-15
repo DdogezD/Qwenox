@@ -88,9 +88,15 @@ int main(int argc, char** argv) {
     return 1;
   }
 #endif
+  if (argc >= 2 && strcmp(argv[1], "--version") == 0) {
+    printf("qwenox-engine %s\n", QWENOX_VERSION_FULL);
+    return 0;
+  }
+  fprintf(stderr, "qwenox-engine %s\n", QWENOX_VERSION_FULL);
   if (argc < 2) {
     fprintf(stderr,
-            "usage: qwenox <base.hgn> [overlay.hgn ...] --tokens 1,2,3 [--gen N] [--dump] "
+            "usage: qwenox --version\n"
+            "       qwenox <base.hgn> [overlay.hgn ...] --tokens 1,2,3 [--gen N] [--dump] "
             "[--no-ple] [--maxctx N]\n"
             "       qwenox <base.hgn> [overlay.hgn ...] --tokens-file IDS --ppl "
             "[--ppl-window N --ppl-stride N] [--maxctx N]\n"

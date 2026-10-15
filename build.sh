@@ -59,6 +59,12 @@ if [[ "$TARGET" != api ]]; then
   command -v "$HIPCC" >/dev/null || { echo '找不到 hipcc，请安装 ROCm 或设置 HIPCC' >&2; exit 1; }
 fi
 CXX="${CXX:-g++}"
+# 版本号：唯一来源是根目录 VERSION（见 src/version.h），宏值不带引号由头文件字符串化
+QWENOX_VER="$(tr -d ' \r\n' < VERSION 2>/dev/null || true)"
+[[ "$QWENOX_VER" =~ ^[0-9A-Za-z.-]+$ ]] || { echo 'VERSION 文件缺失或格式不对（应形如 0.0.8）' >&2; exit 1; }
+QWENOX_GITREV="$(git rev-parse --short=7 HEAD 2>/dev/null || echo nogit)"
+VER_FLAGS=(-DQWENOX_VERSION_RAW="$QWENOX_VER" -DQWENOX_GIT_RAW="$QWENOX_GITREV")
+echo "[版本] $QWENOX_VER ($QWENOX_GITREV)"
 BUNDLE_RPATH=()
 if (( BUNDLE_RUNTIME )); then
   # 旧式 DT_RPATH 让 $ORIGIN/lib 同时覆盖 ROCm 库的间接依赖。
@@ -218,18 +224,18 @@ bundle_api_runtime() {
 }
 
 build_engine() {
-  compile "build/$ENGINE_NAME" 8 600 "$HIPCC" -O3 -Werror \
+  compile "build/$ENGINE_NAME" 8 600 "$HIPCC" -O3 -Werror "${VER_FLAGS[@]}" \
     --offload-arch="$GPU_ARCH" src/gpu/qwenox.cpp -lrocblas -lhipblaslt \
     "${BUNDLE_RPATH[@]}"
 }
 
 build_bench() {
-  compile build/qwenox-bench 8 600 "$HIPCC" -O3 -Werror -std=c++17 \
+  compile build/qwenox-bench 8 600 "$HIPCC" -O3 -Werror -std=c++17 "${VER_FLAGS[@]}" \
     --offload-arch="$GPU_ARCH" -Ithird_party src/gpu/bench_main.cpp \
     -lrocblas -lhipblaslt "${BUNDLE_RPATH[@]}"
 }
 
-API_FLAGS=(-O2 -std=c++17 -Isrc/api -Ithird_party -Wall -Wextra -Wpedantic
+API_FLAGS=(-O2 -std=c++17 "${VER_FLAGS[@]}" -Isrc/api -Ithird_party -Wall -Wextra -Wpedantic
            -Werror "${BUNDLE_RPATH[@]}")
 # 静态页嵌入:编译生成器并重新生成 src/api/static_gen.inc。生成器输出是确定性的,
 # 内容未变不会重写文件;static_gen.inc 是生成物,不入库(.gitignore),此处按需重新生成。
