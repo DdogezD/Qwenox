@@ -208,9 +208,48 @@ bash build_win.sh    # 引擎、benchmark、API 托盘程序、根目录入口 s
 | `PREFILL_CHUNK` | `0` | 长 prompt 每段多少 token,0 表示 Linux 16384、Windows 6144 |
 | `ROPE_FACTOR` | `1` | 1 为原生 256K;设为 2 并把 `MAX_CONTEXT` 改为 `524288` 即 YaRN 512K |
 | `MTP_GAMMA` | `0` | 草稿长度,0 表示自动,1–8 表示固定 |
+| `MOE_A4` | `0` | prefill 4-bit 加速(只对 hgn v2 生效),见下文;0 关,3 开 |
 
 YaRN 是整个实例的设置,开启后短文本的输出分布也会略有变化(与原生 KLD 0.023),只在单条请求确实
 需要超过 256K 时才开。512K 的配置方法、共享池准入规则和验证范围见 [YARN-512K.md](docs/YARN-512K.md)。
+
+### prefill 4-bit 加速(MOE_A4)
+
+可选开关,默认关。打开后,hgn v2 权重在 prefill 时把路由专家的输入激活按每 128 个元素量化成 int4,
+专家 GEMM 改用 INT4 WMMA(`v_wmma_i32_16x16x16_iu4`,gfx1151 上的算力是 F16 WMMA 的 2 倍)。
+`service.conf` 里设 `MOE_A4=3`,或在 Windows 设置面板的 V2 权重页勾选"prefill 4-bit 加速"。
+取值是位掩码:1 只量化 gate/up,2 只量化 down,3 两者都量化。GGUF 和 w4b 权重忽略这个开关。
+
+**影响范围**:只作用于 prefill,也就是一次处理超过 16 个 token 的输入:prompt、多轮对话里新加入的
+消息、工具调用返回的结果。生成的 token 走 decode,MTP verify 和并发合批也不经过这条路径,
+所以生成阶段的计算与关闭时相同。代价是模型读入的内容精度降低,对输入越长、越依赖读准输入的场景
+影响面越大。
+
+| | 关 | `=1` | `=2` | `=3` |
+| --- | --- | --- | --- | --- |
+| 64K prefill(Windows,tok/s) | 1609 | 1719 | 1615 | 1752(+8.9%) |
+| KLD vs BF16 | 0.1075 | 0.1280 | 0.1226 | 0.1427 |
+
+**做过的测试**(均为 hgn v2、Windows):
+
+- **KLD**:wikitext-2 64 chunk × 512,与 [KLD.md](docs/KLD.md) 同口径。这个测法每个位置都按 prefill
+  打分,A4 的误差覆盖全部被测 token,反映的是读入精度的损失,不是生成质量的损失。
+- **正确性**:开关关闭时,输出与加入此功能前的引擎逐 token 相同;`=3` 时,两条多段长 prompt
+  并发运行、中途插入短请求,greedy 输出与单独运行逐 token 相同(`tools/a4_verify_win.sh`)。
+- **长上下文检索**(`bench/codeneedle`,说明见 [bench/README.md](bench/README.md)):用本项目源码
+  拼成 16K / 32K / 64K 的长文,段落打乱,问 144 道答案唯一的题(环境变量在哪个文件读取、默认值是
+  多少,函数定义在哪个文件,常量的值)。关和 `=3` 两轮 greedy 准确率都是 99.3%,144 题里 143 题
+  输出逐字相同,没有一题一对一错;同一答案的对数概率平均变化不超过 0.01,不随长度增大;
+  长文 prefill 1580 → 1726 tok/s。
+
+**测试没覆盖到的**:
+
+- 检索题的基线已接近满分,只能排除明显的退化,小幅损失测不出来。
+- 没测 64K 以上的长度,没测需要串联多处信息的推理题。
+- 没测代码生成、工具调用这类端到端任务。hipfire 作者在他们的模型上用 HumanEval、GSM8K、MMLU-Pro
+  对比过开关两边,差异在噪声范围内,可作参考,但不是本项目的实测。
+
+建议:需要处理大量长输入、更在意首字速度时打开;对精度敏感,或者不确定时保持关闭。
 
 ## 并发
 
@@ -296,6 +335,7 @@ MTP 开、视觉塔开、prefill chunk 8192):
 - [MTP.md](docs/MTP.md) / [NGRAM.md](docs/NGRAM.md) — 投机解码
 - [KLD.md](docs/KLD.md) — 质量测试(与 unsloth / llama.cpp 同口径)
 - [BENCHMARK.md](docs/BENCHMARK.md) — 性能测试工具
+- [bench/README.md](bench/README.md) — 任务级评测(长上下文代码捞针 A/B)
 - [PORTING-WINDOWS.md](docs/PORTING-WINDOWS.md) — Windows 移植与实测
 
 测试:`bash build.sh test` 跑 kernel 单测(不加载模型,预期 ALL PASS);`python3 tools/bpw.py` 统计
@@ -306,6 +346,8 @@ MTP 开、视觉塔开、prefill chunk 8192):
 本项目的实现方式借鉴了 peonist-ai 的 [halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server);`.hgn` 权重容器格式即 halogen 的 checkpoint 容器格式(见 [HGN-FORMAT.md](docs/HGN-FORMAT.md))。感谢 halogen 作者的工作。
 
 GGUF 支持大量参考了 [gufo](https://github.com/gufo-org/gufo)(MIT 许可证):路由专家 F16 WMMA GEMM kernel 移植自其 RoutedF16GEMMKernel(`src/gpu/parts/26_kernels_moe_gguf.inc`),hgn q4cp / GGUF IQ4 的 LUT 解码版沿用同一条流水线(`27_kernels_moe_lut.inc`),GGUF 与引擎张量间的变换语义参考其 reference.cpp(`src/gguf_map.h`);prefill 的 HC 门控融合、生产者 epilogue 直写下一 GEMM 输入、多行 Q8 dense kernel 等优化也借鉴了 gufo 的做法(对照分析见 [GUFO-GAP.md](docs/GUFO-GAP.md))。
+
+prefill 4-bit 加速(`MOE_A4`)借鉴了 warpfront 的 [hipfire](https://github.com/warpfront/hipfire)(Apache-2.0 许可证):路由专家激活按块量化成 int4、专家 GEMM 走 INT4 WMMA 的做法来自 hipfire 的 IU4 路由,本项目按 hgn v2 的 i4r 格式重新实现(`k_quant_a4` / `k_moe_iu4`,`src/gpu/parts/27_kernels_moe_lut.inc`);LUT 专家 GEMM 的 packed epilogue 也参考了 hipfire 的写法。hipfire 作者分享的任务评测结果帮助我们判断了这个开关的取舍。感谢 hipfire 作者。
 
 ngram 投机解码的起草思路与两级 prompt 缓存借鉴了开源项目 [llama.cpp](https://github.com/ggml-org/llama.cpp)(MIT 许可证),GGUF 权重与视觉塔(mmproj)直接复用 llama.cpp 的同一份文件;IQ3_S 码表取自 llama.cpp;ngram 声明详见 [NGRAM.md](docs/NGRAM.md) 的「来源与声明」一节。
 

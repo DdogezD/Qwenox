@@ -223,10 +223,57 @@ environment variable of the same name takes precedence. Restart the engine after
 | `PREFILL_CHUNK` | `0` | Tokens per prefill segment for long prompts; 0 means 16384 on Linux, 6144 on Windows |
 | `ROPE_FACTOR` | `1` | 1 is native 256K; set 2 and `MAX_CONTEXT=524288` for YaRN 512K |
 | `MTP_GAMMA` | `0` | Draft length; 0 is automatic, 1–8 fixes it |
+| `MOE_A4` | `0` | 4-bit prefill speedup (hgn v2 only), see below; 0 off, 3 on |
 
 YaRN applies to the whole instance and slightly changes the output distribution even on short text (KLD
 0.023 vs native), so turn it on only when a single request really needs more than 256K. The 512K setup,
 shared-pool admission rules and validation scope are in [YARN-512K.md](docs/YARN-512K.md).
+
+### 4-bit prefill speedup (MOE_A4)
+
+Optional, off by default. When on, hgn v2 weights quantize the routed experts' input activations to int4
+(one scale per 128 elements) during prefill, and the expert GEMMs run on INT4 WMMA
+(`v_wmma_i32_16x16x16_iu4`, twice the F16 WMMA rate on gfx1151). Set `MOE_A4=3` in `service.conf`, or
+tick "4-bit prefill speedup" on the V2 weights page of the Windows settings panel. The value is a
+bit mask: 1 quantizes gate/up only, 2 down only, 3 both. GGUF and w4b weights ignore it.
+
+**What it affects**: prefill only, i.e. any input processed more than 16 tokens at a time: the prompt,
+new messages in a multi-turn chat, tool-call results. Generated tokens go through decode, and MTP verify
+and concurrent batching do not use this path either, so generation computes exactly as with the switch
+off. The cost is lower precision in what the model reads in; the longer the input and the more a task
+depends on reading it exactly, the more of the work is affected.
+
+| | off | `=1` | `=2` | `=3` |
+| --- | --- | --- | --- | --- |
+| 64K prefill (Windows, tok/s) | 1609 | 1719 | 1615 | 1752 (+8.9%) |
+| KLD vs BF16 | 0.1075 | 0.1280 | 0.1226 | 0.1427 |
+
+**Tests done** (all hgn v2 on Windows):
+
+- **KLD**: wikitext-2, 64 chunks × 512, same method as [KLD.md](docs/KLD.md). This method scores every
+  position through prefill, so the A4 error covers every scored token; it measures the loss in reading
+  precision, not in generation quality.
+- **Correctness**: with the switch off, output is token-for-token identical to the engine before this
+  feature; with `=3`, two concurrent multi-chunk long prompts with short requests cutting in mid-chunk
+  produce the same greedy output as running alone (`tools/a4_verify_win.sh`).
+- **Long-context retrieval** (`bench/codeneedle`, see [bench/README.md](bench/README.md)): this
+  project's own source, shuffled into 16K / 32K / 64K haystacks, with 144 questions that each have a
+  single answer (which file reads an environment variable, its default value, which file defines a
+  function, a constant's value). Off and `=3` both score 99.3% greedy; 143 of 144 outputs are
+  byte-identical and no question flips between right and wrong; the log-probability of the same answer
+  moves by under 0.01 on average, with no growth with length. Haystack prefill 1580 → 1726 tok/s.
+
+**Not covered by these tests**:
+
+- The retrieval baseline is near the ceiling, so these tests can rule out an obvious regression but
+  cannot detect a small loss.
+- Nothing beyond 64K, and no questions that need several places in the input combined.
+- No end-to-end tasks such as code generation or tool calling. The hipfire author compared both sides
+  of the switch on their model with HumanEval, GSM8K and MMLU-Pro and found the difference within
+  noise; that is a useful reference but not a measurement on this project.
+
+Recommendation: turn it on for heavy long-input workloads where time to first token matters; leave it off
+when precision matters or when unsure.
 
 ## Concurrency
 
@@ -327,6 +374,7 @@ columns are Task Manager readings in GB):
 - [MTP_EN.md](docs/MTP_EN.md) / [NGRAM_EN.md](docs/NGRAM_EN.md) — speculative decoding
 - [KLD.md](docs/KLD.md) — quality testing (same method as unsloth / llama.cpp)
 - [BENCHMARK_EN.md](docs/BENCHMARK_EN.md) — benchmark tools
+- [bench/README.md](bench/README.md) — task-level evaluation (long-context code-needle A/B, in Chinese)
 - [PORTING-WINDOWS_EN.md](docs/PORTING-WINDOWS_EN.md) — Windows port and measurements
 
 Tests: `bash build.sh test` runs the kernel unit tests (no model loaded, expect ALL PASS);
@@ -337,6 +385,8 @@ Tests: `bash build.sh test` runs the kernel unit tests (no model loaded, expect 
 The implementation approach draws on peonist-ai's [halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server); the `.hgn` weight container format is halogen's checkpoint container format (see [HGN-FORMAT_EN.md](docs/HGN-FORMAT_EN.md)). Thanks to the halogen authors for their work.
 
 GGUF support draws heavily on [gufo](https://github.com/gufo-org/gufo) (MIT license): the routed-expert F16 WMMA GEMM kernel is ported from its RoutedF16GEMMKernel (`src/gpu/parts/26_kernels_moe_gguf.inc`), the LUT-decode variant for hgn q4cp / GGUF IQ4 follows the same pipeline (`27_kernels_moe_lut.inc`), and the GGUF-to-engine tensor transform semantics follow its reference.cpp (`src/gguf_map.h`). Prefill optimizations such as HC gate fusion, producer epilogues writing the next GEMM's input directly, and the multi-row Q8 dense kernel also follow gufo's approach (comparison in [GUFO-GAP.md](docs/GUFO-GAP.md)).
+
+The 4-bit prefill speedup (`MOE_A4`) draws on warpfront's [hipfire](https://github.com/warpfront/hipfire) (Apache-2.0 license): quantizing routed-expert activations to int4 per block and running the expert GEMMs on INT4 WMMA comes from hipfire's IU4 route, reimplemented here for the hgn v2 i4r format (`k_quant_a4` / `k_moe_iu4`, `src/gpu/parts/27_kernels_moe_lut.inc`); the packed epilogue of the LUT expert GEMM also follows hipfire's approach. The task evaluations shared by the hipfire author helped us weigh this switch. Thanks to the hipfire author.
 
 The ngram speculative drafting idea and the two-level prompt cache draw on [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT license); GGUF weights and the vision tower (mmproj) reuse the same files as llama.cpp, and the IQ3_S grid table comes from llama.cpp. See the "Attribution" section of [NGRAM_EN.md](docs/NGRAM_EN.md) for the ngram notice.
 
