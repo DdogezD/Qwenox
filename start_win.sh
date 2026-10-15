@@ -95,6 +95,7 @@ if [[ "$engine_connect_host" == 0.0.0.0 ]]; then engine_connect_host=127.0.0.1; 
 [[ "$KV_PAGED" =~ ^[01]$ ]] || fail 'KV_PAGED 必须为 0 或 1'
 [[ "$KV_POOL_TOKENS" =~ ^(0|[1-9][0-9]*)$ && ${#KV_POOL_TOKENS} -le 8 ]] || fail 'KV_POOL_TOKENS 必须为非负整数'
 [[ "$PARALLEL" =~ ^[1-8]$ ]] || fail 'PARALLEL 范围为 1–8'
+[[ "${MOE_A4:-0}" =~ ^[0-3]$ ]] || fail 'MOE_A4 范围为 0–3'
 [[ "$MAX_IMAGES" =~ ^[1-9][0-9]*$ && "$MAX_IMAGES" -le 256 ]] || fail 'MAX_IMAGES 范围为 1–256'
 [[ "$ROPE_ORIGINAL_CTX" =~ ^[1-9][0-9]*$ ]] || fail 'ROPE_ORIGINAL_CTX 必须为正整数'
 [[ "$ROPE_FACTOR" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail 'ROPE_FACTOR 必须为非负小数'
@@ -170,6 +171,8 @@ fi
 export QWENOX_PARALLEL="$PARALLEL"
 # VIZ=1：运行时可视化埋点（GET /viz，页面 /viz-live，见 docs/VIZ.md）
 if (( ${VIZ:-0} )); then export QWENOX_VIZ=1; else unset QWENOX_VIZ; fi
+# MOE_A4=1–3：prefill MoE 4-bit 激活（int4 WMMA，见 service.conf）
+if (( ${MOE_A4:-0} )); then export QWENOX_MOE_A4="$MOE_A4"; else unset QWENOX_MOE_A4; fi
 export QWENOX_API_MAX_IMAGES="$MAX_IMAGES"
 export QWENOX_ROPE_FACTOR="$ROPE_FACTOR"
 export QWENOX_ROPE_ORIGINAL_CTX="$ROPE_ORIGINAL_CTX"

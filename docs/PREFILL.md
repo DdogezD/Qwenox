@@ -218,6 +218,7 @@ kernel 链演进（头注释 qwenox.cpp:6-15）：
 | `QWENOX_HC_INJ_FUSE=0` | HC inject 回退独立的 N=4 inject GEMM（融合版 `k_gr_scatter_norm_inj_bf16` 在写 Rhat 时顺带算出下一处 inject 的 4 路部分和，`k_inj_psum` 收尾；需 `QWENOX_GR_BF16=1`，默认开。R/Rhat 逐 bit 一致，w4 求和顺序不同 → **非逐 bit**，KLD +0.0001） |
 | `QWENOX_HC_FUSE_WRITE=1` | HC 写回并进 MoE reduce 的实验（`k_v2_reduce_rot_hc` / `k_moe_reduce_pw_sg_hc` 尾部 4 分支 bf16 RMW + scatter `Write=false` 模式；逐 bit 一致但 KPROF/pp 实测净回退，**已否决，勿开**——机制见 HANDOFF-PREFILL-ALL §4 B2 子项1 的流量模型修正） |
 | `QWENOX_V2_PAIRS_F16=0` | v2 down pairs 回退 f32（f16 版默认开：KLD 0.107705 ≤ 0.10699+0.002 过线，pp +1~1.5%；仅 v2 kI4R 路径） |
+| `QWENOX_MOE_A4=1/2/3` | 可选，默认关（service.conf `MOE_A4`）：v2 路由专家 prefill 激活按 128 元素量化成 int4，GEMM 走 `v_wmma_i32_16x16x16_iu4`（`k_quant_a4` + `k_moe_iu4`）；1 = gate/up，2 = down，3 = 两者。64K PP 1609 → 1752（=3，+8.9%）；**非逐 bit**，逐 token prefill 打分 KLD 0.1075 → 0.1427（=3；=1 0.1280，=2 0.1226），decode 不经过此路径。并发可用（缓冲为 P 行 prefill 工作区，同 `d_hidb`）；打开时 MoE 固定 BN64 tile |
 | `QWENOX_W4B_PAIRS_F16=0` | w4b down pairs 回退 f32（f16 版默认开：KLD 0.162452 ≤ 0.163530+0.002 过线，严格空闲 pp +0.3%、moe:reduce −36%、devarena −0.78 GiB；仅 w4b q4cp LUT 路径，d_guvb 同步减半） |
 | `QWENOX_HC_NORHAT=1` | HC 免 Rhat 落盘实验（scatter 只写 P×4 inv scales，mix-down Epi=2 staging 现场归一化 + hc_up Epi=1 现场乘 Sc/Hw；KLD 全过但 pp −3.3%、hc+hc2 +293 ms/chunk，**已否决，勿开**——见 HANDOFF-PREFILL-ALL §4 B2 子项2） |
 | `QWENOX_GEMM_SPLITK=0` | 关闭 k1 (2560,6144) 的 split-2（X 经 `k_splitk_repack2` 重排成 2 个连续 K=3072 切片，slice0 写 Y + slice1 Epi=3 原子加，W 原布局 strided 读；P≥8192 生效，默认开：KLD +0.001 过线，pp +1.3~1.8%） |

@@ -571,6 +571,10 @@ struct GpuModel {
   int* d_moentiles = nullptr;
   MoeTile* d_moetilesA = nullptr;  // hybrid tiling: <=64-slot remainder tiles
   int* d_moentilesA = nullptr;
+  // QWENOX_MOE_A4 (moe_b_v2): int4 activations + per-128 scales, P-row
+  // prefill scratch like d_hidb (written and consumed inside one MoE call).
+  uint8_t *d_a4x = nullptr, *d_a4h = nullptr;  // [P][d/2], [P*topk][mid/2]
+  float *d_a4xs = nullptr, *d_a4hs = nullptr;  // [P][d/128], [P*topk][mid/128]
   // GGUF routed experts (gg_on()): P == 1 scratch used by the decode graph;
   // batches reuse the prefill workspaces (see moe_gguf).
   __half* d_gg_x16 = nullptr;   // [d] F16 x
@@ -1103,6 +1107,13 @@ struct GpuModel {
           fprintf(stderr, "dpf: dense dequant look-ahead on, 2 x %.1f MiB slots\n",
                   dpf_bytes_ / 1048576.0);
         }
+      }
+      if (moe_a4_env() && g_hgn_v2 && moe_q4w) {  // QWENOX_MOE_A4 (WS end, opt-in)
+        const size_t d = g_cfg.d, km = (size_t)g_cfg.topk * g_cfg.moe_mid;
+        DALLOC(&d_a4x, BP * d / 2);
+        DALLOC(&d_a4xs, BP * (d / 128) * 4);
+        DALLOC(&d_a4h, BP * km / 2);
+        DALLOC(&d_a4hs, BP * (km / 128) * 4);
       }
     }
     int nqsa = g_cfg.layers / 4;  // 12
@@ -5529,28 +5540,29 @@ struct GpuModel {
       // tile 一个 CTA 解码一遍），逐 bit 不变；默认开，QWENOX_MOE_MT=0 回退。
       // microbench：P=2048 亏 5%、4096 +1.8%、8192 +7.5%、16384 +5.5%——按平均
       // 每专家 slot 数 >= 80 设门槛，小 P（tail chunk / 短 prompt）走原路径。
-      // QWENOX_MOE_A4 —— 已废弃的实验开关（10-14 hipfire IU4 对照），默认关，
-      // 不要在生产或测速口径里打开：
-      //   * 精度：MoE 激活量化成 4-bit，不逐 bit。Windows KLD（bf16_c512）
-      //     0.1075 → 0.1427（=3，+0.035；=1 +0.020，=2 +0.015），远超 +0.002 门槛。
-      //   * 并发：A4 量化缓冲是进程内一份 static，两路 prefill（PARALLEL）同时开
-      //     会互相覆盖，结果错误；且强制 BN64 tile（关掉 mt/hyb）。
-      //   * 收益：64K 稳态 1609 → 1752（=3，+8.9%），不足以抵消上述代价。
-      // 代码只为留档/复测保留（k_quant_a4 / k_moe_iu4 在 27_kernels_moe_lut.inc，
-      // 原型 tools/moe_iu4_proto.cu）。取值为位掩码：1 = gate/up，2 = down，3 = 两者。
-      static const int moe_a4_env = [] {
-        const char* e = getenv("QWENOX_MOE_A4");
-        return e && *e ? atoi(e) & 3 : 0;
-      }();
-      const int a4m = (!vseg && !env_zero("QWENOX_V2_PAIRS_F16")) ? moe_a4_env : 0;
+      // QWENOX_MOE_A4 —— 可选的 prefill 提速开关（hipfire IU4 路线），默认关。
+      // 路由专家的激活按 128 元素量化成 int4（k_quant_a4），GEMM 走
+      // v_wmma_i32_16x16x16_iu4（k_moe_iu4，gfx1151 上是 f16 WMMA 的 2 倍算力）。
+      // 取值为位掩码：1 = gate/up，2 = down，3 = 两者。
+      //   * 收益：64K 稳态 1609 → 1752（=3，+8.9%；=1 +6.8%，=2 +0.4%）。
+      //   * 代价：不逐 bit。Windows KLD（bf16_c512，逐 token 走 prefill 打分）
+      //     0.1075 → 0.1427（=3；=1 0.1280，=2 0.1226）。只影响 prompt 部分，
+      //     生成的 token 走 decode，不经过这条路径；hipfire 在 27B 上的任务
+      //     评测（HumanEval / GSM8K / MMLU-Pro）两条路径互有胜负，在噪声内。
+      //   * 打开时 MoE 固定 BN64 tile（不走 mt/hyb）。
+      // 并发：d_a4* 与 d_hidb / d_guvb 一样是 P 行 prefill 工作区，在一次 MoE
+      // 调用内写完即读完；并发 slot 只在 chunk 之间或层边界（D1b 先排空 GPU）
+      // 交接，交接时这些缓冲不含活数据，多路 prefill 共用一份即可。verify /
+      // 合批 verify / D1b 借用的小 P 不进 LUT 路径。
+      const int a4m = (!vseg && d_a4x && !env_zero("QWENOX_V2_PAIRS_F16")) ? moe_a4_env() : 0;
       const bool a4 = a4m != 0, a4_up = a4m & 1, a4_dn = a4m & 2;
       if (a4) {
         static bool la = false;
         if (!la) {
           la = true;
           fprintf(stderr,
-                  "警告: QWENOX_MOE_A4=%d 已废弃（W4A4 iu4，%s%s）：KLD 明显变差（约 +0.015~0.035），"
-                  "且与并发 prefill 不兼容（共享缓冲会互相覆盖）。仅供复测，请勿用于生产。\n",
+                  "moe prefill: QWENOX_MOE_A4=%d W4A4 iu4 on (%s%s; faster prefill, "
+                  "prompt KLD +0.015~0.035, decode unaffected)\n",
                   a4m, a4_up ? "up " : "", a4_dn ? "down" : "");
         }
       }
@@ -5582,21 +5594,12 @@ struct GpuModel {
       KP("moe:up");
       // up + mid fused (方向 3): hid = fwht(silu(g)*u*suh) 直接落盘，
       // 省掉 guv16 的写读往返和 k_i4r_mid 那次 launch，数学逐位一致。
-      static uint8_t *a4x = nullptr, *a4h = nullptr;
-      static float *a4xs = nullptr, *a4hs = nullptr;
-      if (a4 && !a4x) {
-        const size_t cap = (size_t)maxbatch_cap;
-        CK(hipMalloc(&a4x, cap * d / 2));
-        CK(hipMalloc(&a4xs, cap * (d / 128) * 4));
-        CK(hipMalloc(&a4h, cap * k * mid / 2));
-        CK(hipMalloc(&a4hs, cap * k * (mid / 128) * 4));
-      }
       if (a4_up) {
-        k_quant_a4<<<(unsigned)(((size_t)P * (d / 128) + 7) / 8), 256, 0, g_str>>>(x16, P, d, a4x,
-                                                                                  a4xs);
+        k_quant_a4<<<(unsigned)(((size_t)P * (d / 128) + 7) / 8), 256, 0, g_str>>>(x16, P, d, d_a4x,
+                                                                                  d_a4xs);
         const Iu4W qgu{gu.data, gu.data + gu.rows * gu.cols / 2, 2 * mid, mid};
         k_moe_iu4<true><<<dim3(mid / 128, max_tiles), 256, 0, g_str>>>(
-            qgu, a4x, a4xs, d_tokidx, d_moetiles, d_moentiles, hid, mid, d, gu.svh, dn.suh);
+            qgu, d_a4x, d_a4xs, d_tokidx, d_moetiles, d_moentiles, hid, mid, d, gu.svh, dn.suh);
       } else if (a4) {
         moe_lut_up_mid(pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, hid, gu.svh, dn.suh,
                        mid, d, g_str);
@@ -5621,10 +5624,10 @@ struct GpuModel {
       static const bool pairs_f16 = !env_zero("QWENOX_V2_PAIRS_F16");
       if (a4_dn) {
         k_quant_a4<<<(unsigned)(((size_t)P * k * (mid / 128) + 7) / 8), 256, 0, g_str>>>(
-            hid, P * k, mid, a4h, a4hs);
+            hid, P * k, mid, d_a4h, d_a4hs);
         const Iu4W qdn{dn.data, dn.data + dn.rows * dn.cols / 2, d, 0};
         k_moe_iu4<false><<<dim3(d / 128, max_tiles), 256, 0, g_str>>>(
-            qdn, a4h, a4hs, nullptr, d_moetiles, d_moentiles, (__half*)d_guvb, d, mid, nullptr,
+            qdn, d_a4h, d_a4hs, nullptr, d_moetiles, d_moentiles, (__half*)d_guvb, d, mid, nullptr,
             nullptr);
       } else if (a4) {
         moe_lut_down(moelut::kI4R, pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d, mid,

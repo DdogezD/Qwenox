@@ -1001,9 +1001,9 @@ static bool moe_ggx_down(int type, const uint8_t* dn, const __half* hid, const M
   return moe_lut_down(type, p, hid, tiles, ntiles, max_tiles, pairs, m, k, st);
 }
 
-// --- W4A4 routed experts (QWENOX_MOE_A4) — DEPRECATED, kept for reference ---
-// 已废弃：KLD +0.015~0.035（远超 +0.002 门槛），static 缓冲与并发 prefill 不
-// 兼容；端到端只 +8.9%。默认关，不再维护，见 40_model.inc moe_b_v2 处说明。
+// --- W4A4 routed experts (QWENOX_MOE_A4, opt-in, default off) ---------------
+// 可选 prefill 提速：64K +8.9%，prompt KLD +0.015~0.035，decode 不受影响；
+// 取舍与并发说明见 40_model.inc moe_b_v2。
 // hipfire-style IU4 route for hgn v2 i4r experts (10-14; prototype and A/B in
 // tools/moe_iu4_proto.cu, notes dev-docs/HIPFIRE-PREFILL-GAP-GPUONLY.md §8).
 // Activations are quantized to int4 per 128 elements (k_quant_a4) and the

@@ -383,6 +383,12 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
     // VIZ=1（见 service.conf）：运行时可视化埋点，GET /viz 取数据
     SetEnvironmentVariableA("QWENOX_VIZ",
                             svcconf::cfg(conf, "VIZ", "0") == "1" ? "1" : nullptr);
+    // MOE_A4=1–3（见 service.conf）：prefill MoE 4-bit 激活，其它值 = 关
+    {
+        const std::string a4 = svcconf::cfg(conf, "MOE_A4", "0");
+        const bool on = a4 == "1" || a4 == "2" || a4 == "3";
+        SetEnvironmentVariableA("QWENOX_MOE_A4", on ? a4.c_str() : nullptr);
+    }
     // MAX_IMAGES 同时被本进程（API 的 vision::max_images）读取：
     // SetEnvironmentVariableA 只改 Win32 环境块，本进程 CRT 的 getenv 看不到，
     // 必须用 _putenv（CRT 缓存与 Win32 块一起更新，子进程照常继承）。

@@ -125,6 +125,13 @@ static bool guvb_f16_env() {
          (!nm || atoi(nm) <= 16) && g_cfg.topk == 10 && g_cfg.moe_mid % 64 == 0;
 }
 
+// QWENOX_MOE_A4（可选，默认关）：hgn v2 路由专家 prefill 走 W4A4 iu4 WMMA，
+// 位掩码 1 = gate/up，2 = down，3 = 两者。见 40_model.inc moe_b_v2。
+static int moe_a4_env() {
+  const char* e = getenv("QWENOX_MOE_A4");
+  return e && *e ? atoi(e) & 3 : 0;
+}
+
 // 镜像 GpuModel 构造函数的分配公式（含相同 env 分支），用于 arena 精确 sizing。
 // 每项 256B 对齐后求和；估少了一律有 dalloc_arena 的 hipMalloc 回退兜底。
 // GGUF routed experts that load_arena will copy into the arena (Windows),
@@ -303,6 +310,14 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
       add(mx);
       add(mx);
     }
+  }
+  // QWENOX_MOE_A4 激活量化缓冲（GpuModel d_a4*；构造器另要求 v2 权重，此处
+  // 早于 v2_init 只看 env，非 v2 时多估几十 MiB）
+  if (moe_a4_env()) {
+    add(BP * g_cfg.d / 2);
+    add(BP * (g_cfg.d / 128) * 4);
+    add(BP * g_cfg.topk * g_cfg.moe_mid / 2);
+    add(BP * g_cfg.topk * (g_cfg.moe_mid / 128) * 4);
   }
   // 额外序列槽（GpuModel::slots_init，仅分页 KV）：每槽一份序列状态
   if (kv_paged)
