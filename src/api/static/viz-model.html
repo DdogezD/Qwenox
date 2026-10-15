@@ -22,6 +22,7 @@ canvas#gl.drag { cursor: grabbing; }
 .lb.sec { font-size: 15px; font-weight: 600; color: var(--ink); }
 .lb.ly { font-size: 12px; font-weight: 600; color: var(--ink2); transform: translate(-100%, -50%); }
 .lb.ly.qsa { color: var(--blue); }
+.lb.flow { transform: translate(-50%, -50%); font-size: 14px; font-weight: 700; color: #fff; background: #e4572e; padding: 2px 9px; border-radius: 11px; box-shadow: 0 1px 3px rgba(0,0,0,.25); }
 
 header { position: fixed; left: 18px; top: 14px; max-width: 520px; pointer-events: none; }
 h1 { font-size: 20px; font-weight: 600; margin: 0 0 2px; }
@@ -73,6 +74,7 @@ aside .desc { color: var(--ink2); font-size: 13px; line-height: 1.55; white-spac
     <i style="background:#2f8f8a"></i><span>Hyper-Connection：4 路残差的读写</span>
     <i style="background:#d9a531"></i><span>当前 token 选中的专家（越高权重越大）</span>
     <i style="background:#c9c6d6"></i><span>残差流（4 条分支）</span>
+    <i style="background:#e4572e"></i><span>数据流向：48 层串成一条链，每 12 层排一栏，走到底再接下一栏顶部</span>
   </div>
   <div class="tok">
     <div class="src" id="src" aria-live="polite"></div>
@@ -122,6 +124,34 @@ function wmat(name, xL, top, z, nIn, nOut, opt = {}) {
 }
 function label(text, x, y, z, cls = "", near = 0, far = 1e9) { labels.push({ p: [x, y, z], text, cls, near, far }); }
 
+// ---- data-flow arrows: thick shafts (boxes) + triangular heads (own mesh) ----
+const FLOW = hex("#e4572e"), FW = 10, HW = 32, HL = 36;
+const heads = { up: [], down: [], left: [], right: [] };
+function head(dir, x, y, z) {               // (x, y) = tip
+  const v = dir === "up" || dir === "down";
+  const s = v ? [HW, HL, FW + 2] : [HL, HW, FW + 2];
+  const o = [v ? x - HW / 2 : (dir === "right" ? x - HL : x),
+             v ? (dir === "up" ? y - HL : y) : y - HW / 2, z - s[2] / 2];
+  heads[dir].push({ o, s, c: FLOW, a: 1, cells: [1, 1, 1], hl: 0 });
+}
+// axis-aligned polyline; head at the end, plus evenly spaced heads along long segments
+function flow(pts, z = 0, midMin = 260, every = 550) {
+  for (let i = 0; i + 1 < pts.length; i++) {
+    let [xa, ya] = pts[i], [xb, yb] = pts[i + 1];
+    const dir = xa === xb ? (yb > ya ? "up" : "down") : (xb > xa ? "right" : "left");
+    const len = Math.hypot(xb - xa, yb - ya), last = i + 2 === pts.length;
+    if (last) { const k = (len - HL + 1) / len; xb = xa + (xb - xa) * k; yb = ya + (yb - ya) * k; }
+    if (xa === xb) box("", xa, Math.max(ya, yb) + FW / 2, z, FW, Math.abs(yb - ya) + FW, FW, FLOW, { pick: false });
+    else box("", (xa + xb) / 2, ya + FW / 2, z, Math.abs(xb - xa) + FW, FW, FW, FLOW, { pick: false });
+    if (len >= midMin) {
+      const d = { up: [0, 1], down: [0, -1], right: [1, 0], left: [-1, 0] }[dir];
+      const [mx, my] = pts[i], n = Math.max(1, Math.round(len / every));
+      for (let k = 0; k < n; k++) { const m = (k + 0.5) * len / n + HL / 2; head(dir, mx + d[0] * m, my + d[1] * m, z); }
+    }
+    if (last) head(dir, pts[i + 1][0], pts[i + 1][1], z);
+  }
+}
+
 const COLW = 520, LH = 150, TOP = 0, PER_COL = 12;
 const layerOrigin = l => [Math.floor(l / PER_COL) * COLW, TOP - (l % PER_COL) * LH];
 const PIPES = [-9, -3, 3, 9];                 // x of the 4 residual branches
@@ -134,13 +164,11 @@ for (let c = 0; c < L / PER_COL; c++) {
       shape: "4 × 2560", pick: true,
       desc: "Hyper-Connection 把残差流扩成 4 条分支，每条 2560 维。每个子层读时把 4 路混成 1 路，写回时再按学到的系数分发到 4 路。",
     });
-  if (c < L / PER_COL - 1) {           // bottom of this column -> top of the next
-    const yb = y1 - 6, xn = (c + 1) * COLW;
-    box("", x0, yb + 6, -40, 3, 6, 3, C.conn, { pick: false });
-    box("", (x0 + xn) / 2, yb, -40, xn - x0, 2, 2, C.conn, { pick: false });
-    box("", xn, y0 + 30, -40, 2, y0 + 30 - yb, 2, C.conn, { pick: false });
-    box("", (x0 + xn) / 2 + COLW / 2 - (xn - x0) / 2 + 0, y0 + 30, -40, 0.01, 0.01, 0.01, C.conn, { pick: false });
-    box("", xn, y0 + 30, -40 + 20, 2, 2, 40, C.conn, { pick: false });
+  if (c < L / PER_COL - 1) {           // bottom of this column -> up the gap -> top of the next
+    const xn = (c + 1) * COLW, xg = x0 + 231, yb = y1 - 45, yt = TOP + 100;
+    flow([[x0, y1], [x0, yb], [xg, yb], [xg, yt], [xn, yt], [xn, y0 + 2]]);
+    const a = c * PER_COL + PER_COL - 1;
+    label(`L${a} → L${a + 1}`, xg, yb + (yt - yb) / 3, 0, "flow");
   }
 }
 
@@ -152,7 +180,7 @@ for (let c = 0; c < L / PER_COL; c++) {
     desc: "每个 token id 取一行 2560 维向量，复制成 4 份作为残差流的 4 条分支的起点。",
   });
   label("Token 嵌入", 0, top + 6, 0, "sec");
-  box("", 0, top - S(2560), 0, 1.2, 120 - S(2560) - 18 + 0.01, 1.2, C.conn, { pick: false });
+  flow([[0, top - S(2560)], [0, TOP + 20]]);
 }
 
 // ---- one layer ----
@@ -253,7 +281,7 @@ function buildLayer(l) {
       desc: "按前几个 token 的哈希查一张极大的 n-gram 嵌入表（放主机内存/SSD，按需流式读），经长度 4、空洞 3 的卷积和门控后注入第 1 层残差流。",
     });
     box("PLE 门控 + 卷积", X - 40, Y - 44, 18, 12, 6, 6, C.hc, { shape: "2560", desc: "把 n-gram 嵌入做卷积并门控后加进残差流。" });
-    box("", X - 220, Y - 40, 18, 290, 1.2, 1.2, C.conn, { pick: false });
+    flow([[X - 290, Y - 41], [X - 47, Y - 41]], 18);
     label("PLE n-gram 表", X - 360, Y + 18, 0, "sec", 0, 5200);
   }
 }
@@ -278,13 +306,14 @@ for (let l = 0; l < L; l++) buildLayer(l);
     shape: "每轮猜 γ 个 token",
     desc: "草稿层连续猜几个 token，主干一次前向同时验证它们，猜对的全部收下。运行时视图里那根 MTP 柱状图就是每轮收下的个数。",
   });
-  box("", (X + MX) / 2, MY - 140, 0, MX - X, 1.2, 1.2, C.conn, { pick: false });
+  flow([[X, TOP - PER_COL * LH + 10], [X, top + 1]]);                        // L47 -> final HC mix
+  flow([[X + 13, top - 1.5], [MX + 95, top - 1.5], [MX + 95, MY + 30], [MX, MY + 30], [MX, MY + 1]]);
   label("MTP 草稿层", MX, MY + 10, 0, "sec");
 }
-label("第 0–11 层", 0, TOP + 40, 0, "sec", 1400);
-label("第 12–23 层", COLW, TOP + 40, 0, "sec", 1400);
-label("第 24–35 层", 2 * COLW, TOP + 40, 0, "sec", 1400);
-label("第 36–47 层", 3 * COLW, TOP + 40, 0, "sec", 1400);
+label("第 0–11 层", 0 - 95, TOP + 40, 0, "sec", 1400);
+label("第 12–23 层", COLW - 95, TOP + 40, 0, "sec", 1400);
+label("第 24–35 层", 2 * COLW - 95, TOP + 40, 0, "sec", 1400);
+label("第 36–47 层", 3 * COLW - 95, TOP + 40, 0, "sec", 1400);
 
 // ---------------- WebGL ----------------
 const cv = document.getElementById("gl");
@@ -302,6 +331,7 @@ void main(){ vec3 w = io + p*is_; gl_Position = vp*vec4(w,1.0); vl=p; vn=n; vc=i
 const FS = `#version 300 es
 precision highp float;
 in vec3 vl; in vec3 vn; in vec4 vc; in vec3 vcell; in float vhl; out vec4 o;
+uniform float edges;
 void main(){
   vec3 an = abs(vn);
   float diff = 0.62 + 0.30*max(dot(vn, normalize(vec3(0.35,0.85,0.4))),0.0) + 0.08*max(dot(vn, normalize(vec3(-0.6,0.2,0.7))),0.0);
@@ -311,12 +341,12 @@ void main(){
   vec3 dl = abs(fract(g-0.5)-0.5)/max(fw,vec3(1e-4));
   vec3 gline = (1.0-clamp(dl,0.0,1.0)) * (1.0-smoothstep(0.12,0.35,fw)) * (1.0-an);
   float line = max(max(gline.x,gline.y),gline.z);
-  col = mix(col, col*0.80, line*0.7);
+  col = mix(col, col*0.80, line*0.7*edges);
   // box edges
   vec3 fe = fwidth(vl); vec3 de = min(vl,1.0-vl)/max(fe,vec3(1e-4));
   de = mix(de, vec3(1e4), an);
   float edge = 1.0-clamp(min(min(de.x,de.y),de.z)-0.2,0.0,1.0);
-  col = mix(col, mix(vec3(1.0), vec3(0.85,0.62,0.12), vhl), edge*(0.55+0.45*vhl));
+  col = mix(col, mix(vec3(1.0), vec3(0.85,0.62,0.12), vhl), edge*(0.55+0.45*vhl)*edges);
   col = mix(col, col*1.18+0.06, vhl*0.5);
   o = vec4(col, vc.a);
 }`;
@@ -325,7 +355,7 @@ const prog = gl.createProgram();
 gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
 gl.linkProgram(prog);
 if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
-const uVP = gl.getUniformLocation(prog, "vp");
+const uVP = gl.getUniformLocation(prog, "vp"), uEdges = gl.getUniformLocation(prog, "edges");
 
 // cube in [0,1]^3
 const cube = [];
@@ -339,11 +369,27 @@ for (const [ax, nrm] of faces) {
     cube.push(...v, ...nrm);
   }
 }
+// triangular prism in [0,1]^3, tip pointing along dir; outward normals, CCW winding
+function prism(dir) {
+  const map = { up: (u, v) => [u, v], down: (u, v) => [u, 1 - v], right: (u, v) => [v, u], left: (u, v) => [1 - v, u] }[dir];
+  const t = [[0, 0], [1, 0], [0.5, 1]].map(([u, v]) => map(u, v));
+  const P = (i, z) => [t[i][0], t[i][1], z], ctr = [0.5, 0.4, 0.5];
+  const tris = [[P(0, 1), P(1, 1), P(2, 1)], [P(0, 0), P(2, 0), P(1, 0)]];
+  for (let i = 0; i < 3; i++) { const j = (i + 1) % 3; tris.push([P(i, 0), P(j, 0), P(j, 1)], [P(i, 0), P(j, 1), P(i, 1)]); }
+  const out = [];
+  for (let [a, b, c] of tris) {
+    let n = norm(cross(sub(b, a), sub(c, a)));
+    const m = mul(add(add(a, b), c), 1 / 3);
+    if (dot(n, sub(m, ctr)) < 0) { [b, c] = [c, b]; n = mul(n, -1); }
+    for (const v of [a, b, c]) out.push(...v, ...n);
+  }
+  return out;
+}
 const STRIDE = 14;
-function makeSet(list) {
+function makeSet(list, geom = cube) {
   const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
   const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(cube), gl.STATIC_DRAW);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(geom), gl.STATIC_DRAW);
   gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 24, 0);
   gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 24, 12);
   const data = new Float32Array(list.length * STRIDE);
@@ -355,7 +401,7 @@ function makeSet(list) {
     gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, sz, gl.FLOAT, false, STRIDE * 4, off * 4);
     gl.vertexAttribDivisor(loc, 1);
   }
-  const set = { vao, ib, data, n: list.length, list };
+  const set = { vao, ib, data, n: list.length, list, nv: geom.length / 6 };
   list.forEach(b => (b.set = set));
   return set;
 }
@@ -387,6 +433,7 @@ function lookAt(e, c, up) {
   const z = norm(sub(e, c)), x = norm(cross(up, z)), y = cross(z, x);
   return [x[0], y[0], z[0], 0, x[1], y[1], z[1], 0, x[2], y[2], z[2], 0, -dot(x, e), -dot(y, e), -dot(z, e), 1];
 }
+const headSets = Object.entries(heads).filter(([, l]) => l.length).map(([d, l]) => makeSet(l, prism(d)));
 function mm(a, b) { const r = new Array(16).fill(0); for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) for (let k = 0; k < 4; k++) r[j * 4 + i] += a[k * 4 + i] * b[j * 4 + k]; return r; }
 
 // ---------------- camera ----------------
@@ -700,7 +747,11 @@ function frame(t) {
   gl.enable(gl.DEPTH_TEST); gl.enable(gl.CULL_FACE);
   gl.useProgram(prog); gl.uniformMatrix4fv(uVP, false, VP);
   gl.disable(gl.BLEND); gl.depthMask(true);
+  gl.uniform1f(uEdges, 1);
   gl.bindVertexArray(opaque.vao); gl.drawArraysInstanced(gl.TRIANGLES, 0, 36, opaque.n);
+  gl.uniform1f(uEdges, 0);
+  for (const hs of headSets) { gl.bindVertexArray(hs.vao); gl.drawArraysInstanced(gl.TRIANGLES, 0, hs.nv, hs.n); }
+  gl.uniform1f(uEdges, 1);
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
   gl.bindVertexArray(transp.vao); gl.drawArraysInstanced(gl.TRIANGLES, 0, 36, transp.n);
   gl.depthMask(true);
