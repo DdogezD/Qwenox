@@ -72,6 +72,7 @@ def load_set(path):
 def cmd_run(a):
     S, blobs = load_set(a.set)
     tk = C.tokenizer()
+    special = C.special_ids(tk)
     eng = Engine(a.port)
     byhay = defaultdict(list)
     for q in S['questions']:
@@ -84,7 +85,10 @@ def cmd_run(a):
         text = C.haystack_text(blobs, frags)
         if C.sha(text) != h['sha256']:
             raise SystemExit(f'{h["id"]}: haystack sha mismatch (rev {S["rev"][:10]} not available?)')
-        pre = tk.encode(C.prefix_text(text))
+        pre = C.prefix_ids(tk, text)
+        nsp = sum(t in special for t in pre)
+        if nsp != 1:     # 只允许开头的 <|im_start|>
+            raise SystemExit(f'{h["id"]}: {nsp} special tokens in the prompt prefix (want 1)')
         w = eng.gen(pre, 1, snap=len(pre))
         if w['reason'] == 'error':
             errors += 1
@@ -96,7 +100,7 @@ def cmd_run(a):
             basenames[p.rsplit('/', 1)[-1]] += 1
         nok = 0
         for q in byhay[h['id']]:
-            ids = pre + tk.encode(C.suffix_text(q['q']))
+            ids = pre + C.suffix_ids(tk, q['q'])
             r = dict(type=q['type'], hay=h['id'], L=h['L'], depth=q['depth'], answer=q['answer'])
             g = eng.gen(ids, a.max_tokens, snap=len(pre))
             stats['q_total'] += 1
@@ -170,6 +174,9 @@ def cmd_cmp(a):
     print(f'{"":5} {"greedy A":>9} {"greedy B":>9} {"A>B":>4} {"B>A":>4} {"p":>6} {"B-A 95% CI (pt)":>20} '
           f'{"same ans":>8} | {"sample A":>8} {"sample B":>8} {"A>B":>4} {"B>A":>4} {"p":>6} | {"dlogp":>7} {"n":>4}')
     verdict_bad = []
+    if not ids:
+        fails.append('no results to compare')
+        groups = {}
     for gname, ks in groups.items():
         n = len(ks)
         ga = sum(A['res'][k]['greedy']['ok'] for k in ks)

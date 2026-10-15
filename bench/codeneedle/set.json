@@ -6,7 +6,7 @@
   {
    "id": "L16K-0",
    "L": 16384,
-   "n_tokens": 15833,
+   "n_tokens": 15862,
    "frags": [
     [
      "src/service_conf.h",
@@ -19,9 +19,9 @@
      119
     ],
     [
-     "src/gpu/parts/49_rckpt.inc",
-     153,
-     225
+     "src/gpu/parts/22_kernels_prefill.inc",
+     1478,
+     1542
     ],
     [
      "src/ple_prefetch.h",
@@ -44,9 +44,9 @@
      134
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     895,
-     954
+     "src/gpu/parts/49_rckpt.inc",
+     153,
+     225
     ],
     [
      "src/gpu/parts/51_host_cfg.inc",
@@ -64,9 +64,9 @@
      251
     ],
     [
-     "src/gpu/parts/22_kernels_prefill.inc",
-     1478,
-     1542
+     "src/gpu/parts/40_model.inc",
+     895,
+     954
     ],
     [
      "src/gpu/vit.cpp",
@@ -104,13 +104,13 @@
      190
     ]
    ],
-   "sha256": "25630101e2e3bc12d600d135c369edb103227a2c57e3d3340eee2c5cb64b636d",
+   "sha256": "5563088773dab233f889a8c667545c1210dda616ef68e4ac62aa5f9371cddca1",
    "files": 15
   },
   {
    "id": "L16K-1",
    "L": 16384,
-   "n_tokens": 15957,
+   "n_tokens": 15961,
    "frags": [
     [
      "src/gpu/parts/40_model.inc",
@@ -139,8 +139,8 @@
     ],
     [
      "src/gpu/parts/40_model.inc",
-     895,
-     954
+     2386,
+     2432
     ],
     [
      "src/api/http.cpp",
@@ -179,8 +179,8 @@
     ],
     [
      "src/gpu/parts/40_model.inc",
-     2386,
-     2432
+     895,
+     954
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -193,13 +193,13 @@
      176
     ]
    ],
-   "sha256": "aa4ac50c6900d82a1b3014536d4a2b1d6b1236633066b321ab4209afc25f7cf8",
+   "sha256": "69a24e7c1b1862ed45abba1e9f7f24743937686738a003b5232b1f0688569a2b",
    "files": 11
   },
   {
    "id": "L16K-2",
    "L": 16384,
-   "n_tokens": 15860,
+   "n_tokens": 15862,
    "frags": [
     [
      "src/gpu/parts/27_kernels_moe_lut.inc",
@@ -212,9 +212,9 @@
      443
     ],
     [
-     "src/gpu/parts/26_kernels_moe_gguf.inc",
-     1022,
-     1053
+     "src/gpu/parts/30_host_util.inc",
+     1100,
+     1159
     ],
     [
      "src/gpu/vit.cpp",
@@ -232,9 +232,9 @@
      2335
     ],
     [
-     "src/gpu/parts/30_host_util.inc",
-     1100,
-     1159
+     "src/gpu/parts/26_kernels_moe_gguf.inc",
+     1022,
+     1053
     ],
     [
      "src/gpu/parts/30_host_util.inc",
@@ -252,9 +252,9 @@
      4374
     ],
     [
-     "src/gpu/parts/00_platform.inc",
-     136,
-     160
+     "src/gpu/parts/25_kernels_gdn.inc",
+     871,
+     928
     ],
     [
      "src/gpu/parts/31_vision.inc",
@@ -272,9 +272,9 @@
      285
     ],
     [
-     "src/gpu/parts/25_kernels_gdn.inc",
-     871,
-     928
+     "src/gpu/parts/00_platform.inc",
+     136,
+     160
     ],
     [
      "src/gpu/parts/26_kernels_moe_gguf.inc",
@@ -287,13 +287,13 @@
      265
     ]
    ],
-   "sha256": "88535b26c769565c75b0d610a4e883320a2aa049648221336b5a9f7543024a7c",
+   "sha256": "d6f0e87add7e4355b47983265bd1fa42ca9cd97d0e69d66021740bec11338658",
    "files": 14
   },
   {
    "id": "L16K-3",
    "L": 16384,
-   "n_tokens": 16040,
+   "n_tokens": 16052,
    "frags": [
     [
      "src/gpu/parts/40_model.inc",
@@ -326,9 +326,9 @@
      223
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     895,
-     954
+     "src/gpu/parts/51_host_cfg.inc",
+     806,
+     866
     ],
     [
      "src/api/main.cpp",
@@ -351,9 +351,9 @@
      69
     ],
     [
-     "src/gpu/parts/51_host_cfg.inc",
-     806,
-     866
+     "src/gpu/parts/40_model.inc",
+     895,
+     954
     ],
     [
      "src/api/http.cpp",
@@ -386,7 +386,7 @@
      1822
     ]
    ],
-   "sha256": "2ff77c55010d2d2698c6fecaa17866ac893aacc1af228aecff13389eccc0f51a",
+   "sha256": "cf723b0427471d508a6942466d741c3813d9ecebff813c6abae4d854e6dd08ac",
    "files": 12
   },
   {
@@ -405,9 +405,9 @@
      4199
     ],
     [
-     "src/gpu/parts/30_host_util.inc",
-     135,
-     190
+     "src/gpu/parts/40_model.inc",
+     10987,
+     11042
     ],
     [
      "src/api/http.cpp",
@@ -425,9 +425,9 @@
      792
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     599,
-     660
+     "src/gpu/parts/30_host_util.inc",
+     135,
+     190
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -466,8 +466,8 @@
     ],
     [
      "src/gpu/parts/40_model.inc",
-     10987,
-     11042
+     599,
+     660
     ],
     [
      "src/api/main.cpp",
@@ -480,13 +480,13 @@
      224
     ]
    ],
-   "sha256": "8dcaa6e979536817d865553b44152f708f758e104cd7cbb1b5250b3fe5c67920",
+   "sha256": "d4a598faca2a6d3f3040f4a0f13f94e60ad7c434a41f277126048347778f3a15",
    "files": 11
   },
   {
    "id": "L16K-5",
    "L": 16384,
-   "n_tokens": 16120,
+   "n_tokens": 16113,
    "frags": [
     [
      "src/api/toolparse_test.cpp",
@@ -499,9 +499,9 @@
      916
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     2651,
-     2711
+     "src/api/chat_template.cpp",
+     83,
+     157
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -519,9 +519,9 @@
      1172
     ],
     [
-     "src/gpu/parts/19_viz.inc",
-     1,
-     35
+     "src/gpu/parts/30_host_util.inc",
+     80,
+     134
     ],
     [
      "src/gpu/parts/22_kernels_prefill.inc",
@@ -539,14 +539,14 @@
      792
     ],
     [
-     "src/api/chat_template.cpp",
-     83,
-     157
-    ],
-    [
      "src/gpu/parts/10_ple_io.inc",
      669,
      719
+    ],
+    [
+     "src/gpu/parts/19_viz.inc",
+     1,
+     35
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -559,22 +559,27 @@
      3708
     ],
     [
-     "src/gpu/parts/30_host_util.inc",
-     80,
-     134
-    ],
-    [
      "src/gpu/parts/51_host_cfg.inc",
      3399,
      3463
     ],
     [
-     "src/api/tpl_cli.cpp",
-     1,
-     52
+     "src/gpu/parts/40_model.inc",
+     2651,
+     2711
+    ],
+    [
+     "src/gguf.h",
+     541,
+     544
+    ],
+    [
+     "src/gpu/parts/40_model.inc",
+     4558,
+     4589
     ]
    ],
-   "sha256": "883f223ca955a431c54214b92eb3cd04cccb14c413ed84e28122845f6f408d16",
+   "sha256": "74f8c5c56df229ac48810191b57962396c703ffd313b6d37d823ef220a36bd41",
    "files": 11
   },
   {
@@ -593,9 +598,9 @@
      909
     ],
     [
-     "src/gpu/parts/51_host_cfg.inc",
-     3816,
-     3855
+     "src/gpu/parts/06_memstats.inc",
+     1,
+     83
     ],
     [
      "src/gpu/parts/20_kernels_gemv.inc",
@@ -608,9 +613,9 @@
      761
     ],
     [
-     "src/api/http.cpp",
-     1,
-     82
+     "src/gpu/parts/40_model.inc",
+     895,
+     954
     ],
     [
      "src/service_conf.h",
@@ -633,9 +638,9 @@
      141
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     895,
-     954
+     "src/gpu/parts/51_host_cfg.inc",
+     3816,
+     3855
     ],
     [
      "src/gpu/parts/20_kernels_gemv.inc",
@@ -648,9 +653,9 @@
      311
     ],
     [
-     "src/gpu/parts/06_memstats.inc",
+     "src/api/http.cpp",
      1,
-     83
+     82
     ],
     [
      "src/api/main.cpp",
@@ -663,13 +668,13 @@
      230
     ]
    ],
-   "sha256": "608ac5bdc3c7a3a6b9e0cb287a9ec28fb8a202a9096b23a0129ecaeaeb9f0280",
+   "sha256": "71ab59a8289739b30d40ffd52e4e513e4232346c6a6fb110462330e2831819df",
    "files": 11
   },
   {
    "id": "L16K-7",
    "L": 16384,
-   "n_tokens": 16064,
+   "n_tokens": 16066,
    "frags": [
     [
      "src/gpu/parts/31_vision.inc",
@@ -677,9 +682,9 @@
      510
     ],
     [
-     "src/gpu/parts/22_kernels_prefill.inc",
-     2037,
-     2107
+     "src/gpu/parts/40_model.inc",
+     599,
+     660
     ],
     [
      "src/gpu/parts/25_kernels_gdn.inc",
@@ -697,9 +702,9 @@
      3885
     ],
     [
-     "src/gpu/parts/51_host_cfg.inc",
-     2938,
-     3008
+     "src/gpu/parts/22_kernels_prefill.inc",
+     2037,
+     2107
     ],
     [
      "src/gguf_map.h",
@@ -717,9 +722,9 @@
      2565
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     599,
-     660
+     "src/gpu/parts/51_host_cfg.inc",
+     2938,
+     3008
     ],
     [
      "src/gpu/parts/22_kernels_prefill.inc",
@@ -747,7 +752,7 @@
      2095
     ]
    ],
-   "sha256": "9cf452d097ce658172a6ffec9f15bd27c950f21f735f98b2057b0d3fe0dbb0e3",
+   "sha256": "6fc7ad8f694e6437035cfba38422583c1826fd19c71959cffecea004f4817f6e",
    "files": 10
   },
   {
@@ -766,9 +771,9 @@
      3637
     ],
     [
-     "src/gpu/parts/30_host_util.inc",
-     410,
-     443
+     "src/gpu/parts/25_kernels_gdn.inc",
+     871,
+     928
     ],
     [
      "src/gpu/parts/25_kernels_gdn.inc",
@@ -786,9 +791,9 @@
      841
     ],
     [
-     "src/gpu/parts/25_kernels_gdn.inc",
-     871,
-     928
+     "src/gpu/parts/30_host_util.inc",
+     410,
+     443
     ],
     [
      "src/gpu/vit.cpp",
@@ -841,13 +846,13 @@
      1905
     ]
    ],
-   "sha256": "5312b3b8c4025230d75a133c6f35507ac6401a26b62eff1050b8bc2c76043f8f",
+   "sha256": "0efae41ffc21183f0d6d17db91b3487b21b48a37ff72298cd9b2c5064daa12a9",
    "files": 8
   },
   {
    "id": "L16K-9",
    "L": 16384,
-   "n_tokens": 16013,
+   "n_tokens": 16026,
    "frags": [
     [
      "src/gpu/parts/40_model.inc",
@@ -860,9 +865,9 @@
      580
     ],
     [
-     "src/gpu/parts/40_model.inc",
+     "src/api/vision.cpp",
      1,
-     70
+     74
     ],
     [
      "src/api/main.cpp",
@@ -880,9 +885,9 @@
      1460
     ],
     [
-     "src/api/vision.cpp",
-     1,
-     74
+     "src/api/tray_win.cpp",
+     468,
+     544
     ],
     [
      "src/gpu/parts/30_host_util.inc",
@@ -900,9 +905,9 @@
      1518
     ],
     [
-     "src/gpu/parts/51_host_cfg.inc",
-     3009,
-     3064
+     "src/gpu/parts/40_model.inc",
+     1,
+     70
     ],
     [
      "src/gguf_iq3s_grid.h",
@@ -920,9 +925,9 @@
      976
     ],
     [
-     "src/api/tray_win.cpp",
-     468,
-     544
+     "src/gpu/parts/51_host_cfg.inc",
+     3009,
+     3064
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -935,13 +940,13 @@
      37
     ]
    ],
-   "sha256": "a817e0a00945990f2565bd7a86b248985944f5504e213620c68eb3890f0a12a7",
+   "sha256": "ba15ebe8864621e9334d78d2d3e2f59a007ecfebd2674a1f306d4639a012ddd0",
    "files": 10
   },
   {
    "id": "L16K-10",
    "L": 16384,
-   "n_tokens": 15798,
+   "n_tokens": 15800,
    "frags": [
     [
      "src/gpu/parts/40_model.inc",
@@ -954,9 +959,9 @@
      385
     ],
     [
-     "src/api/chat_template.cpp",
-     158,
-     202
+     "src/gpu/parts/30_host_util.inc",
+     363,
+     409
     ],
     [
      "src/gpu/parts/52_main.inc",
@@ -974,9 +979,9 @@
      85
     ],
     [
-     "src/gpu/parts/30_host_util.inc",
-     363,
-     409
+     "src/gpu/parts/51_host_cfg.inc",
+     1414,
+     1469
     ],
     [
      "src/gpu/parts/22_kernels_prefill.inc",
@@ -1014,9 +1019,9 @@
      42
     ],
     [
-     "src/gpu/parts/51_host_cfg.inc",
-     1414,
-     1469
+     "src/api/chat_template.cpp",
+     158,
+     202
     ],
     [
      "src/gpu/parts/27_kernels_moe_lut.inc",
@@ -1029,7 +1034,7 @@
      11
     ]
    ],
-   "sha256": "f5a6c630d3e6590a5d698a3be8321bed766e4ba9b0cb0e17ea9d5b6835ea280f",
+   "sha256": "e377076272b3e237d108d699f6fbb49c29db19542eaec43f3367a64ec4e43b5f",
    "files": 14
   },
   {
@@ -1048,9 +1053,9 @@
      7902
     ],
     [
-     "src/gpu/parts/30_host_util.inc",
-     1,
-     79
+     "src/gpu/parts/40_model.inc",
+     2712,
+     2772
     ],
     [
      "src/api/tokenizer.cpp",
@@ -1068,9 +1073,9 @@
      3937
     ],
     [
-     "src/gpu/os_win32.h",
+     "src/gpu/parts/30_host_util.inc",
      1,
-     66
+     79
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -1088,9 +1093,9 @@
      135
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     2712,
-     2772
+     "src/gpu/parts/23_kernels_moe_w4.inc",
+     1,
+     51
     ],
     [
      "src/gpu/parts/49_rckpt.inc",
@@ -1108,9 +1113,9 @@
      265
     ],
     [
-     "src/gpu/parts/23_kernels_moe_w4.inc",
+     "src/gpu/os_win32.h",
      1,
-     51
+     66
     ],
     [
      "src/gpu/parts/31_vision.inc",
@@ -1123,13 +1128,13 @@
      991
     ]
    ],
-   "sha256": "a71e04a0fc5911ac76f730be88f8a3269c8a7d7d2bc8b9b61ed4b617e166c571",
+   "sha256": "c4bbcc8d48e177ab19940e1e77f02d696b06b5d48b59eccad434c2e510046dc2",
    "files": 14
   },
   {
    "id": "L32K-0",
    "L": 32768,
-   "n_tokens": 32289,
+   "n_tokens": 32303,
    "frags": [
     [
      "src/api/vision.cpp",
@@ -1143,8 +1148,8 @@
     ],
     [
      "src/gpu/parts/40_model.inc",
-     9771,
-     9831
+     895,
+     954
     ],
     [
      "src/gpu/bench_main.cpp",
@@ -1162,9 +1167,9 @@
      3003
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     7964,
-     8018
+     "src/api/main.cpp",
+     3638,
+     3681
     ],
     [
      "src/gpu/parts/27_kernels_moe_lut.inc",
@@ -1182,9 +1187,9 @@
      1692
     ],
     [
-     "src/api/main.cpp",
-     3638,
-     3681
+     "src/gpu/parts/40_model.inc",
+     9771,
+     9831
     ],
     [
      "src/gpu/parts/20_kernels_gemv.inc",
@@ -1203,8 +1208,8 @@
     ],
     [
      "src/gpu/parts/40_model.inc",
-     895,
-     954
+     2651,
+     2711
     ],
     [
      "src/settings_panel.inc",
@@ -1227,9 +1232,9 @@
      1897
     ],
     [
-     "src/gpu/parts/25_kernels_gdn.inc",
-     1819,
-     1881
+     "src/gguf.h",
+     1,
+     80
     ],
     [
      "src/gpu/parts/51_host_cfg.inc",
@@ -1247,9 +1252,9 @@
      4135
     ],
     [
-     "src/gguf.h",
+     "src/api/engine_sup.cpp",
      1,
-     80
+     111
     ],
     [
      "src/api/tokenizer.cpp",
@@ -1268,8 +1273,8 @@
     ],
     [
      "src/gpu/parts/40_model.inc",
-     2651,
-     2711
+     7964,
+     8018
     ],
     [
      "src/api/main.cpp",
@@ -1287,9 +1292,9 @@
      296
     ],
     [
-     "src/api/engine_sup.cpp",
-     1,
-     111
+     "src/gpu/parts/25_kernels_gdn.inc",
+     1819,
+     1881
     ],
     [
      "src/gpu/parts/28_kernels_hgn_v2.inc",
@@ -1302,7 +1307,7 @@
      10749
     ]
    ],
-   "sha256": "5ebf1e00cff6e4d0bd2eee1746eac09ae7f832d8049bd44a0552d642bc5864a8",
+   "sha256": "39190e6b87243a6590feee5c0add6305f269b3654ae104d942b14de8902f0c81",
    "files": 21
   },
   {
@@ -1321,9 +1326,9 @@
      5490
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     4925,
-     4994
+     "src/gpu/parts/21_kernels_ple.inc",
+     184,
+     221
     ],
     [
      "src/gpu/parts/28_kernels_hgn_v2.inc",
@@ -1341,9 +1346,9 @@
      1234
     ],
     [
-     "src/gpu/parts/21_kernels_ple.inc",
-     184,
-     221
+     "src/gpu/parts/40_model.inc",
+     4925,
+     4994
     ],
     [
      "src/gpu/parts/30_host_util.inc",
@@ -1361,9 +1366,9 @@
      762
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     2651,
-     2711
+     "src/gpu/parts/51_host_cfg.inc",
+     1721,
+     1785
     ],
     [
      "src/api/main.cpp",
@@ -1386,9 +1391,9 @@
      263
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     2879,
-     2935
+     "src/settings_panel.inc",
+     1100,
+     1160
     ],
     [
      "src/rope.h",
@@ -1406,9 +1411,9 @@
      2512
     ],
     [
-     "src/gpu/parts/30_host_util.inc",
-     1100,
-     1159
+     "src/gpu/parts/40_model.inc",
+     2651,
+     2711
     ],
     [
      "src/api/engine_client.cpp",
@@ -1431,9 +1436,9 @@
      1343
     ],
     [
-     "src/gpu/parts/51_host_cfg.inc",
-     1721,
-     1785
+     "src/gpu/parts/30_host_util.inc",
+     1100,
+     1159
     ],
     [
      "src/gpu/parts/27_kernels_moe_lut.inc",
@@ -1451,9 +1456,9 @@
      285
     ],
     [
-     "src/settings_panel.inc",
-     1100,
-     1160
+     "src/api/tray_win.cpp",
+     397,
+     467
     ],
     [
      "src/gpu/parts/51_host_cfg.inc",
@@ -1471,9 +1476,9 @@
      1263
     ],
     [
-     "src/api/tray_win.cpp",
-     397,
-     467
+     "src/gpu/parts/40_model.inc",
+     2879,
+     2935
     ],
     [
      "src/gpu/parts/25_kernels_gdn.inc",
@@ -1486,13 +1491,13 @@
      447
     ]
    ],
-   "sha256": "5e2e6e21160306582cdce36367324df11abc53f29291977880e73b7393ae4ebd",
+   "sha256": "cef2914e3533616b8671137039c1b6147e28d19bec4c452e865a30d5a9e65189",
    "files": 21
   },
   {
    "id": "L32K-2",
    "L": 32768,
-   "n_tokens": 32415,
+   "n_tokens": 32432,
    "frags": [
     [
      "src/gpu/parts/30_host_util.inc",
@@ -1505,9 +1510,9 @@
      931
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     5544,
-     5598
+     "src/api/main.cpp",
+     1072,
+     1135
     ],
     [
      "src/gpu/parts/22_kernels_prefill.inc",
@@ -1525,9 +1530,9 @@
      72
     ],
     [
-     "src/settings_panel.inc",
-     1100,
-     1160
+     "src/gpu/bench_main.cpp",
+     132,
+     208
     ],
     [
      "src/settings_panel.inc",
@@ -1570,9 +1575,9 @@
      523
     ],
     [
-     "src/api/main.cpp",
-     1072,
-     1135
+     "src/gpu/parts/40_model.inc",
+     7964,
+     8018
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -1595,9 +1600,9 @@
      259
     ],
     [
-     "src/gpu/bench_main.cpp",
-     132,
-     208
+     "src/gpu/parts/40_model.inc",
+     5544,
+     5598
     ],
     [
      "src/gpu/parts/52_main.inc",
@@ -1615,9 +1620,9 @@
      70
     ],
     [
-     "src/api/vision.cpp",
-     1,
-     74
+     "src/settings_panel.inc",
+     1100,
+     1160
     ],
     [
      "src/api/tray_win.cpp",
@@ -1640,9 +1645,9 @@
      1263
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     7964,
-     8018
+     "src/gpu/parts/51_host_cfg.inc",
+     3747,
+     3815
     ],
     [
      "src/settings_panel.inc",
@@ -1660,9 +1665,9 @@
      3235
     ],
     [
-     "src/gpu/parts/51_host_cfg.inc",
-     3747,
-     3815
+     "src/api/vision.cpp",
+     1,
+     74
     ],
     [
      "src/gpu/parts/19_viz.inc",
@@ -1675,13 +1680,13 @@
      130
     ]
    ],
-   "sha256": "c5e2e5270dcda1a93e759469f8e8161e4e9032835453ceb83904996fb37ba166",
+   "sha256": "e7f66472365a7b427b7c7088b7cb1d3b8ec8b3d5b86c218d949e6dcb78cc7cc7",
    "files": 20
   },
   {
    "id": "L32K-3",
    "L": 32768,
-   "n_tokens": 32342,
+   "n_tokens": 32120,
    "frags": [
     [
      "src/gpu/parts/27_kernels_moe_lut.inc",
@@ -1714,9 +1719,9 @@
      83
     ],
     [
-     "src/gpu/parts/30_host_util.inc",
-     363,
-     409
+     "src/gpu/parts/40_model.inc",
+     599,
+     660
     ],
     [
      "src/gpu/parts/28_kernels_hgn_v2.inc",
@@ -1734,14 +1739,14 @@
      1065
     ],
     [
+     "src/gpu/parts/06_memstats.inc",
+     84,
+     161
+    ],
+    [
      "src/gpu/parts/31_vision.inc",
      511,
      589
-    ],
-    [
-     "src/api/vision.cpp",
-     1,
-     74
     ],
     [
      "src/gpu/parts/51_host_cfg.inc",
@@ -1759,9 +1764,9 @@
      3815
     ],
     [
-     "src/gpu/parts/40_model.inc",
+     "src/api/power.cpp",
      1,
-     70
+     86
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -1779,14 +1784,14 @@
      10157
     ],
     [
+     "src/api/vision.cpp",
+     1,
+     74
+    ],
+    [
      "src/gpu/parts/40_model.inc",
      4647,
      4702
-    ],
-    [
-     "src/api/power.cpp",
-     1,
-     86
     ],
     [
      "src/gpu/parts/10_ple_io.inc",
@@ -1804,9 +1809,9 @@
      6902
     ],
     [
-     "src/gpu/parts/06_memstats.inc",
-     84,
-     161
+     "src/gpu/parts/40_model.inc",
+     1,
+     70
     ],
     [
      "src/gpu/parts/26_kernels_moe_gguf.inc",
@@ -1824,14 +1829,14 @@
      907
     ],
     [
+     "src/api/toolparse.cpp",
+     91,
+     155
+    ],
+    [
      "src/ple_prefetch.h",
      1,
      89
-    ],
-    [
-     "src/gpu/parts/40_model.inc",
-     599,
-     660
     ],
     [
      "src/api/main.cpp",
@@ -1844,33 +1849,28 @@
      119
     ],
     [
+     "src/gpu/parts/30_host_util.inc",
+     363,
+     409
+    ],
+    [
      "src/gpu/parts/40_model.inc",
      182,
      251
     ],
     [
-     "src/api/toolparse.cpp",
-     91,
-     155
-    ],
-    [
      "src/gpu/bench_main.cpp",
      562,
      598
-    ],
-    [
-     "src/api/reqstat_read.h",
-     59,
-     72
     ]
    ],
-   "sha256": "b876d55359e32a6cd1cad54970fcdbb771f38065902482e230e2e82f92487ec1",
-   "files": 18
+   "sha256": "b5246fe7bc081512daaa3516a8b10d008c83db0b1dc947d3f650fe0c7ca8eec2",
+   "files": 17
   },
   {
    "id": "L32K-4",
    "L": 32768,
-   "n_tokens": 32447,
+   "n_tokens": 32463,
    "frags": [
     [
      "src/gpu/parts/52_main.inc",
@@ -1883,9 +1883,9 @@
      10715
     ],
     [
-     "src/api/vision.cpp",
+     "src/gpu/parts/40_model.inc",
      1,
-     74
+     70
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -1908,9 +1908,9 @@
      2722
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     1402,
-     1460
+     "src/api/vision.cpp",
+     1,
+     74
     ],
     [
      "src/gpu/parts/22_kernels_prefill.inc",
@@ -1933,9 +1933,9 @@
      88
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     1,
-     70
+     "src/settings_panel.inc",
+     1376,
+     1429
     ],
     [
      "src/gpu/parts/27_kernels_moe_lut.inc",
@@ -1958,9 +1958,9 @@
      4994
     ],
     [
-     "src/gpu/parts/51_host_cfg.inc",
-     3816,
-     3855
+     "src/gpu/parts/40_model.inc",
+     599,
+     660
     ],
     [
      "src/gpu/vit.cpp",
@@ -1978,9 +1978,9 @@
      3346
     ],
     [
-     "src/api/vision.cpp",
-     245,
-     285
+     "src/gpu/parts/40_model.inc",
+     1402,
+     1460
     ],
     [
      "src/ref.cpp",
@@ -2003,9 +2003,9 @@
      245
     ],
     [
-     "src/settings_panel.inc",
-     1376,
-     1429
+     "src/api/http.cpp",
+     1,
+     82
     ],
     [
      "src/gpu/parts/52_main.inc",
@@ -2028,9 +2028,9 @@
      8860
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     599,
-     660
+     "src/api/vision.cpp",
+     245,
+     285
     ],
     [
      "src/gpu/parts/27_kernels_moe_lut.inc",
@@ -2053,9 +2053,9 @@
      1926
     ],
     [
-     "src/api/http.cpp",
-     1,
-     82
+     "src/gpu/parts/51_host_cfg.inc",
+     3816,
+     3855
     ],
     [
      "src/api/main.cpp",
@@ -2068,13 +2068,13 @@
      3226
     ]
    ],
-   "sha256": "7666644ca7dfad98fe8fc2327281cb1e20ff8b1de468ddbac3e34193304a8062",
+   "sha256": "2af84ba06e0385046b690df01f082544a23514f10d1f6930fb7f0da6e74fcc8b",
    "files": 19
   },
   {
    "id": "L32K-5",
    "L": 32768,
-   "n_tokens": 32382,
+   "n_tokens": 32387,
    "frags": [
     [
      "src/gpu/vit.cpp",
@@ -2087,9 +2087,9 @@
      875
     ],
     [
-     "src/gpu/parts/26_kernels_moe_gguf.inc",
-     1022,
-     1053
+     "src/gpu/parts/40_model.inc",
+     71,
+     118
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -2107,9 +2107,9 @@
      718
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     2651,
-     2711
+     "src/gpu/vit.cpp",
+     842,
+     894
     ],
     [
      "src/api/tray_win.cpp",
@@ -2127,9 +2127,9 @@
      110
     ],
     [
-     "src/settings_panel.inc",
-     1100,
-     1160
+     "src/gpu/parts/40_model.inc",
+     2651,
+     2711
     ],
     [
      "src/gpu/os_win32.h",
@@ -2147,9 +2147,9 @@
      1401
     ],
     [
-     "src/gpu/vit.cpp",
-     842,
-     894
+     "src/settings_panel.inc",
+     1100,
+     1160
     ],
     [
      "src/gpu/parts/22_kernels_prefill.inc",
@@ -2193,8 +2193,8 @@
     ],
     [
      "src/gpu/parts/40_model.inc",
-     10393,
-     10444
+     8574,
+     8644
     ],
     [
      "src/gpu/parts/30_host_util.inc",
@@ -2212,9 +2212,9 @@
      299
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     8574,
-     8644
+     "src/gpu/parts/26_kernels_moe_gguf.inc",
+     1022,
+     1053
     ],
     [
      "src/settings_panel.inc",
@@ -2233,8 +2233,8 @@
     ],
     [
      "src/gpu/parts/40_model.inc",
-     71,
-     118
+     10393,
+     10444
     ],
     [
      "src/api/http.h",
@@ -2247,13 +2247,13 @@
      3681
     ]
    ],
-   "sha256": "a3ed05c43fbb0610fb06524f4a4a6187e655bc6d45df567755227983821d35fe",
+   "sha256": "88a556b910bd18c44e85b66e14ec9c0b1e97c49d168340e31f13618ff53cc73f",
    "files": 21
   },
   {
    "id": "L64K-0",
    "L": 65536,
-   "n_tokens": 64960,
+   "n_tokens": 64968,
    "frags": [
     [
      "src/gpu/parts/40_model.inc",
@@ -2266,9 +2266,9 @@
      6355
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     895,
-     954
+     "src/gpu/parts/51_host_cfg.inc",
+     2256,
+     2298
     ],
     [
      "src/gpu/parts/51_host_cfg.inc",
@@ -2286,9 +2286,9 @@
      113
     ],
     [
-     "src/gpu/parts/51_host_cfg.inc",
-     2256,
-     2298
+     "src/gpu/parts/40_model.inc",
+     2433,
+     2476
     ],
     [
      "src/ref.cpp",
@@ -2306,9 +2306,9 @@
      285
     ],
     [
-     "src/gpu/parts/30_host_util.inc",
-     1499,
-     1558
+     "src/gpu/parts/49_rckpt.inc",
+     69,
+     152
     ],
     [
      "src/gpu/parts/51_host_cfg.inc",
@@ -2326,9 +2326,9 @@
      2246
     ],
     [
-     "src/gpu/parts/30_host_util.inc",
-     1100,
-     1159
+     "src/gpu/parts/40_model.inc",
+     8715,
+     8767
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -2346,9 +2346,9 @@
      3637
     ],
     [
-     "src/api/tray_win.cpp",
-     325,
-     396
+     "src/gpu/parts/40_model.inc",
+     2588,
+     2650
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -2371,9 +2371,9 @@
      228
     ],
     [
-     "src/api/power.cpp",
-     1,
-     86
+     "src/gpu/parts/30_host_util.inc",
+     1499,
+     1558
     ],
     [
      "src/gpu/parts/10_ple_io.inc",
@@ -2391,9 +2391,9 @@
      244
     ],
     [
-     "src/gpu/parts/49_rckpt.inc",
-     69,
-     152
+     "src/api/power.cpp",
+     1,
+     86
     ],
     [
      "src/gpu/parts/22_kernels_prefill.inc",
@@ -2411,9 +2411,9 @@
      1019
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     2433,
-     2476
+     "src/api/main.cpp",
+     156,
+     223
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -2451,9 +2451,9 @@
      10819
     ],
     [
-     "src/settings_panel.inc",
-     1100,
-     1160
+     "src/gpu/parts/10_ple_io.inc",
+     427,
+     486
     ],
     [
      "src/gpu/parts/27_kernels_moe_lut.inc",
@@ -2471,9 +2471,9 @@
      123
     ],
     [
-     "src/gpu/parts/10_ple_io.inc",
-     427,
-     486
+     "src/gpu/parts/30_host_util.inc",
+     1100,
+     1159
     ],
     [
      "src/gpu/parts/06_memstats.inc",
@@ -2496,9 +2496,9 @@
      699
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     1,
-     70
+     "src/settings_panel.inc",
+     1100,
+     1160
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -2517,8 +2517,8 @@
     ],
     [
      "src/gpu/parts/40_model.inc",
-     8715,
-     8767
+     1,
+     70
     ],
     [
      "src/gpu/parts/22_kernels_prefill.inc",
@@ -2536,9 +2536,9 @@
      84
     ],
     [
-     "src/api/main.cpp",
-     156,
-     223
+     "src/api/tray_win.cpp",
+     325,
+     396
     ],
     [
      "src/api/main.cpp",
@@ -2557,8 +2557,8 @@
     ],
     [
      "src/gpu/parts/40_model.inc",
-     2588,
-     2650
+     6850,
+     6902
     ],
     [
      "src/gpu/parts/51_host_cfg.inc",
@@ -2577,8 +2577,8 @@
     ],
     [
      "src/gpu/parts/40_model.inc",
-     6850,
-     6902
+     895,
+     954
     ],
     [
      "src/gpu/parts/26_kernels_moe_gguf.inc",
@@ -2591,13 +2591,13 @@
      589
     ]
    ],
-   "sha256": "15733d9b720cb4daf1552f1ae929911ccd164e4268f57737dfc06eb6b17d31cb",
+   "sha256": "60053df6b6f98e23044224f20aa3ba4ee7f71c21ce1656b03d6ad17f3e7e9d7f",
    "files": 26
   },
   {
    "id": "L64K-1",
    "L": 65536,
-   "n_tokens": 65163,
+   "n_tokens": 65203,
    "frags": [
     [
      "src/settings_panel.inc",
@@ -2610,9 +2610,9 @@
      120
     ],
     [
-     "src/gpu/parts/51_host_cfg.inc",
-     1414,
-     1469
+     "src/gpu/parts/40_model.inc",
+     1823,
+     1865
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -2630,9 +2630,9 @@
      29
     ],
     [
-     "src/hgn_dump.cpp",
-     1,
-     94
+     "src/gpu/parts/40_model.inc",
+     8574,
+     8644
     ],
     [
      "src/gpu/parts/20_kernels_gemv.inc",
@@ -2655,9 +2655,9 @@
      3407
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     8574,
-     8644
+     "src/api/toolparse.cpp",
+     230,
+     311
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -2675,9 +2675,9 @@
      455
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     4748,
-     4800
+     "src/gpu/parts/27_kernels_moe_lut.inc",
+     1068,
+     1105
     ],
     [
      "src/hgn.h",
@@ -2700,9 +2700,9 @@
      4646
     ],
     [
-     "src/gpu/parts/51_host_cfg.inc",
-     187,
-     234
+     "src/gpu/parts/40_model.inc",
+     8715,
+     8767
     ],
     [
      "src/gpu/parts/22_kernels_prefill.inc",
@@ -2720,9 +2720,9 @@
      3343
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     10445,
-     10508
+     "src/api/http.cpp",
+     1,
+     82
     ],
     [
      "src/api/engine_client.cpp",
@@ -2745,9 +2745,9 @@
      199
     ],
     [
-     "src/api/http.cpp",
-     1,
-     82
+     "src/gpu/parts/40_model.inc",
+     10445,
+     10508
     ],
     [
      "src/gpu/parts/25_kernels_gdn.inc",
@@ -2765,9 +2765,9 @@
      10576
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     1823,
-     1865
+     "src/hgn_dump.cpp",
+     1,
+     94
     ],
     [
      "src/gpu/parts/09_kernels_index.inc",
@@ -2791,8 +2791,8 @@
     ],
     [
      "src/gpu/parts/51_host_cfg.inc",
-     2590,
-     2635
+     187,
+     234
     ],
     [
      "src/api/main.cpp",
@@ -2810,9 +2810,9 @@
      426
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     1,
-     70
+     "src/gpu/parts/51_host_cfg.inc",
+     2590,
+     2635
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -2835,9 +2835,9 @@
      2335
     ],
     [
-     "src/gpu/parts/30_host_util.inc",
-     444,
-     504
+     "src/gpu/parts/40_model.inc",
+     895,
+     954
     ],
     [
      "src/gpu/parts/20_kernels_gemv.inc",
@@ -2855,9 +2855,9 @@
      2047
     ],
     [
-     "src/gpu/parts/27_kernels_moe_lut.inc",
-     1068,
-     1105
+     "src/gpu/parts/00_platform.inc",
+     136,
+     160
     ],
     [
      "src/api/vision_test.cpp",
@@ -2880,9 +2880,9 @@
      222
     ],
     [
-     "src/gpu/parts/00_platform.inc",
-     136,
-     160
+     "src/gpu/parts/40_model.inc",
+     1,
+     70
     ],
     [
      "src/settings_panel.inc",
@@ -2900,9 +2900,9 @@
      7154
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     895,
-     954
+     "src/gpu/parts/51_host_cfg.inc",
+     1414,
+     1469
     ],
     [
      "src/gpu/parts/22_kernels_prefill.inc",
@@ -2926,8 +2926,8 @@
     ],
     [
      "src/gpu/parts/40_model.inc",
-     8715,
-     8767
+     4748,
+     4800
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -2945,9 +2945,9 @@
      193
     ],
     [
-     "src/api/toolparse.cpp",
-     230,
-     311
+     "src/gpu/parts/30_host_util.inc",
+     444,
+     504
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -2960,13 +2960,13 @@
      612
     ]
    ],
-   "sha256": "8de0d80159259e0d75c8430b1233cae1bf1232b0b80f6cc836542089bf0260bd",
+   "sha256": "8016f4888fef47e08e95b139b6bfb49919e2bc66b88e7182017f6269906fad42",
    "files": 30
   },
   {
    "id": "L64K-2",
    "L": 65536,
-   "n_tokens": 65136,
+   "n_tokens": 65147,
    "frags": [
     [
      "src/gpu/parts/22_kernels_prefill.inc",
@@ -2979,9 +2979,9 @@
      80
     ],
     [
-     "src/api/http.cpp",
-     1,
-     82
+     "src/gpu/parts/40_model.inc",
+     895,
+     954
     ],
     [
      "src/gpu/parts/51_host_cfg.inc",
@@ -2999,9 +2999,9 @@
      544
     ],
     [
-     "src/api/chat_template.cpp",
-     264,
-     319
+     "src/ref.cpp",
+     1,
+     66
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -3019,9 +3019,9 @@
      392
     ],
     [
-     "src/api/tokenizer.cpp",
-     89,
-     162
+     "src/gpu/parts/40_model.inc",
+     4748,
+     4800
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -3039,9 +3039,9 @@
      484
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     4748,
-     4800
+     "src/api/tokenizer.cpp",
+     89,
+     162
     ],
     [
      "src/rope.h",
@@ -3064,9 +3064,9 @@
      1752
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     8574,
-     8644
+     "src/api/power.cpp",
+     1,
+     86
     ],
     [
      "src/gpu/parts/22_kernels_prefill.inc",
@@ -3084,9 +3084,9 @@
      1484
     ],
     [
-     "src/api/power.cpp",
-     1,
-     86
+     "src/gpu/parts/10_ple_io.inc",
+     569,
+     609
     ],
     [
      "src/gpu/parts/28_kernels_hgn_v2.inc",
@@ -3104,9 +3104,9 @@
      113
     ],
     [
-     "src/gpu/parts/30_host_util.inc",
-     80,
-     134
+     "src/gpu/parts/40_model.inc",
+     2588,
+     2650
     ],
     [
      "src/gpu/parts/22_kernels_prefill.inc",
@@ -3125,8 +3125,8 @@
     ],
     [
      "src/gpu/parts/40_model.inc",
-     7091,
-     7154
+     5599,
+     5651
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -3150,8 +3150,8 @@
     ],
     [
      "src/gpu/parts/40_model.inc",
-     2386,
-     2432
+     8574,
+     8644
     ],
     [
      "src/gpu/parts/25_kernels_gdn.inc",
@@ -3169,9 +3169,9 @@
      1005
     ],
     [
-     "src/gpu/parts/10_ple_io.inc",
-     569,
-     609
+     "src/api/http.cpp",
+     1,
+     82
     ],
     [
      "src/gpu/parts/40_model.inc",
@@ -3190,8 +3190,8 @@
     ],
     [
      "src/gpu/parts/40_model.inc",
-     5599,
-     5651
+     2386,
+     2432
     ],
     [
      "src/gpu/parts/10_ple_io.inc",
@@ -3209,9 +3209,9 @@
      1903
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     895,
-     954
+     "src/gpu/parts/30_host_util.inc",
+     80,
+     134
     ],
     [
      "src/gpu/parts/28_kernels_hgn_v2.inc",
@@ -3234,9 +3234,9 @@
      11409
     ],
     [
-     "src/gpu/parts/40_model.inc",
-     2588,
-     2650
+     "src/gpu/parts/30_host_util.inc",
+     1311,
+     1368
     ],
     [
      "src/gpu/parts/28_kernels_hgn_v2.inc",
@@ -3254,9 +3254,9 @@
      72
     ],
     [
-     "src/ref.cpp",
-     1,
-     66
+     "src/api/chat_template.cpp",
+     264,
+     319
     ],
     [
      "src/gpu/parts/30_host_util.inc",
@@ -3274,9 +3274,9 @@
      78
     ],
     [
-     "src/gpu/parts/30_host_util.inc",
-     1311,
-     1368
+     "src/gpu/parts/40_model.inc",
+     7091,
+     7154
     ],
     [
      "src/gpu/parts/48_kld.inc",
@@ -3309,11 +3309,26 @@
      1327
     ]
    ],
-   "sha256": "2f6df81a0960890be0f6c7d4313fa18457fde3d665ce50dc4ceb22d761d8b765",
+   "sha256": "7ebedf9e8d448bbcdb22ec0e9a398e6adb2f721f71ede7e2e5167238fd63d611",
    "files": 29
   }
  ],
  "questions": [
+  {
+   "id": "L16K-0-const_val-QW_KTILE",
+   "hay": "L16K-0",
+   "type": "const_val",
+   "kind": "num",
+   "q": "上面的源码里，常量 `QW_KTILE` 的值是多少？只回答数值。",
+   "answer": "16",
+   "name": "QW_KTILE",
+   "src": [
+    "src/gpu/parts/22_kernels_prefill.inc",
+    1503
+   ],
+   "depth": 0.092,
+   "other_files": 0
+  },
   {
    "id": "L16K-0-func_file-prewarm",
    "hay": "L16K-0",
@@ -3326,7 +3341,7 @@
     "src/gpu/parts/49_rckpt.inc",
     192
    ],
-   "depth": 0.096,
+   "depth": 0.344,
    "other_files": 0
   },
   {
@@ -3341,22 +3356,7 @@
     "src/gpu/parts/40_model.inc",
     922
    ],
-   "depth": 0.332,
-   "other_files": 0
-  },
-  {
-   "id": "L16K-0-const_val-QW_KTILE",
-   "hay": "L16K-0",
-   "type": "const_val",
-   "kind": "num",
-   "q": "上面的源码里，常量 `QW_KTILE` 的值是多少？只回答数值。",
-   "answer": "16",
-   "name": "QW_KTILE",
-   "src": [
-    "src/gpu/parts/22_kernels_prefill.inc",
-    1503
-   ],
-   "depth": 0.571,
+   "depth": 0.576,
    "other_files": 0
   },
   {
@@ -3390,18 +3390,18 @@
    "other_files": 0
   },
   {
-   "id": "L16K-1-env_def-QWENOX_DRAFT_VOCAB",
+   "id": "L16K-1-env_file-QWENOX_PERF",
    "hay": "L16K-1",
-   "type": "env_def",
-   "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_DRAFT_VOCAB` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "0",
-   "name": "QWENOX_DRAFT_VOCAB",
+   "type": "env_file",
+   "kind": "path",
+   "q": "上面的源码里，环境变量 `QWENOX_PERF` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/40_model.inc",
+   "name": "QWENOX_PERF",
    "src": [
     "src/gpu/parts/40_model.inc",
-    916
+    2407
    ],
-   "depth": 0.315,
+   "depth": 0.322,
    "other_files": 0
   },
   {
@@ -3420,33 +3420,18 @@
    "other_files": 0
   },
   {
-   "id": "L16K-1-env_file-QWENOX_PERF",
+   "id": "L16K-1-env_def-QWENOX_DRAFT_VOCAB",
    "hay": "L16K-1",
-   "type": "env_file",
-   "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_PERF` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/40_model.inc",
-   "name": "QWENOX_PERF",
+   "type": "env_def",
+   "kind": "num",
+   "q": "上面的源码里，环境变量 `QWENOX_DRAFT_VOCAB` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "0",
+   "name": "QWENOX_DRAFT_VOCAB",
    "src": [
     "src/gpu/parts/40_model.inc",
-    2407
+    916
    ],
-   "depth": 0.839,
-   "other_files": 0
-  },
-  {
-   "id": "L16K-2-func_file-gemv_dn_ok",
-   "hay": "L16K-2",
-   "type": "func_file",
-   "kind": "path",
-   "q": "上面的源码里，函数 `gemv_dn_ok` 定义在哪个文件？只回答文件路径。",
-   "answer": "src/gpu/parts/26_kernels_moe_gguf.inc",
-   "name": "gemv_dn_ok",
-   "src": [
-    "src/gpu/parts/26_kernels_moe_gguf.inc",
-    1032
-   ],
-   "depth": 0.137,
+   "depth": 0.832,
    "other_files": 0
   },
   {
@@ -3461,22 +3446,22 @@
     "src/gpu/parts/30_host_util.inc",
     1116
    ],
-   "depth": 0.383,
+   "depth": 0.147,
    "other_files": 0
   },
   {
-   "id": "L16K-2-env_file-QWENOX_NGRAM_MATCH",
+   "id": "L16K-2-func_file-gemv_dn_ok",
    "hay": "L16K-2",
-   "type": "env_file",
+   "type": "func_file",
    "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_NGRAM_MATCH` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/00_platform.inc",
-   "name": "QWENOX_NGRAM_MATCH",
+   "q": "上面的源码里，函数 `gemv_dn_ok` 定义在哪个文件？只回答文件路径。",
+   "answer": "src/gpu/parts/26_kernels_moe_gguf.inc",
+   "name": "gemv_dn_ok",
    "src": [
-    "src/gpu/parts/00_platform.inc",
-    154
+    "src/gpu/parts/26_kernels_moe_gguf.inc",
+    1032
    ],
-   "depth": 0.651,
+   "depth": 0.414,
    "other_files": 0
   },
   {
@@ -3491,7 +3476,22 @@
     "src/gpu/parts/25_kernels_gdn.inc",
     904
    ],
-   "depth": 0.852,
+   "depth": 0.647,
+   "other_files": 0
+  },
+  {
+   "id": "L16K-2-env_file-QWENOX_NGRAM_MATCH",
+   "hay": "L16K-2",
+   "type": "env_file",
+   "kind": "path",
+   "q": "上面的源码里，环境变量 `QWENOX_NGRAM_MATCH` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/00_platform.inc",
+   "name": "QWENOX_NGRAM_MATCH",
+   "src": [
+    "src/gpu/parts/00_platform.inc",
+    154
+   ],
+   "depth": 0.862,
    "other_files": 0
   },
   {
@@ -3510,21 +3510,6 @@
    "other_files": 0
   },
   {
-   "id": "L16K-3-env_file-QWENOX_DRAFT_DESYNC",
-   "hay": "L16K-3",
-   "type": "env_file",
-   "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_DRAFT_DESYNC` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/40_model.inc",
-   "name": "QWENOX_DRAFT_DESYNC",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    910
-   ],
-   "depth": 0.374,
-   "other_files": 0
-  },
-  {
    "id": "L16K-3-func_file-commit",
    "hay": "L16K-3",
    "type": "func_file",
@@ -3536,8 +3521,23 @@
     "src/gpu/parts/51_host_cfg.inc",
     853
    ],
-   "depth": 0.655,
+   "depth": 0.397,
    "other_files": 1
+  },
+  {
+   "id": "L16K-3-env_file-QWENOX_DRAFT_DESYNC",
+   "hay": "L16K-3",
+   "type": "env_file",
+   "kind": "path",
+   "q": "上面的源码里，环境变量 `QWENOX_DRAFT_DESYNC` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/40_model.inc",
+   "name": "QWENOX_DRAFT_DESYNC",
+   "src": [
+    "src/gpu/parts/40_model.inc",
+    910
+   ],
+   "depth": 0.618,
+   "other_files": 0
   },
   {
    "id": "L16K-3-env_def-QWENOX_OCC_FORCE",
@@ -3555,6 +3555,21 @@
    "other_files": 0
   },
   {
+   "id": "L16K-4-env_file-QWENOX_CONC_PREFILL",
+   "hay": "L16K-4",
+   "type": "env_file",
+   "kind": "path",
+   "q": "上面的源码里，环境变量 `QWENOX_CONC_PREFILL` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/40_model.inc",
+   "name": "QWENOX_CONC_PREFILL",
+   "src": [
+    "src/gpu/parts/40_model.inc",
+    10995
+   ],
+   "depth": 0.151,
+   "other_files": 0
+  },
+  {
    "id": "L16K-4-func_file-devarena_estimate",
    "hay": "L16K-4",
    "type": "func_file",
@@ -3566,22 +3581,7 @@
     "src/gpu/parts/30_host_util.inc",
     140
    ],
-   "depth": 0.148,
-   "other_files": 0
-  },
-  {
-   "id": "L16K-4-env_def-QWENOX_VIZ_PARTS",
-   "hay": "L16K-4",
-   "type": "env_def",
-   "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_VIZ_PARTS` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "3",
-   "name": "QWENOX_VIZ_PARTS",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    627
-   ],
-   "depth": 0.383,
+   "depth": 0.354,
    "other_files": 0
   },
   {
@@ -3600,48 +3600,18 @@
    "other_files": 0
   },
   {
-   "id": "L16K-4-env_file-QWENOX_CONC_PREFILL",
+   "id": "L16K-4-env_def-QWENOX_VIZ_PARTS",
    "hay": "L16K-4",
-   "type": "env_file",
-   "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_CONC_PREFILL` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/40_model.inc",
-   "name": "QWENOX_CONC_PREFILL",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    10995
-   ],
-   "depth": 0.834,
-   "other_files": 0
-  },
-  {
-   "id": "L16K-5-env_def-QWENOX_DENSE_LUT_MINP",
-   "hay": "L16K-5",
    "type": "env_def",
    "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_DENSE_LUT_MINP` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "1024",
-   "name": "QWENOX_DENSE_LUT_MINP",
+   "q": "上面的源码里，环境变量 `QWENOX_VIZ_PARTS` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "3",
+   "name": "QWENOX_VIZ_PARTS",
    "src": [
     "src/gpu/parts/40_model.inc",
-    2696
+    627
    ],
-   "depth": 0.149,
-   "other_files": 0
-  },
-  {
-   "id": "L16K-5-const_val-kRing",
-   "hay": "L16K-5",
-   "type": "const_val",
-   "kind": "num",
-   "q": "上面的源码里，常量 `kRing` 的值是多少？只回答数值。",
-   "answer": "2048",
-   "name": "kRing",
-   "src": [
-    "src/gpu/parts/19_viz.inc",
-    33
-   ],
-   "depth": 0.404,
+   "depth": 0.853,
    "other_files": 0
   },
   {
@@ -3656,7 +3626,7 @@
     "src/api/chat_template.cpp",
     125
    ],
-   "depth": 0.616,
+   "depth": 0.139,
    "other_files": 0
   },
   {
@@ -3671,52 +3641,37 @@
     "src/gpu/parts/30_host_util.inc",
     124
    ],
-   "depth": 0.875,
+   "depth": 0.407,
    "other_files": 0
   },
   {
-   "id": "L16K-6-env_file-QWENOX_KVSNAP_QUEUE_MB",
-   "hay": "L16K-6",
-   "type": "env_file",
-   "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_KVSNAP_QUEUE_MB` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/51_host_cfg.inc",
-   "name": "QWENOX_KVSNAP_QUEUE_MB",
-   "src": [
-    "src/gpu/parts/51_host_cfg.inc",
-    3834
-   ],
-   "depth": 0.154,
-   "other_files": 0
-  },
-  {
-   "id": "L16K-6-const_val-kSocketTimeoutSec",
-   "hay": "L16K-6",
+   "id": "L16K-5-const_val-kRing",
+   "hay": "L16K-5",
    "type": "const_val",
    "kind": "num",
-   "q": "上面的源码里，常量 `kSocketTimeoutSec` 的值是多少？只回答数值。",
-   "answer": "30",
-   "name": "kSocketTimeoutSec",
+   "q": "上面的源码里，常量 `kRing` 的值是多少？只回答数值。",
+   "answer": "2048",
+   "name": "kRing",
    "src": [
-    "src/api/http.cpp",
-    57
+    "src/gpu/parts/19_viz.inc",
+    33
    ],
-   "depth": 0.343,
+   "depth": 0.696,
    "other_files": 0
   },
   {
-   "id": "L16K-6-env_def-QWENOX_FORK_DUMP",
-   "hay": "L16K-6",
+   "id": "L16K-5-env_def-QWENOX_DENSE_LUT_MINP",
+   "hay": "L16K-5",
    "type": "env_def",
    "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_FORK_DUMP` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "0",
-   "name": "QWENOX_FORK_DUMP",
+   "q": "上面的源码里，环境变量 `QWENOX_DENSE_LUT_MINP` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "1024",
+   "name": "QWENOX_DENSE_LUT_MINP",
    "src": [
     "src/gpu/parts/40_model.inc",
-    922
+    2696
    ],
-   "depth": 0.654,
+   "depth": 0.947,
    "other_files": 0
   },
   {
@@ -3731,37 +3686,52 @@
     "src/gpu/parts/06_memstats.inc",
     69
    ],
-   "depth": 0.904,
+   "depth": 0.191,
    "other_files": 0
   },
   {
-   "id": "L16K-7-const_val-QSA_UCAP",
-   "hay": "L16K-7",
-   "type": "const_val",
+   "id": "L16K-6-env_def-QWENOX_FORK_DUMP",
+   "hay": "L16K-6",
+   "type": "env_def",
    "kind": "num",
-   "q": "上面的源码里，常量 `QSA_UCAP` 的值是多少？只回答数值。",
-   "answer": "2052",
-   "name": "QSA_UCAP",
+   "q": "上面的源码里，环境变量 `QWENOX_FORK_DUMP` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "0",
+   "name": "QWENOX_FORK_DUMP",
    "src": [
-    "src/gpu/parts/22_kernels_prefill.inc",
-    2056
+    "src/gpu/parts/40_model.inc",
+    922
    ],
-   "depth": 0.078,
+   "depth": 0.357,
    "other_files": 0
   },
   {
-   "id": "L16K-7-env_file-QWENOX_SPEC_ADAPT",
-   "hay": "L16K-7",
+   "id": "L16K-6-env_file-QWENOX_KVSNAP_QUEUE_MB",
+   "hay": "L16K-6",
    "type": "env_file",
    "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_SPEC_ADAPT` 是在哪个文件里读取的？只回答文件路径。",
+   "q": "上面的源码里，环境变量 `QWENOX_KVSNAP_QUEUE_MB` 是在哪个文件里读取的？只回答文件路径。",
    "answer": "src/gpu/parts/51_host_cfg.inc",
-   "name": "QWENOX_SPEC_ADAPT",
+   "name": "QWENOX_KVSNAP_QUEUE_MB",
    "src": [
     "src/gpu/parts/51_host_cfg.inc",
-    2995
+    3834
    ],
-   "depth": 0.394,
+   "depth": 0.677,
+   "other_files": 0
+  },
+  {
+   "id": "L16K-6-const_val-kSocketTimeoutSec",
+   "hay": "L16K-6",
+   "type": "const_val",
+   "kind": "num",
+   "q": "上面的源码里，常量 `kSocketTimeoutSec` 的值是多少？只回答数值。",
+   "answer": "30",
+   "name": "kSocketTimeoutSec",
+   "src": [
+    "src/api/http.cpp",
+    57
+   ],
+   "depth": 0.897,
    "other_files": 0
   },
   {
@@ -3776,7 +3746,37 @@
     "src/gpu/parts/40_model.inc",
     627
    ],
-   "depth": 0.636,
+   "depth": 0.088,
+   "other_files": 0
+  },
+  {
+   "id": "L16K-7-const_val-QSA_UCAP",
+   "hay": "L16K-7",
+   "type": "const_val",
+   "kind": "num",
+   "q": "上面的源码里，常量 `QSA_UCAP` 的值是多少？只回答数值。",
+   "answer": "2052",
+   "name": "QSA_UCAP",
+   "src": [
+    "src/gpu/parts/22_kernels_prefill.inc",
+    2056
+   ],
+   "depth": 0.346,
+   "other_files": 0
+  },
+  {
+   "id": "L16K-7-env_file-QWENOX_SPEC_ADAPT",
+   "hay": "L16K-7",
+   "type": "env_file",
+   "kind": "path",
+   "q": "上面的源码里，环境变量 `QWENOX_SPEC_ADAPT` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/51_host_cfg.inc",
+   "name": "QWENOX_SPEC_ADAPT",
+   "src": [
+    "src/gpu/parts/51_host_cfg.inc",
+    2995
+   ],
+   "depth": 0.656,
    "other_files": 0
   },
   {
@@ -3795,21 +3795,6 @@
    "other_files": 0
   },
   {
-   "id": "L16K-8-func_file-is_trunk_experts",
-   "hay": "L16K-8",
-   "type": "func_file",
-   "kind": "path",
-   "q": "上面的源码里，函数 `is_trunk_experts` 定义在哪个文件？只回答文件路径。",
-   "answer": "src/gpu/parts/30_host_util.inc",
-   "name": "is_trunk_experts",
-   "src": [
-    "src/gpu/parts/30_host_util.inc",
-    436
-   ],
-   "depth": 0.13,
-   "other_files": 0
-  },
-  {
    "id": "L16K-8-const_val-GDN_PIPE2_NCPB",
    "hay": "L16K-8",
    "type": "const_val",
@@ -3821,7 +3806,22 @@
     "src/gpu/parts/25_kernels_gdn.inc",
     904
    ],
-   "depth": 0.357,
+   "depth": 0.124,
+   "other_files": 0
+  },
+  {
+   "id": "L16K-8-func_file-is_trunk_experts",
+   "hay": "L16K-8",
+   "type": "func_file",
+   "kind": "path",
+   "q": "上面的源码里，函数 `is_trunk_experts` 定义在哪个文件？只回答文件路径。",
+   "answer": "src/gpu/parts/30_host_util.inc",
+   "name": "is_trunk_experts",
+   "src": [
+    "src/gpu/parts/30_host_util.inc",
+    436
+   ],
+   "depth": 0.368,
    "other_files": 0
   },
   {
@@ -3855,21 +3855,6 @@
    "other_files": 0
   },
   {
-   "id": "L16K-9-env_def-QWENOX_NGRAM_GATE",
-   "hay": "L16K-9",
-   "type": "env_def",
-   "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_NGRAM_GATE` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "1",
-   "name": "QWENOX_NGRAM_GATE",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    45
-   ],
-   "depth": 0.177,
-   "other_files": 0
-  },
-  {
    "id": "L16K-9-const_val-kMerge",
    "hay": "L16K-9",
    "type": "const_val",
@@ -3881,22 +3866,7 @@
     "src/api/vision.cpp",
     44
    ],
-   "depth": 0.408,
-   "other_files": 0
-  },
-  {
-   "id": "L16K-9-env_file-QWENOX_NOSPEC",
-   "hay": "L16K-9",
-   "type": "env_file",
-   "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_NOSPEC` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/51_host_cfg.inc",
-   "name": "QWENOX_NOSPEC",
-   "src": [
-    "src/gpu/parts/51_host_cfg.inc",
-    3035
-   ],
-   "depth": 0.664,
+   "depth": 0.167,
    "other_files": 0
   },
   {
@@ -3911,22 +3881,37 @@
     "src/api/tray_win.cpp",
     476
    ],
-   "depth": 0.84,
+   "depth": 0.373,
    "other_files": 0
   },
   {
-   "id": "L16K-10-func_file-option_true",
-   "hay": "L16K-10",
-   "type": "func_file",
-   "kind": "path",
-   "q": "上面的源码里，函数 `option_true` 定义在哪个文件？只回答文件路径。",
-   "answer": "src/api/chat_template.cpp",
-   "name": "option_true",
+   "id": "L16K-9-env_def-QWENOX_NGRAM_GATE",
+   "hay": "L16K-9",
+   "type": "env_def",
+   "kind": "num",
+   "q": "上面的源码里，环境变量 `QWENOX_NGRAM_GATE` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "1",
+   "name": "QWENOX_NGRAM_GATE",
    "src": [
-    "src/api/chat_template.cpp",
-    158
+    "src/gpu/parts/40_model.inc",
+    45
    ],
-   "depth": 0.11,
+   "depth": 0.676,
+   "other_files": 0
+  },
+  {
+   "id": "L16K-9-env_file-QWENOX_NOSPEC",
+   "hay": "L16K-9",
+   "type": "env_file",
+   "kind": "path",
+   "q": "上面的源码里，环境变量 `QWENOX_NOSPEC` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/51_host_cfg.inc",
+   "name": "QWENOX_NOSPEC",
+   "src": [
+    "src/gpu/parts/51_host_cfg.inc",
+    3035
+   ],
+   "depth": 0.864,
    "other_files": 0
   },
   {
@@ -3941,22 +3926,7 @@
     "src/gpu/parts/30_host_util.inc",
     369
    ],
-   "depth": 0.355,
-   "other_files": 0
-  },
-  {
-   "id": "L16K-10-env_def-QWENOX_DEQ_AHEAD_MINP",
-   "hay": "L16K-10",
-   "type": "env_def",
-   "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_DEQ_AHEAD_MINP` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "64",
-   "name": "QWENOX_DEQ_AHEAD_MINP",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    177
-   ],
-   "depth": 0.657,
+   "depth": 0.117,
    "other_files": 0
   },
   {
@@ -3971,37 +3941,37 @@
     "src/gpu/parts/51_host_cfg.inc",
     1424
    ],
-   "depth": 0.872,
+   "depth": 0.343,
    "other_files": 0
   },
   {
-   "id": "L16K-11-env_file-QWENOX_ARENA_DEBUG",
-   "hay": "L16K-11",
-   "type": "env_file",
-   "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_ARENA_DEBUG` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/30_host_util.inc",
-   "name": "QWENOX_ARENA_DEBUG",
+   "id": "L16K-10-env_def-QWENOX_DEQ_AHEAD_MINP",
+   "hay": "L16K-10",
+   "type": "env_def",
+   "kind": "num",
+   "q": "上面的源码里，环境变量 `QWENOX_DEQ_AHEAD_MINP` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "64",
+   "name": "QWENOX_DEQ_AHEAD_MINP",
    "src": [
-    "src/gpu/parts/30_host_util.inc",
-    14
+    "src/gpu/parts/40_model.inc",
+    177
    ],
-   "depth": 0.126,
+   "depth": 0.655,
    "other_files": 0
   },
   {
-   "id": "L16K-11-func_file-madvise",
-   "hay": "L16K-11",
+   "id": "L16K-10-func_file-option_true",
+   "hay": "L16K-10",
    "type": "func_file",
    "kind": "path",
-   "q": "上面的源码里，函数 `madvise` 定义在哪个文件？只回答文件路径。",
-   "answer": "src/gpu/os_win32.h",
-   "name": "madvise",
+   "q": "上面的源码里，函数 `option_true` 定义在哪个文件？只回答文件路径。",
+   "answer": "src/api/chat_template.cpp",
+   "name": "option_true",
    "src": [
-    "src/gpu/os_win32.h",
-    32
+    "src/api/chat_template.cpp",
+    158
    ],
-   "depth": 0.396,
+   "depth": 0.858,
    "other_files": 0
   },
   {
@@ -4016,7 +3986,22 @@
     "src/gpu/parts/40_model.inc",
     2712
    ],
-   "depth": 0.592,
+   "depth": 0.116,
+   "other_files": 0
+  },
+  {
+   "id": "L16K-11-env_file-QWENOX_ARENA_DEBUG",
+   "hay": "L16K-11",
+   "type": "env_file",
+   "kind": "path",
+   "q": "上面的源码里，环境变量 `QWENOX_ARENA_DEBUG` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/30_host_util.inc",
+   "name": "QWENOX_ARENA_DEBUG",
+   "src": [
+    "src/gpu/parts/30_host_util.inc",
+    14
+   ],
+   "depth": 0.392,
    "other_files": 0
   },
   {
@@ -4031,52 +4016,22 @@
     "src/gpu/parts/23_kernels_moe_w4.inc",
     33
    ],
-   "depth": 0.892,
+   "depth": 0.664,
    "other_files": 0
   },
   {
-   "id": "L32K-0-env_file-QWENOX_VR_SAMPLE",
-   "hay": "L32K-0",
-   "type": "env_file",
-   "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_VR_SAMPLE` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/40_model.inc",
-   "name": "QWENOX_VR_SAMPLE",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    9778
-   ],
-   "depth": 0.054,
-   "other_files": 0
-  },
-  {
-   "id": "L32K-0-env_def-QWENOX_MTP_REST_LVL",
-   "hay": "L32K-0",
-   "type": "env_def",
-   "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_MTP_REST_LVL` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "-1",
-   "name": "QWENOX_MTP_REST_LVL",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    7990
-   ],
-   "depth": 0.196,
-   "other_files": 0
-  },
-  {
-   "id": "L32K-0-func_file-collapse_parts",
-   "hay": "L32K-0",
+   "id": "L16K-11-func_file-madvise",
+   "hay": "L16K-11",
    "type": "func_file",
    "kind": "path",
-   "q": "上面的源码里，函数 `collapse_parts` 定义在哪个文件？只回答文件路径。",
-   "answer": "src/api/main.cpp",
-   "name": "collapse_parts",
+   "q": "上面的源码里，函数 `madvise` 定义在哪个文件？只回答文件路径。",
+   "answer": "src/gpu/os_win32.h",
+   "name": "madvise",
    "src": [
-    "src/api/main.cpp",
-    3677
+    "src/gpu/os_win32.h",
+    32
    ],
-   "depth": 0.302,
+   "depth": 0.896,
    "other_files": 0
   },
   {
@@ -4091,37 +4046,37 @@
     "src/gpu/parts/40_model.inc",
     922
    ],
-   "depth": 0.405,
+   "depth": 0.064,
    "other_files": 0
   },
   {
-   "id": "L32K-0-const_val-GDN_NT_STRIP",
-   "hay": "L32K-0",
-   "type": "const_val",
-   "kind": "num",
-   "q": "上面的源码里，常量 `GDN_NT_STRIP` 的值是多少？只回答数值。",
-   "answer": "256",
-   "name": "GDN_NT_STRIP",
-   "src": [
-    "src/gpu/parts/25_kernels_gdn.inc",
-    1830
-   ],
-   "depth": 0.552,
-   "other_files": 0
-  },
-  {
-   "id": "L32K-0-func_file-block_info",
+   "id": "L32K-0-func_file-collapse_parts",
    "hay": "L32K-0",
    "type": "func_file",
    "kind": "path",
-   "q": "上面的源码里，函数 `block_info` 定义在哪个文件？只回答文件路径。",
-   "answer": "src/gguf.h",
-   "name": "block_info",
+   "q": "上面的源码里，函数 `collapse_parts` 定义在哪个文件？只回答文件路径。",
+   "answer": "src/api/main.cpp",
+   "name": "collapse_parts",
    "src": [
-    "src/gguf.h",
-    43
+    "src/api/main.cpp",
+    3677
    ],
-   "depth": 0.688,
+   "depth": 0.201,
+   "other_files": 0
+  },
+  {
+   "id": "L32K-0-env_file-QWENOX_VR_SAMPLE",
+   "hay": "L32K-0",
+   "type": "env_file",
+   "kind": "path",
+   "q": "上面的源码里，环境变量 `QWENOX_VR_SAMPLE` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/40_model.inc",
+   "name": "QWENOX_VR_SAMPLE",
+   "src": [
+    "src/gpu/parts/40_model.inc",
+    9778
+   ],
+   "depth": 0.276,
    "other_files": 0
   },
   {
@@ -4136,7 +4091,22 @@
     "src/gpu/parts/40_model.inc",
     2700
    ],
-   "depth": 0.819,
+   "depth": 0.417,
+   "other_files": 0
+  },
+  {
+   "id": "L32K-0-func_file-block_info",
+   "hay": "L32K-0",
+   "type": "func_file",
+   "kind": "path",
+   "q": "上面的源码里，函数 `block_info` 定义在哪个文件？只回答文件路径。",
+   "answer": "src/gguf.h",
+   "name": "block_info",
+   "src": [
+    "src/gguf.h",
+    43
+   ],
+   "depth": 0.563,
    "other_files": 0
   },
   {
@@ -4151,22 +4121,37 @@
     "src/api/engine_sup.cpp",
     37
    ],
-   "depth": 0.925,
+   "depth": 0.679,
    "other_files": 0
   },
   {
-   "id": "L32K-1-env_file-QWENOX_MOE_UNION_LOG",
-   "hay": "L32K-1",
-   "type": "env_file",
-   "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_MOE_UNION_LOG` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/40_model.inc",
-   "name": "QWENOX_MOE_UNION_LOG",
+   "id": "L32K-0-env_def-QWENOX_MTP_REST_LVL",
+   "hay": "L32K-0",
+   "type": "env_def",
+   "kind": "num",
+   "q": "上面的源码里，环境变量 `QWENOX_MTP_REST_LVL` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "-1",
+   "name": "QWENOX_MTP_REST_LVL",
    "src": [
     "src/gpu/parts/40_model.inc",
-    4967
+    7990
    ],
-   "depth": 0.088,
+   "depth": 0.804,
+   "other_files": 0
+  },
+  {
+   "id": "L32K-0-const_val-GDN_NT_STRIP",
+   "hay": "L32K-0",
+   "type": "const_val",
+   "kind": "num",
+   "q": "上面的源码里，常量 `GDN_NT_STRIP` 的值是多少？只回答数值。",
+   "answer": "256",
+   "name": "GDN_NT_STRIP",
+   "src": [
+    "src/gpu/parts/25_kernels_gdn.inc",
+    1830
+   ],
+   "depth": 0.917,
    "other_files": 0
   },
   {
@@ -4181,52 +4166,22 @@
     "src/gpu/parts/21_kernels_ple.inc",
     199
    ],
-   "depth": 0.197,
+   "depth": 0.075,
    "other_files": 0
   },
   {
-   "id": "L32K-1-env_def-QWENOX_DENSE_LUT_MAXP_D9",
-   "hay": "L32K-1",
-   "type": "env_def",
-   "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_DENSE_LUT_MAXP_D9` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "0",
-   "name": "QWENOX_DENSE_LUT_MAXP_D9",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    2704
-   ],
-   "depth": 0.339,
-   "other_files": 0
-  },
-  {
-   "id": "L32K-1-env_file-QWENOX_LT_MISS_LOG",
+   "id": "L32K-1-env_file-QWENOX_MOE_UNION_LOG",
    "hay": "L32K-1",
    "type": "env_file",
    "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_LT_MISS_LOG` 是在哪个文件里读取的？只回答文件路径。",
+   "q": "上面的源码里，环境变量 `QWENOX_MOE_UNION_LOG` 是在哪个文件里读取的？只回答文件路径。",
    "answer": "src/gpu/parts/40_model.inc",
-   "name": "QWENOX_LT_MISS_LOG",
+   "name": "QWENOX_MOE_UNION_LOG",
    "src": [
     "src/gpu/parts/40_model.inc",
-    2918
+    4967
    ],
-   "depth": 0.459,
-   "other_files": 0
-  },
-  {
-   "id": "L32K-1-env_def-QWENOX_HT_WMMA_BLOCKS",
-   "hay": "L32K-1",
-   "type": "env_def",
-   "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_HT_WMMA_BLOCKS` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "80",
-   "name": "QWENOX_HT_WMMA_BLOCKS",
-   "src": [
-    "src/gpu/parts/30_host_util.inc",
-    1116
-   ],
-   "depth": 0.543,
+   "depth": 0.196,
    "other_files": 0
   },
   {
@@ -4241,7 +4196,7 @@
     "src/gpu/parts/51_host_cfg.inc",
     1777
    ],
-   "depth": 0.708,
+   "depth": 0.331,
    "other_files": 0
   },
   {
@@ -4256,7 +4211,37 @@
     "src/settings_panel.inc",
     1146
    ],
-   "depth": 0.802,
+   "depth": 0.452,
+   "other_files": 0
+  },
+  {
+   "id": "L32K-1-env_def-QWENOX_DENSE_LUT_MAXP_D9",
+   "hay": "L32K-1",
+   "type": "env_def",
+   "kind": "num",
+   "q": "上面的源码里，环境变量 `QWENOX_DENSE_LUT_MAXP_D9` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "0",
+   "name": "QWENOX_DENSE_LUT_MAXP_D9",
+   "src": [
+    "src/gpu/parts/40_model.inc",
+    2704
+   ],
+   "depth": 0.553,
+   "other_files": 0
+  },
+  {
+   "id": "L32K-1-env_def-QWENOX_HT_WMMA_BLOCKS",
+   "hay": "L32K-1",
+   "type": "env_def",
+   "kind": "num",
+   "q": "上面的源码里，环境变量 `QWENOX_HT_WMMA_BLOCKS` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "80",
+   "name": "QWENOX_HT_WMMA_BLOCKS",
+   "src": [
+    "src/gpu/parts/30_host_util.inc",
+    1116
+   ],
+   "depth": 0.687,
    "other_files": 0
   },
   {
@@ -4271,52 +4256,22 @@
     "src/api/tray_win.cpp",
     414
    ],
-   "depth": 0.908,
+   "depth": 0.785,
    "other_files": 0
   },
   {
-   "id": "L32K-2-env_file-QWENOX_MOE_HYB",
-   "hay": "L32K-2",
+   "id": "L32K-1-env_file-QWENOX_LT_MISS_LOG",
+   "hay": "L32K-1",
    "type": "env_file",
    "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_MOE_HYB` 是在哪个文件里读取的？只回答文件路径。",
+   "q": "上面的源码里，环境变量 `QWENOX_LT_MISS_LOG` 是在哪个文件里读取的？只回答文件路径。",
    "answer": "src/gpu/parts/40_model.inc",
-   "name": "QWENOX_MOE_HYB",
+   "name": "QWENOX_LT_MISS_LOG",
    "src": [
     "src/gpu/parts/40_model.inc",
-    5577
+    2918
    ],
-   "depth": 0.084,
-   "other_files": 0
-  },
-  {
-   "id": "L32K-2-const_val-kEdPlainW",
-   "hay": "L32K-2",
-   "type": "const_val",
-   "kind": "num",
-   "q": "上面的源码里，常量 `kEdPlainW` 的值是多少？只回答数值。",
-   "answer": "354",
-   "name": "kEdPlainW",
-   "src": [
-    "src/settings_panel.inc",
-    1143
-   ],
-   "depth": 0.195,
-   "other_files": 0
-  },
-  {
-   "id": "L32K-2-env_def-QWENOX_ATDROW",
-   "hay": "L32K-2",
-   "type": "env_def",
-   "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_ATDROW` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "2",
-   "name": "QWENOX_ATDROW",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    4799
-   ],
-   "depth": 0.337,
+   "depth": 0.923,
    "other_files": 0
   },
   {
@@ -4331,7 +4286,7 @@
     "src/api/main.cpp",
     1129
    ],
-   "depth": 0.425,
+   "depth": 0.091,
    "other_files": 0
   },
   {
@@ -4346,22 +4301,22 @@
     "src/gpu/bench_main.cpp",
     200
    ],
-   "depth": 0.565,
+   "depth": 0.197,
    "other_files": 0
   },
   {
-   "id": "L32K-2-const_val-kVideoToken",
+   "id": "L32K-2-env_def-QWENOX_ATDROW",
    "hay": "L32K-2",
-   "type": "const_val",
+   "type": "env_def",
    "kind": "num",
-   "q": "上面的源码里，常量 `kVideoToken` 的值是多少？只回答数值。",
-   "answer": "248057",
-   "name": "kVideoToken",
+   "q": "上面的源码里，环境变量 `QWENOX_ATDROW` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "2",
+   "name": "QWENOX_ATDROW",
    "src": [
-    "src/api/vision.cpp",
-    50
+    "src/gpu/parts/40_model.inc",
+    4799
    ],
-   "depth": 0.681,
+   "depth": 0.333,
    "other_files": 0
   },
   {
@@ -4376,7 +4331,37 @@
     "src/gpu/parts/40_model.inc",
     7990
    ],
-   "depth": 0.825,
+   "depth": 0.41,
+   "other_files": 0
+  },
+  {
+   "id": "L32K-2-env_file-QWENOX_MOE_HYB",
+   "hay": "L32K-2",
+   "type": "env_file",
+   "kind": "path",
+   "q": "上面的源码里，环境变量 `QWENOX_MOE_HYB` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/40_model.inc",
+   "name": "QWENOX_MOE_HYB",
+   "src": [
+    "src/gpu/parts/40_model.inc",
+    5577
+   ],
+   "depth": 0.555,
+   "other_files": 0
+  },
+  {
+   "id": "L32K-2-const_val-kEdPlainW",
+   "hay": "L32K-2",
+   "type": "const_val",
+   "kind": "num",
+   "q": "上面的源码里，常量 `kEdPlainW` 的值是多少？只回答数值。",
+   "answer": "354",
+   "name": "kEdPlainW",
+   "src": [
+    "src/settings_panel.inc",
+    1143
+   ],
+   "depth": 0.687,
    "other_files": 0
   },
   {
@@ -4391,7 +4376,22 @@
     "src/gpu/parts/51_host_cfg.inc",
     3748
    ],
-   "depth": 0.918,
+   "depth": 0.818,
+   "other_files": 0
+  },
+  {
+   "id": "L32K-2-const_val-kVideoToken",
+   "hay": "L32K-2",
+   "type": "const_val",
+   "kind": "num",
+   "q": "上面的源码里，常量 `kVideoToken` 的值是多少？只回答数值。",
+   "answer": "248057",
+   "name": "kVideoToken",
+   "src": [
+    "src/api/vision.cpp",
+    50
+   ],
+   "depth": 0.942,
    "other_files": 0
   },
   {
@@ -4410,63 +4410,18 @@
    "other_files": 0
   },
   {
-   "id": "L32K-3-env_file-QWENOX_ARENA_SLACK_GB",
-   "hay": "L32K-3",
-   "type": "env_file",
-   "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_ARENA_SLACK_GB` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/30_host_util.inc",
-   "name": "QWENOX_ARENA_SLACK_GB",
-   "src": [
-    "src/gpu/parts/30_host_util.inc",
-    368
-   ],
-   "depth": 0.171,
-   "other_files": 0
-  },
-  {
-   "id": "L32K-3-const_val-kVideoToken",
-   "hay": "L32K-3",
-   "type": "const_val",
-   "kind": "num",
-   "q": "上面的源码里，常量 `kVideoToken` 的值是多少？只回答数值。",
-   "answer": "248057",
-   "name": "kVideoToken",
-   "src": [
-    "src/api/vision.cpp",
-    50
-   ],
-   "depth": 0.314,
-   "other_files": 0
-  },
-  {
-   "id": "L32K-3-env_def-QWENOX_NGRAM_GATE",
+   "id": "L32K-3-env_def-QWENOX_VIZ_PARTS",
    "hay": "L32K-3",
    "type": "env_def",
    "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_NGRAM_GATE` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "1",
-   "name": "QWENOX_NGRAM_GATE",
+   "q": "上面的源码里，环境变量 `QWENOX_VIZ_PARTS` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "3",
+   "name": "QWENOX_VIZ_PARTS",
    "src": [
     "src/gpu/parts/40_model.inc",
-    45
+    627
    ],
-   "depth": 0.428,
-   "other_files": 0
-  },
-  {
-   "id": "L32K-3-const_val-ADL_PMLOG_TEMPERATURE_CPU",
-   "hay": "L32K-3",
-   "type": "const_val",
-   "kind": "num",
-   "q": "上面的源码里，常量 `ADL_PMLOG_TEMPERATURE_CPU` 的值是多少？只回答数值。",
-   "answer": "32",
-   "name": "ADL_PMLOG_TEMPERATURE_CPU",
-   "src": [
-    "src/api/power.cpp",
-    27
-   ],
-   "depth": 0.581,
+   "depth": 0.183,
    "other_files": 0
   },
   {
@@ -4481,22 +4436,52 @@
     "src/gpu/parts/06_memstats.inc",
     99
    ],
-   "depth": 0.686,
+   "depth": 0.278,
    "other_files": 0
   },
   {
-   "id": "L32K-3-env_def-QWENOX_VIZ_PARTS",
+   "id": "L32K-3-const_val-ADL_PMLOG_TEMPERATURE_CPU",
+   "hay": "L32K-3",
+   "type": "const_val",
+   "kind": "num",
+   "q": "上面的源码里，常量 `ADL_PMLOG_TEMPERATURE_CPU` 的值是多少？只回答数值。",
+   "answer": "32",
+   "name": "ADL_PMLOG_TEMPERATURE_CPU",
+   "src": [
+    "src/api/power.cpp",
+    27
+   ],
+   "depth": 0.43,
+   "other_files": 0
+  },
+  {
+   "id": "L32K-3-const_val-kVideoToken",
+   "hay": "L32K-3",
+   "type": "const_val",
+   "kind": "num",
+   "q": "上面的源码里，常量 `kVideoToken` 的值是多少？只回答数值。",
+   "answer": "248057",
+   "name": "kVideoToken",
+   "src": [
+    "src/api/vision.cpp",
+    50
+   ],
+   "depth": 0.57,
+   "other_files": 0
+  },
+  {
+   "id": "L32K-3-env_def-QWENOX_NGRAM_GATE",
    "hay": "L32K-3",
    "type": "env_def",
    "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_VIZ_PARTS` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "3",
-   "name": "QWENOX_VIZ_PARTS",
+   "q": "上面的源码里，环境变量 `QWENOX_NGRAM_GATE` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "1",
+   "name": "QWENOX_NGRAM_GATE",
    "src": [
     "src/gpu/parts/40_model.inc",
-    627
+    45
    ],
-   "depth": 0.845,
+   "depth": 0.71,
    "other_files": 0
   },
   {
@@ -4511,37 +4496,22 @@
     "src/api/toolparse.cpp",
     117
    ],
-   "depth": 0.951,
+   "depth": 0.825,
    "other_files": 0
   },
   {
-   "id": "L32K-4-const_val-kMaxAspect",
-   "hay": "L32K-4",
-   "type": "const_val",
-   "kind": "num",
-   "q": "上面的源码里，常量 `kMaxAspect` 的值是多少？只回答数值。",
-   "answer": "200.0",
-   "name": "kMaxAspect",
-   "src": [
-    "src/api/vision.cpp",
-    48
-   ],
-   "depth": 0.031,
-   "other_files": 0
-  },
-  {
-   "id": "L32K-4-env_file-QWENOX_MTP_HAGG",
-   "hay": "L32K-4",
+   "id": "L32K-3-env_file-QWENOX_ARENA_SLACK_GB",
+   "hay": "L32K-3",
    "type": "env_file",
    "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_MTP_HAGG` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/40_model.inc",
-   "name": "QWENOX_MTP_HAGG",
+   "q": "上面的源码里，环境变量 `QWENOX_ARENA_SLACK_GB` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/30_host_util.inc",
+   "name": "QWENOX_ARENA_SLACK_GB",
    "src": [
-    "src/gpu/parts/40_model.inc",
-    1416
+    "src/gpu/parts/30_host_util.inc",
+    368
    ],
-   "depth": 0.169,
+   "depth": 0.925,
    "other_files": 0
   },
   {
@@ -4556,37 +4526,22 @@
     "src/gpu/parts/40_model.inc",
     45
    ],
-   "depth": 0.305,
+   "depth": 0.034,
    "other_files": 0
   },
   {
-   "id": "L32K-4-env_file-QWENOX_KVSNAP_QUEUE_MB",
+   "id": "L32K-4-const_val-kMaxAspect",
    "hay": "L32K-4",
-   "type": "env_file",
-   "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_KVSNAP_QUEUE_MB` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/51_host_cfg.inc",
-   "name": "QWENOX_KVSNAP_QUEUE_MB",
-   "src": [
-    "src/gpu/parts/51_host_cfg.inc",
-    3834
-   ],
-   "depth": 0.441,
-   "other_files": 0
-  },
-  {
-   "id": "L32K-4-func_file-smart_resize",
-   "hay": "L32K-4",
-   "type": "func_file",
-   "kind": "path",
-   "q": "上面的源码里，函数 `smart_resize` 定义在哪个文件？只回答文件路径。",
-   "answer": "src/api/vision.cpp",
-   "name": "smart_resize",
+   "type": "const_val",
+   "kind": "num",
+   "q": "上面的源码里，常量 `kMaxAspect` 的值是多少？只回答数值。",
+   "answer": "200.0",
+   "name": "kMaxAspect",
    "src": [
     "src/api/vision.cpp",
-    245
+    48
    ],
-   "depth": 0.513,
+   "depth": 0.183,
    "other_files": 0
   },
   {
@@ -4601,7 +4556,7 @@
     "src/settings_panel.inc",
     1379
    ],
-   "depth": 0.651,
+   "depth": 0.285,
    "other_files": 0
   },
   {
@@ -4616,7 +4571,22 @@
     "src/gpu/parts/40_model.inc",
     627
    ],
-   "depth": 0.801,
+   "depth": 0.438,
+   "other_files": 0
+  },
+  {
+   "id": "L32K-4-env_file-QWENOX_MTP_HAGG",
+   "hay": "L32K-4",
+   "type": "env_file",
+   "kind": "path",
+   "q": "上面的源码里，环境变量 `QWENOX_MTP_HAGG` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/40_model.inc",
+   "name": "QWENOX_MTP_HAGG",
+   "src": [
+    "src/gpu/parts/40_model.inc",
+    1416
+   ],
+   "depth": 0.522,
    "other_files": 0
   },
   {
@@ -4631,112 +4601,37 @@
     "src/api/http.cpp",
     58
    ],
-   "depth": 0.944,
+   "depth": 0.684,
    "other_files": 0
   },
   {
-   "id": "L32K-5-func_file-gemv_gu_ok",
-   "hay": "L32K-5",
+   "id": "L32K-4-func_file-smart_resize",
+   "hay": "L32K-4",
    "type": "func_file",
    "kind": "path",
-   "q": "上面的源码里，函数 `gemv_gu_ok` 定义在哪个文件？只回答文件路径。",
-   "answer": "src/gpu/parts/26_kernels_moe_gguf.inc",
-   "name": "gemv_gu_ok",
+   "q": "上面的源码里，函数 `smart_resize` 定义在哪个文件？只回答文件路径。",
+   "answer": "src/api/vision.cpp",
+   "name": "smart_resize",
    "src": [
-    "src/gpu/parts/26_kernels_moe_gguf.inc",
-    1029
+    "src/api/vision.cpp",
+    245
    ],
-   "depth": 0.067,
+   "depth": 0.805,
    "other_files": 0
   },
   {
-   "id": "L32K-5-env_def-QWENOX_DENSE_LUT_MINP",
-   "hay": "L32K-5",
-   "type": "env_def",
-   "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_DENSE_LUT_MINP` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "1024",
-   "name": "QWENOX_DENSE_LUT_MINP",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    2696
-   ],
-   "depth": 0.193,
-   "other_files": 0
-  },
-  {
-   "id": "L32K-5-const_val-kEdPlainW",
-   "hay": "L32K-5",
-   "type": "const_val",
-   "kind": "num",
-   "q": "上面的源码里，常量 `kEdPlainW` 的值是多少？只回答数值。",
-   "answer": "354",
-   "name": "kEdPlainW",
-   "src": [
-    "src/settings_panel.inc",
-    1143
-   ],
-   "depth": 0.318,
-   "other_files": 0
-  },
-  {
-   "id": "L32K-5-func_file-load_weights",
-   "hay": "L32K-5",
-   "type": "func_file",
-   "kind": "path",
-   "q": "上面的源码里，函数 `load_weights` 定义在哪个文件？只回答文件路径。",
-   "answer": "src/gpu/vit.cpp",
-   "name": "load_weights",
-   "src": [
-    "src/gpu/vit.cpp",
-    842
-   ],
-   "depth": 0.408,
-   "other_files": 0
-  },
-  {
-   "id": "L32K-5-env_def-QWENOX_ATDROW",
-   "hay": "L32K-5",
-   "type": "env_def",
-   "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_ATDROW` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "2",
-   "name": "QWENOX_ATDROW",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    4799
-   ],
-   "depth": 0.582,
-   "other_files": 0
-  },
-  {
-   "id": "L32K-5-const_val-kVGMaxSeg",
-   "hay": "L32K-5",
-   "type": "const_val",
-   "kind": "num",
-   "q": "上面的源码里，常量 `kVGMaxSeg` 的值是多少？只回答数值。",
-   "answer": "16",
-   "name": "kVGMaxSeg",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    10405
-   ],
-   "depth": 0.677,
-   "other_files": 0
-  },
-  {
-   "id": "L32K-5-env_file-QWENOX_SPEC_ADAPT_MIN",
-   "hay": "L32K-5",
+   "id": "L32K-4-env_file-QWENOX_KVSNAP_QUEUE_MB",
+   "hay": "L32K-4",
    "type": "env_file",
    "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_SPEC_ADAPT_MIN` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/40_model.inc",
-   "name": "QWENOX_SPEC_ADAPT_MIN",
+   "q": "上面的源码里，环境变量 `QWENOX_KVSNAP_QUEUE_MB` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/51_host_cfg.inc",
+   "name": "QWENOX_KVSNAP_QUEUE_MB",
    "src": [
-    "src/gpu/parts/40_model.inc",
-    8594
+    "src/gpu/parts/51_host_cfg.inc",
+    3834
    ],
-   "depth": 0.814,
+   "depth": 0.94,
    "other_files": 0
   },
   {
@@ -4751,22 +4646,112 @@
     "src/gpu/parts/40_model.inc",
     101
    ],
-   "depth": 0.949,
+   "depth": 0.085,
    "other_files": 0
   },
   {
-   "id": "L64K-0-env_def-QWENOX_FORK_DUMP",
-   "hay": "L64K-0",
+   "id": "L32K-5-func_file-load_weights",
+   "hay": "L32K-5",
+   "type": "func_file",
+   "kind": "path",
+   "q": "上面的源码里，函数 `load_weights` 定义在哪个文件？只回答文件路径。",
+   "answer": "src/gpu/vit.cpp",
+   "name": "load_weights",
+   "src": [
+    "src/gpu/vit.cpp",
+    842
+   ],
+   "depth": 0.187,
+   "other_files": 0
+  },
+  {
+   "id": "L32K-5-env_def-QWENOX_DENSE_LUT_MINP",
+   "hay": "L32K-5",
    "type": "env_def",
    "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_FORK_DUMP` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "0",
-   "name": "QWENOX_FORK_DUMP",
+   "q": "上面的源码里，环境变量 `QWENOX_DENSE_LUT_MINP` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "1024",
+   "name": "QWENOX_DENSE_LUT_MINP",
    "src": [
     "src/gpu/parts/40_model.inc",
-    922
+    2696
    ],
-   "depth": 0.037,
+   "depth": 0.33,
+   "other_files": 0
+  },
+  {
+   "id": "L32K-5-const_val-kEdPlainW",
+   "hay": "L32K-5",
+   "type": "const_val",
+   "kind": "num",
+   "q": "上面的源码里，常量 `kEdPlainW` 的值是多少？只回答数值。",
+   "answer": "354",
+   "name": "kEdPlainW",
+   "src": [
+    "src/settings_panel.inc",
+    1143
+   ],
+   "depth": 0.443,
+   "other_files": 0
+  },
+  {
+   "id": "L32K-5-env_def-QWENOX_ATDROW",
+   "hay": "L32K-5",
+   "type": "env_def",
+   "kind": "num",
+   "q": "上面的源码里，环境变量 `QWENOX_ATDROW` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "2",
+   "name": "QWENOX_ATDROW",
+   "src": [
+    "src/gpu/parts/40_model.inc",
+    4799
+   ],
+   "depth": 0.601,
+   "other_files": 0
+  },
+  {
+   "id": "L32K-5-env_file-QWENOX_SPEC_ADAPT_MIN",
+   "hay": "L32K-5",
+   "type": "env_file",
+   "kind": "path",
+   "q": "上面的源码里，环境变量 `QWENOX_SPEC_ADAPT_MIN` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/40_model.inc",
+   "name": "QWENOX_SPEC_ADAPT_MIN",
+   "src": [
+    "src/gpu/parts/40_model.inc",
+    8594
+   ],
+   "depth": 0.698,
+   "other_files": 0
+  },
+  {
+   "id": "L32K-5-func_file-gemv_gu_ok",
+   "hay": "L32K-5",
+   "type": "func_file",
+   "kind": "path",
+   "q": "上面的源码里，函数 `gemv_gu_ok` 定义在哪个文件？只回答文件路径。",
+   "answer": "src/gpu/parts/26_kernels_moe_gguf.inc",
+   "name": "gemv_gu_ok",
+   "src": [
+    "src/gpu/parts/26_kernels_moe_gguf.inc",
+    1029
+   ],
+   "depth": 0.827,
+   "other_files": 0
+  },
+  {
+   "id": "L32K-5-const_val-kVGMaxSeg",
+   "hay": "L32K-5",
+   "type": "const_val",
+   "kind": "num",
+   "q": "上面的源码里，常量 `kVGMaxSeg` 的值是多少？只回答数值。",
+   "answer": "16",
+   "name": "kVGMaxSeg",
+   "src": [
+    "src/gpu/parts/40_model.inc",
+    10405
+   ],
+   "depth": 0.936,
    "other_files": 0
   },
   {
@@ -4781,82 +4766,7 @@
     "src/gpu/parts/51_host_cfg.inc",
     2267
    ],
-   "depth": 0.086,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-0-func_file-v2_deq_bf16",
-   "hay": "L64K-0",
-   "type": "func_file",
-   "kind": "path",
-   "q": "上面的源码里，函数 `v2_deq_bf16` 定义在哪个文件？只回答文件路径。",
-   "answer": "src/gpu/parts/30_host_util.inc",
-   "name": "v2_deq_bf16",
-   "src": [
-    "src/gpu/parts/30_host_util.inc",
-    1536
-   ],
-   "depth": 0.142,
-   "other_files": 1
-  },
-  {
-   "id": "L64K-0-env_def-QWENOX_HT_WMMA_BLOCKS",
-   "hay": "L64K-0",
-   "type": "env_def",
-   "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_HT_WMMA_BLOCKS` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "80",
-   "name": "QWENOX_HT_WMMA_BLOCKS",
-   "src": [
-    "src/gpu/parts/30_host_util.inc",
-    1116
-   ],
-   "depth": 0.201,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-0-func_file-engine_start",
-   "hay": "L64K-0",
-   "type": "func_file",
-   "kind": "path",
-   "q": "上面的源码里，函数 `engine_start` 定义在哪个文件？只回答文件路径。",
-   "answer": "src/api/tray_win.cpp",
-   "name": "engine_start",
-   "src": [
-    "src/api/tray_win.cpp",
-    379
-   ],
-   "depth": 0.27,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-0-const_val-ADL_PMLOG_ASIC_POWER",
-   "hay": "L64K-0",
-   "type": "const_val",
-   "kind": "num",
-   "q": "上面的源码里，常量 `ADL_PMLOG_ASIC_POWER` 的值是多少？只回答数值。",
-   "answer": "23",
-   "name": "ADL_PMLOG_ASIC_POWER",
-   "src": [
-    "src/api/power.cpp",
-    18
-   ],
-   "depth": 0.336,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-0-env_def-QWENOX_RCKPT_MIN",
-   "hay": "L64K-0",
-   "type": "env_def",
-   "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_RCKPT_MIN` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "4096",
-   "name": "QWENOX_RCKPT_MIN",
-   "src": [
-    "src/gpu/parts/49_rckpt.inc",
-    146
-   ],
-   "depth": 0.409,
+   "depth": 0.032,
    "other_files": 0
   },
   {
@@ -4871,67 +4781,22 @@
     "src/gpu/parts/40_model.inc",
     2456
    ],
-   "depth": 0.464,
+   "depth": 0.085,
    "other_files": 0
   },
   {
-   "id": "L64K-0-env_file-QWENOX_DENSE_WMMA_HC",
+   "id": "L64K-0-env_def-QWENOX_RCKPT_MIN",
    "hay": "L64K-0",
-   "type": "env_file",
-   "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_DENSE_WMMA_HC` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/30_host_util.inc",
-   "name": "QWENOX_DENSE_WMMA_HC",
-   "src": [
-    "src/gpu/parts/30_host_util.inc",
-    1178
-   ],
-   "depth": 0.525,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-0-const_val-kEdPlainW",
-   "hay": "L64K-0",
-   "type": "const_val",
+   "type": "env_def",
    "kind": "num",
-   "q": "上面的源码里，常量 `kEdPlainW` 的值是多少？只回答数值。",
-   "answer": "354",
-   "name": "kEdPlainW",
+   "q": "上面的源码里，环境变量 `QWENOX_RCKPT_MIN` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "4096",
+   "name": "QWENOX_RCKPT_MIN",
    "src": [
-    "src/settings_panel.inc",
-    1143
+    "src/gpu/parts/49_rckpt.inc",
+    146
    ],
-   "depth": 0.593,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-0-const_val-KV_PAGE_SHIFT",
-   "hay": "L64K-0",
-   "type": "const_val",
-   "kind": "num",
-   "q": "上面的源码里，常量 `KV_PAGE_SHIFT` 的值是多少？只回答数值。",
-   "answer": "8",
-   "name": "KV_PAGE_SHIFT",
-   "src": [
-    "src/gpu/parts/10_ple_io.inc",
-    435
-   ],
-   "depth": 0.647,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-0-env_file-QWENOX_NGRAM_CHUNK",
-   "hay": "L64K-0",
-   "type": "env_file",
-   "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_NGRAM_CHUNK` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/40_model.inc",
-   "name": "QWENOX_NGRAM_CHUNK",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    27
-   ],
-   "depth": 0.72,
+   "depth": 0.146,
    "other_files": 0
   },
   {
@@ -4946,22 +4811,7 @@
     "src/gpu/parts/40_model.inc",
     8719
    ],
-   "depth": 0.778,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-0-func_file-utf8_boundary_at_or_before",
-   "hay": "L64K-0",
-   "type": "func_file",
-   "kind": "path",
-   "q": "上面的源码里，函数 `utf8_boundary_at_or_before` 定义在哪个文件？只回答文件路径。",
-   "answer": "src/api/main.cpp",
-   "name": "utf8_boundary_at_or_before",
-   "src": [
-    "src/api/main.cpp",
-    218
-   ],
-   "depth": 0.847,
+   "depth": 0.197,
    "other_files": 0
   },
   {
@@ -4976,7 +4826,142 @@
     "src/gpu/parts/40_model.inc",
     2617
    ],
-   "depth": 0.896,
+   "depth": 0.264,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-0-func_file-v2_deq_bf16",
+   "hay": "L64K-0",
+   "type": "func_file",
+   "kind": "path",
+   "q": "上面的源码里，函数 `v2_deq_bf16` 定义在哪个文件？只回答文件路径。",
+   "answer": "src/gpu/parts/30_host_util.inc",
+   "name": "v2_deq_bf16",
+   "src": [
+    "src/gpu/parts/30_host_util.inc",
+    1536
+   ],
+   "depth": 0.342,
+   "other_files": 1
+  },
+  {
+   "id": "L64K-0-const_val-ADL_PMLOG_ASIC_POWER",
+   "hay": "L64K-0",
+   "type": "const_val",
+   "kind": "num",
+   "q": "上面的源码里，常量 `ADL_PMLOG_ASIC_POWER` 的值是多少？只回答数值。",
+   "answer": "23",
+   "name": "ADL_PMLOG_ASIC_POWER",
+   "src": [
+    "src/api/power.cpp",
+    18
+   ],
+   "depth": 0.397,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-0-func_file-utf8_boundary_at_or_before",
+   "hay": "L64K-0",
+   "type": "func_file",
+   "kind": "path",
+   "q": "上面的源码里，函数 `utf8_boundary_at_or_before` 定义在哪个文件？只回答文件路径。",
+   "answer": "src/api/main.cpp",
+   "name": "utf8_boundary_at_or_before",
+   "src": [
+    "src/api/main.cpp",
+    218
+   ],
+   "depth": 0.468,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-0-env_file-QWENOX_DENSE_WMMA_HC",
+   "hay": "L64K-0",
+   "type": "env_file",
+   "kind": "path",
+   "q": "上面的源码里，环境变量 `QWENOX_DENSE_WMMA_HC` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/30_host_util.inc",
+   "name": "QWENOX_DENSE_WMMA_HC",
+   "src": [
+    "src/gpu/parts/30_host_util.inc",
+    1178
+   ],
+   "depth": 0.522,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-0-const_val-KV_PAGE_SHIFT",
+   "hay": "L64K-0",
+   "type": "const_val",
+   "kind": "num",
+   "q": "上面的源码里，常量 `KV_PAGE_SHIFT` 的值是多少？只回答数值。",
+   "answer": "8",
+   "name": "KV_PAGE_SHIFT",
+   "src": [
+    "src/gpu/parts/10_ple_io.inc",
+    435
+   ],
+   "depth": 0.581,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-0-env_def-QWENOX_HT_WMMA_BLOCKS",
+   "hay": "L64K-0",
+   "type": "env_def",
+   "kind": "num",
+   "q": "上面的源码里，环境变量 `QWENOX_HT_WMMA_BLOCKS` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "80",
+   "name": "QWENOX_HT_WMMA_BLOCKS",
+   "src": [
+    "src/gpu/parts/30_host_util.inc",
+    1116
+   ],
+   "depth": 0.647,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-0-const_val-kEdPlainW",
+   "hay": "L64K-0",
+   "type": "const_val",
+   "kind": "num",
+   "q": "上面的源码里，常量 `kEdPlainW` 的值是多少？只回答数值。",
+   "answer": "354",
+   "name": "kEdPlainW",
+   "src": [
+    "src/settings_panel.inc",
+    1143
+   ],
+   "depth": 0.724,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-0-env_file-QWENOX_NGRAM_CHUNK",
+   "hay": "L64K-0",
+   "type": "env_file",
+   "kind": "path",
+   "q": "上面的源码里，环境变量 `QWENOX_NGRAM_CHUNK` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/40_model.inc",
+   "name": "QWENOX_NGRAM_CHUNK",
+   "src": [
+    "src/gpu/parts/40_model.inc",
+    27
+   ],
+   "depth": 0.781,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-0-func_file-engine_start",
+   "hay": "L64K-0",
+   "type": "func_file",
+   "kind": "path",
+   "q": "上面的源码里，函数 `engine_start` 定义在哪个文件？只回答文件路径。",
+   "answer": "src/api/tray_win.cpp",
+   "name": "engine_start",
+   "src": [
+    "src/api/tray_win.cpp",
+    379
+   ],
+   "depth": 0.844,
    "other_files": 0
   },
   {
@@ -4991,112 +4976,22 @@
     "src/gpu/parts/40_model.inc",
     6858
    ],
-   "depth": 0.956,
+   "depth": 0.891,
    "other_files": 1
   },
   {
-   "id": "L64K-1-const_val-kVimgMax",
-   "hay": "L64K-1",
-   "type": "const_val",
-   "kind": "num",
-   "q": "上面的源码里，常量 `kVimgMax` 的值是多少？只回答数值。",
-   "answer": "256",
-   "name": "kVimgMax",
-   "src": [
-    "src/gpu/parts/51_host_cfg.inc",
-    1424
-   ],
-   "depth": 0.024,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-1-func_file-pread_exact",
-   "hay": "L64K-1",
-   "type": "func_file",
-   "kind": "path",
-   "q": "上面的源码里，函数 `pread_exact` 定义在哪个文件？只回答文件路径。",
-   "answer": "src/hgn_dump.cpp",
-   "name": "pread_exact",
-   "src": [
-    "src/hgn_dump.cpp",
-    54
-   ],
-   "depth": 0.081,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-1-env_file-QWENOX_SPEC_ADAPT_MAX",
-   "hay": "L64K-1",
-   "type": "env_file",
-   "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_SPEC_ADAPT_MAX` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/40_model.inc",
-   "name": "QWENOX_SPEC_ADAPT_MAX",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    8595
-   ],
-   "depth": 0.154,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-1-env_def-QWENOX_ATDROW",
-   "hay": "L64K-1",
+   "id": "L64K-0-env_def-QWENOX_FORK_DUMP",
+   "hay": "L64K-0",
    "type": "env_def",
    "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_ATDROW` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "2",
-   "name": "QWENOX_ATDROW",
+   "q": "上面的源码里，环境变量 `QWENOX_FORK_DUMP` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "0",
+   "name": "QWENOX_FORK_DUMP",
    "src": [
     "src/gpu/parts/40_model.inc",
-    4799
+    922
    ],
-   "depth": 0.215,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-1-func_file-buf_get",
-   "hay": "L64K-1",
-   "type": "func_file",
-   "kind": "path",
-   "q": "上面的源码里，函数 `buf_get` 定义在哪个文件？只回答文件路径。",
-   "answer": "src/gpu/parts/51_host_cfg.inc",
-   "name": "buf_get",
-   "src": [
-    "src/gpu/parts/51_host_cfg.inc",
-    203
-   ],
-   "depth": 0.28,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-1-env_file-QWENOX_VGRAPH_NOGDN",
-   "hay": "L64K-1",
-   "type": "env_file",
-   "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_VGRAPH_NOGDN` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/40_model.inc",
-   "name": "QWENOX_VGRAPH_NOGDN",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    10502
-   ],
-   "depth": 0.349,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-1-const_val-kSocketTimeoutSec",
-   "hay": "L64K-1",
-   "type": "const_val",
-   "kind": "num",
-   "q": "上面的源码里，常量 `kSocketTimeoutSec` 的值是多少？只回答数值。",
-   "answer": "30",
-   "name": "kSocketTimeoutSec",
-   "src": [
-    "src/api/http.cpp",
-    57
-   ],
-   "depth": 0.419,
+   "depth": 0.959,
    "other_files": 0
   },
   {
@@ -5111,112 +5006,22 @@
     "src/gpu/parts/40_model.inc",
     1837
    ],
-   "depth": 0.474,
+   "depth": 0.025,
    "other_files": 0
   },
   {
-   "id": "L64K-1-func_file-dr_execute",
-   "hay": "L64K-1",
-   "type": "func_file",
-   "kind": "path",
-   "q": "上面的源码里，函数 `dr_execute` 定义在哪个文件？只回答文件路径。",
-   "answer": "src/gpu/parts/51_host_cfg.inc",
-   "name": "dr_execute",
-   "src": [
-    "src/gpu/parts/51_host_cfg.inc",
-    2594
-   ],
-   "depth": 0.541,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-1-env_def-QWENOX_NGRAM_GATE",
-   "hay": "L64K-1",
-   "type": "env_def",
-   "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_NGRAM_GATE` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "1",
-   "name": "QWENOX_NGRAM_GATE",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    45
-   ],
-   "depth": 0.597,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-1-env_file-QWENOX_GGUF_EXPERTS",
+   "id": "L64K-1-env_file-QWENOX_SPEC_ADAPT_MAX",
    "hay": "L64K-1",
    "type": "env_file",
    "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_GGUF_EXPERTS` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/30_host_util.inc",
-   "name": "QWENOX_GGUF_EXPERTS",
-   "src": [
-    "src/gpu/parts/30_host_util.inc",
-    449
-   ],
-   "depth": 0.669,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-1-const_val-kActStrideB",
-   "hay": "L64K-1",
-   "type": "const_val",
-   "kind": "num",
-   "q": "上面的源码里，常量 `kActStrideB` 的值是多少？只回答数值。",
-   "answer": "80",
-   "name": "kActStrideB",
-   "src": [
-    "src/gpu/parts/27_kernels_moe_lut.inc",
-    1084
-   ],
-   "depth": 0.731,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-1-env_file-QWENOX_NGRAM_MIN",
-   "hay": "L64K-1",
-   "type": "env_file",
-   "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_NGRAM_MIN` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/00_platform.inc",
-   "name": "QWENOX_NGRAM_MIN",
-   "src": [
-    "src/gpu/parts/00_platform.inc",
-    154
-   ],
-   "depth": 0.8,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-1-env_def-QWENOX_DRAFT_VOCAB",
-   "hay": "L64K-1",
-   "type": "env_def",
-   "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_DRAFT_VOCAB` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "0",
-   "name": "QWENOX_DRAFT_VOCAB",
+   "q": "上面的源码里，环境变量 `QWENOX_SPEC_ADAPT_MAX` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/40_model.inc",
+   "name": "QWENOX_SPEC_ADAPT_MAX",
    "src": [
     "src/gpu/parts/40_model.inc",
-    916
+    8595
    ],
-   "depth": 0.843,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-1-env_def-QWENOX_OCC_HYST",
-   "hay": "L64K-1",
-   "type": "env_def",
-   "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_OCC_HYST` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "0.01",
-   "name": "QWENOX_OCC_HYST",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    8735
-   ],
-   "depth": 0.907,
+   "depth": 0.074,
    "other_files": 0
   },
   {
@@ -5231,57 +5036,177 @@
     "src/api/toolparse.cpp",
     230
    ],
-   "depth": 0.958,
+   "depth": 0.148,
    "other_files": 0
   },
   {
-   "id": "L64K-2-const_val-kMaxConnections",
-   "hay": "L64K-2",
+   "id": "L64K-1-const_val-kActStrideB",
+   "hay": "L64K-1",
    "type": "const_val",
    "kind": "num",
-   "q": "上面的源码里，常量 `kMaxConnections` 的值是多少？只回答数值。",
-   "answer": "128",
-   "name": "kMaxConnections",
+   "q": "上面的源码里，常量 `kActStrideB` 的值是多少？只回答数值。",
+   "answer": "80",
+   "name": "kActStrideB",
+   "src": [
+    "src/gpu/parts/27_kernels_moe_lut.inc",
+    1084
+   ],
+   "depth": 0.203,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-1-env_def-QWENOX_OCC_HYST",
+   "hay": "L64K-1",
+   "type": "env_def",
+   "kind": "num",
+   "q": "上面的源码里，环境变量 `QWENOX_OCC_HYST` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "0.01",
+   "name": "QWENOX_OCC_HYST",
+   "src": [
+    "src/gpu/parts/40_model.inc",
+    8735
+   ],
+   "depth": 0.277,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-1-const_val-kSocketTimeoutSec",
+   "hay": "L64K-1",
+   "type": "const_val",
+   "kind": "num",
+   "q": "上面的源码里，常量 `kSocketTimeoutSec` 的值是多少？只回答数值。",
+   "answer": "30",
+   "name": "kSocketTimeoutSec",
    "src": [
     "src/api/http.cpp",
-    58
+    57
    ],
-   "depth": 0.043,
+   "depth": 0.345,
    "other_files": 0
   },
   {
-   "id": "L64K-2-func_file-extract_reasoning",
-   "hay": "L64K-2",
+   "id": "L64K-1-env_file-QWENOX_VGRAPH_NOGDN",
+   "hay": "L64K-1",
+   "type": "env_file",
+   "kind": "path",
+   "q": "上面的源码里，环境变量 `QWENOX_VGRAPH_NOGDN` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/40_model.inc",
+   "name": "QWENOX_VGRAPH_NOGDN",
+   "src": [
+    "src/gpu/parts/40_model.inc",
+    10502
+   ],
+   "depth": 0.422,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-1-func_file-pread_exact",
+   "hay": "L64K-1",
    "type": "func_file",
    "kind": "path",
-   "q": "上面的源码里，函数 `extract_reasoning` 定义在哪个文件？只回答文件路径。",
-   "answer": "src/api/chat_template.cpp",
-   "name": "extract_reasoning",
+   "q": "上面的源码里，函数 `pread_exact` 定义在哪个文件？只回答文件路径。",
+   "answer": "src/hgn_dump.cpp",
+   "name": "pread_exact",
    "src": [
-    "src/api/chat_template.cpp",
-    280
+    "src/hgn_dump.cpp",
+    54
    ],
-   "depth": 0.103,
+   "depth": 0.478,
    "other_files": 0
   },
   {
-   "id": "L64K-2-func_file-compose_pair",
-   "hay": "L64K-2",
+   "id": "L64K-1-func_file-buf_get",
+   "hay": "L64K-1",
    "type": "func_file",
    "kind": "path",
-   "q": "上面的源码里，函数 `compose_pair` 定义在哪个文件？只回答文件路径。",
-   "answer": "src/api/tokenizer.cpp",
-   "name": "compose_pair",
+   "q": "上面的源码里，函数 `buf_get` 定义在哪个文件？只回答文件路径。",
+   "answer": "src/gpu/parts/51_host_cfg.inc",
+   "name": "buf_get",
    "src": [
-    "src/api/tokenizer.cpp",
-    89
+    "src/gpu/parts/51_host_cfg.inc",
+    203
    ],
-   "depth": 0.161,
+   "depth": 0.545,
    "other_files": 0
   },
   {
-   "id": "L64K-2-env_def-QWENOX_ATDROW",
-   "hay": "L64K-2",
+   "id": "L64K-1-func_file-dr_execute",
+   "hay": "L64K-1",
+   "type": "func_file",
+   "kind": "path",
+   "q": "上面的源码里，函数 `dr_execute` 定义在哪个文件？只回答文件路径。",
+   "answer": "src/gpu/parts/51_host_cfg.inc",
+   "name": "dr_execute",
+   "src": [
+    "src/gpu/parts/51_host_cfg.inc",
+    2594
+   ],
+   "depth": 0.591,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-1-env_def-QWENOX_DRAFT_VOCAB",
+   "hay": "L64K-1",
+   "type": "env_def",
+   "kind": "num",
+   "q": "上面的源码里，环境变量 `QWENOX_DRAFT_VOCAB` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "0",
+   "name": "QWENOX_DRAFT_VOCAB",
+   "src": [
+    "src/gpu/parts/40_model.inc",
+    916
+   ],
+   "depth": 0.669,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-1-env_file-QWENOX_NGRAM_MIN",
+   "hay": "L64K-1",
+   "type": "env_file",
+   "kind": "path",
+   "q": "上面的源码里，环境变量 `QWENOX_NGRAM_MIN` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/00_platform.inc",
+   "name": "QWENOX_NGRAM_MIN",
+   "src": [
+    "src/gpu/parts/00_platform.inc",
+    154
+   ],
+   "depth": 0.73,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-1-env_def-QWENOX_NGRAM_GATE",
+   "hay": "L64K-1",
+   "type": "env_def",
+   "kind": "num",
+   "q": "上面的源码里，环境变量 `QWENOX_NGRAM_GATE` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "1",
+   "name": "QWENOX_NGRAM_GATE",
+   "src": [
+    "src/gpu/parts/40_model.inc",
+    45
+   ],
+   "depth": 0.797,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-1-const_val-kVimgMax",
+   "hay": "L64K-1",
+   "type": "const_val",
+   "kind": "num",
+   "q": "上面的源码里，常量 `kVimgMax` 的值是多少？只回答数值。",
+   "answer": "256",
+   "name": "kVimgMax",
+   "src": [
+    "src/gpu/parts/51_host_cfg.inc",
+    1424
+   ],
+   "depth": 0.84,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-1-env_def-QWENOX_ATDROW",
+   "hay": "L64K-1",
    "type": "env_def",
    "kind": "num",
    "q": "上面的源码里，环境变量 `QWENOX_ATDROW` 没有设置时，程序取的默认值是多少？只回答数值。",
@@ -5291,112 +5216,22 @@
     "src/gpu/parts/40_model.inc",
     4799
    ],
-   "depth": 0.239,
+   "depth": 0.916,
    "other_files": 0
   },
   {
-   "id": "L64K-2-env_def-QWENOX_SPEC_ADAPT_ALPHA",
-   "hay": "L64K-2",
-   "type": "env_def",
-   "kind": "num",
-   "q": "上面的源码里，环境变量 `QWENOX_SPEC_ADAPT_ALPHA` 没有设置时，程序取的默认值是多少？只回答数值。",
-   "answer": "0.05",
-   "name": "QWENOX_SPEC_ADAPT_ALPHA",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    8592
-   ],
-   "depth": 0.289,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-2-func_file-adl_init",
-   "hay": "L64K-2",
-   "type": "func_file",
-   "kind": "path",
-   "q": "上面的源码里，函数 `adl_init` 定义在哪个文件？只回答文件路径。",
-   "answer": "src/api/power.cpp",
-   "name": "adl_init",
-   "src": [
-    "src/api/power.cpp",
-    52
-   ],
-   "depth": 0.359,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-2-env_file-QWENOX_MOE_Q4W",
-   "hay": "L64K-2",
+   "id": "L64K-1-env_file-QWENOX_GGUF_EXPERTS",
+   "hay": "L64K-1",
    "type": "env_file",
    "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_MOE_Q4W` 是在哪个文件里读取的？只回答文件路径。",
+   "q": "上面的源码里，环境变量 `QWENOX_GGUF_EXPERTS` 是在哪个文件里读取的？只回答文件路径。",
    "answer": "src/gpu/parts/30_host_util.inc",
-   "name": "QWENOX_MOE_Q4W",
+   "name": "QWENOX_GGUF_EXPERTS",
    "src": [
     "src/gpu/parts/30_host_util.inc",
-    101
+    449
    ],
-   "depth": 0.405,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-2-const_val-kVrSaveRows",
-   "hay": "L64K-2",
-   "type": "const_val",
-   "kind": "num",
-   "q": "上面的源码里，常量 `kVrSaveRows` 的值是多少？只回答数值。",
-   "answer": "9",
-   "name": "kVrSaveRows",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    7136
-   ],
-   "depth": 0.464,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-2-env_file-QWENOX_MOE_UP_LEGACY",
-   "hay": "L64K-2",
-   "type": "env_file",
-   "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_MOE_UP_LEGACY` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/40_model.inc",
-   "name": "QWENOX_MOE_UP_LEGACY",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    2426
-   ],
-   "depth": 0.544,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-2-env_file-QWENOX_KV_POOL_TOKENS",
-   "hay": "L64K-2",
-   "type": "env_file",
-   "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_KV_POOL_TOKENS` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/10_ple_io.inc",
-   "name": "QWENOX_KV_POOL_TOKENS",
-   "src": [
-    "src/gpu/parts/10_ple_io.inc",
-    581
-   ],
-   "depth": 0.596,
-   "other_files": 1
-  },
-  {
-   "id": "L64K-2-env_file-QWENOX_MOE_REP",
-   "hay": "L64K-2",
-   "type": "env_file",
-   "kind": "path",
-   "q": "上面的源码里，环境变量 `QWENOX_MOE_REP` 是在哪个文件里读取的？只回答文件路径。",
-   "answer": "src/gpu/parts/40_model.inc",
-   "name": "QWENOX_MOE_REP",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    5649
-   ],
-   "depth": 0.668,
+   "depth": 0.96,
    "other_files": 0
   },
   {
@@ -5411,22 +5246,7 @@
     "src/gpu/parts/40_model.inc",
     916
    ],
-   "depth": 0.719,
-   "other_files": 0
-  },
-  {
-   "id": "L64K-2-const_val-reps",
-   "hay": "L64K-2",
-   "type": "const_val",
-   "kind": "num",
-   "q": "上面的源码里，常量 `reps` 的值是多少？只回答数值。",
-   "answer": "5",
-   "name": "reps",
-   "src": [
-    "src/gpu/parts/40_model.inc",
-    2617
-   ],
-   "depth": 0.799,
+   "depth": 0.039,
    "other_files": 0
   },
   {
@@ -5441,8 +5261,158 @@
     "src/ref.cpp",
     55
    ],
-   "depth": 0.858,
+   "depth": 0.112,
    "other_files": 2
+  },
+  {
+   "id": "L64K-2-env_def-QWENOX_ATDROW",
+   "hay": "L64K-2",
+   "type": "env_def",
+   "kind": "num",
+   "q": "上面的源码里，环境变量 `QWENOX_ATDROW` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "2",
+   "name": "QWENOX_ATDROW",
+   "src": [
+    "src/gpu/parts/40_model.inc",
+    4799
+   ],
+   "depth": 0.178,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-2-func_file-compose_pair",
+   "hay": "L64K-2",
+   "type": "func_file",
+   "kind": "path",
+   "q": "上面的源码里，函数 `compose_pair` 定义在哪个文件？只回答文件路径。",
+   "answer": "src/api/tokenizer.cpp",
+   "name": "compose_pair",
+   "src": [
+    "src/api/tokenizer.cpp",
+    89
+   ],
+   "depth": 0.226,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-2-func_file-adl_init",
+   "hay": "L64K-2",
+   "type": "func_file",
+   "kind": "path",
+   "q": "上面的源码里，函数 `adl_init` 定义在哪个文件？只回答文件路径。",
+   "answer": "src/api/power.cpp",
+   "name": "adl_init",
+   "src": [
+    "src/api/power.cpp",
+    52
+   ],
+   "depth": 0.295,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-2-env_file-QWENOX_KV_POOL_TOKENS",
+   "hay": "L64K-2",
+   "type": "env_file",
+   "kind": "path",
+   "q": "上面的源码里，环境变量 `QWENOX_KV_POOL_TOKENS` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/10_ple_io.inc",
+   "name": "QWENOX_KV_POOL_TOKENS",
+   "src": [
+    "src/gpu/parts/10_ple_io.inc",
+    581
+   ],
+   "depth": 0.352,
+   "other_files": 1
+  },
+  {
+   "id": "L64K-2-const_val-reps",
+   "hay": "L64K-2",
+   "type": "const_val",
+   "kind": "num",
+   "q": "上面的源码里，常量 `reps` 的值是多少？只回答数值。",
+   "answer": "5",
+   "name": "reps",
+   "src": [
+    "src/gpu/parts/40_model.inc",
+    2617
+   ],
+   "depth": 0.4,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-2-env_file-QWENOX_MOE_REP",
+   "hay": "L64K-2",
+   "type": "env_file",
+   "kind": "path",
+   "q": "上面的源码里，环境变量 `QWENOX_MOE_REP` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/40_model.inc",
+   "name": "QWENOX_MOE_REP",
+   "src": [
+    "src/gpu/parts/40_model.inc",
+    5649
+   ],
+   "depth": 0.464,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-2-env_def-QWENOX_SPEC_ADAPT_ALPHA",
+   "hay": "L64K-2",
+   "type": "env_def",
+   "kind": "num",
+   "q": "上面的源码里，环境变量 `QWENOX_SPEC_ADAPT_ALPHA` 没有设置时，程序取的默认值是多少？只回答数值。",
+   "answer": "0.05",
+   "name": "QWENOX_SPEC_ADAPT_ALPHA",
+   "src": [
+    "src/gpu/parts/40_model.inc",
+    8592
+   ],
+   "depth": 0.53,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-2-const_val-kMaxConnections",
+   "hay": "L64K-2",
+   "type": "const_val",
+   "kind": "num",
+   "q": "上面的源码里，常量 `kMaxConnections` 的值是多少？只回答数值。",
+   "answer": "128",
+   "name": "kMaxConnections",
+   "src": [
+    "src/api/http.cpp",
+    58
+   ],
+   "depth": 0.599,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-2-env_file-QWENOX_MOE_UP_LEGACY",
+   "hay": "L64K-2",
+   "type": "env_file",
+   "kind": "path",
+   "q": "上面的源码里，环境变量 `QWENOX_MOE_UP_LEGACY` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/40_model.inc",
+   "name": "QWENOX_MOE_UP_LEGACY",
+   "src": [
+    "src/gpu/parts/40_model.inc",
+    2426
+   ],
+   "depth": 0.668,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-2-env_file-QWENOX_MOE_Q4W",
+   "hay": "L64K-2",
+   "type": "env_file",
+   "kind": "path",
+   "q": "上面的源码里，环境变量 `QWENOX_MOE_Q4W` 是在哪个文件里读取的？只回答文件路径。",
+   "answer": "src/gpu/parts/30_host_util.inc",
+   "name": "QWENOX_MOE_Q4W",
+   "src": [
+    "src/gpu/parts/30_host_util.inc",
+    101
+   ],
+   "depth": 0.72,
+   "other_files": 0
   },
   {
    "id": "L64K-2-env_def-QWENOX_Q6W_BLOCKS",
@@ -5456,7 +5426,37 @@
     "src/gpu/parts/30_host_util.inc",
     1336
    ],
-   "depth": 0.91,
+   "depth": 0.796,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-2-func_file-extract_reasoning",
+   "hay": "L64K-2",
+   "type": "func_file",
+   "kind": "path",
+   "q": "上面的源码里，函数 `extract_reasoning` 定义在哪个文件？只回答文件路径。",
+   "answer": "src/api/chat_template.cpp",
+   "name": "extract_reasoning",
+   "src": [
+    "src/api/chat_template.cpp",
+    280
+   ],
+   "depth": 0.85,
+   "other_files": 0
+  },
+  {
+   "id": "L64K-2-const_val-kVrSaveRows",
+   "hay": "L64K-2",
+   "type": "const_val",
+   "kind": "num",
+   "q": "上面的源码里，常量 `kVrSaveRows` 的值是多少？只回答数值。",
+   "answer": "9",
+   "name": "kVrSaveRows",
+   "src": [
+    "src/gpu/parts/40_model.inc",
+    7136
+   ],
+   "depth": 0.915,
    "other_files": 0
   },
   {

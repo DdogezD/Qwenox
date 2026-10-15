@@ -176,7 +176,7 @@ def make_hay(rng, hid, L, cand, frags, frags_by_path, ftok, blobs, per_type):
         if n >= budget - 400:
             break
     # 目标段落按深度均匀插入
-    tf = list(used_frags)
+    tf = sorted(used_frags)          # set 的遍历顺序随哈希种子变，先排序再打乱才可复现
     rng.shuffle(tf)
     order = filler[:]
     for j, f in sorted(enumerate(tf), key=lambda x: -x[0]):
@@ -220,7 +220,7 @@ def main():
     frags_by_path = defaultdict(list)
     for f in frags:
         frags_by_path[f[0]].append(f)
-    ftok = {f: len(tk.encode(C.frag_text(blobs, f))) for f in frags}
+    ftok = {f: len(C.encode_plain(tk, C.frag_text(blobs, f))) for f in frags}
     print(f'rev {rev[:10]}  {len(paths)} files, {len(frags)} fragments, '
           f'{sum(ftok.values())} tokens in pool')
     cand = {
@@ -245,7 +245,7 @@ def main():
         for h in range(max(1, args.per_len // (4 * per_type))):
             hid = f'L{L // 1024}K-{h}'
             order, text, qs = make_hay(rng, hid, L, cand, frags, frags_by_path, ftok, blobs, per_type)
-            ntok = len(tk.encode(C.prefix_text(text)))
+            ntok = len(C.prefix_ids(tk, text))
             hays.append(dict(id=hid, L=L, n_tokens=ntok, frags=[list(f) for f in order],
                              sha256=C.sha(text), files=len({f[0] for f in order})))
             questions += qs

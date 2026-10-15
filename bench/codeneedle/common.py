@@ -106,6 +106,32 @@ def suffix_text(question):
             '<|im_start|>assistant\n<think>\n\n</think>\n\n')
 
 
+def encode_plain(tk, text):
+    """纯 BPE，不匹配特殊 token：源码里的 `<|vision_start|>`、`<|im_end|>` 等字面量按普通字符编码，
+    不会变成控制 token（否则引擎会当成图像占位符拒绝，或者把对话结构截断）。"""
+    import unicodedata
+    from qwentok import _split, _B2U
+    ids = []
+    for ptok in _split(unicodedata.normalize('NFC', text)):
+        for t in tk._bpe(''.join(_B2U[b] for b in ptok.encode('utf-8'))):
+            ids.append(tk.vocab[t])
+    return ids
+
+
+def prefix_ids(tk, hay):
+    """<|im_start|>user\\n + 说明 + 长文（长文按普通文本）。"""
+    return tk.encode('<|im_start|>user\n') + encode_plain(tk, INTRO + hay + '\n')
+
+
+def suffix_ids(tk, question):
+    return (encode_plain(tk, question + '\n只输出答案本身，不要解释。') +
+            tk.encode('<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n'))
+
+
+def special_ids(tk):
+    return set(tk.special.values())
+
+
 # ---------------- 判分 ----------------
 # 独立的数字：前后不粘 ASCII 字母/数字/下划线/点（避开 Q6W_BLOCKS 这类名字里的数字），允许 f/u/l 后缀
 _NUM = re.compile(r'(?<![A-Za-z0-9_.])(-?(?:0[xX][0-9a-fA-F]+|\d+(?:\.\d+)?(?:[eE][-+]?\d+)?))[fFuUlL]*'
