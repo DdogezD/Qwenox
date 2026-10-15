@@ -321,6 +321,8 @@ static void configure_runtime(const BenchConfig& config) {
   }
   if (config_int(config, "PLE_URING", 1)) set_env_value("QWENOX_PLE_URING", "1");
   else unset_env_value("QWENOX_PLE_URING");
+  // MOE_A4=1–3：prefill MoE 4-bit 激活位掩码（0/未设 = 关，与引擎侧语义一致）
+  set_if_configured("QWENOX_MOE_A4", "MOE_A4");
   set_if_configured("QWENOX_ROPE_FACTOR", "ROPE_FACTOR");
   set_if_configured("QWENOX_ROPE_ORIGINAL_CTX", "ROPE_ORIGINAL_CTX");
   set_if_configured("QWENOX_ROPE_BETA_FAST", "ROPE_BETA_FAST");
