@@ -192,9 +192,13 @@ static int ple_pump_count() { return g_ple_nrings; }
 // IOCP 批量读：与 PleUring::run 相同语义——n 个 160B 行从文件偏移
 // g_ple_foff + (addrs[i] - table_va) 读入 staging + i*g_ple_rb；任何失败/短读
 // 立即 fatal，不做半途回退。
+// 一个实例 = 一个文件句柄 + 一个 IOCP，完成包按 OVERLAPPED 地址回推槽位，
+// 因此同一实例同一时刻只能有一个读批次：run() 加锁串行；issue()/wait_all()
+// 由调用方保证独占（只给 PLE flight 用，见 g_ple_win_fl）。
 struct PleWin {
   HANDLE fh = INVALID_HANDLE_VALUE;
   HANDLE iocp = nullptr;
+  std::mutex run_mu;
   static constexpr size_t DEPTH = 512;
   std::string path;
 
@@ -231,6 +235,7 @@ struct PleWin {
 
   void run(const uint64_t* addrs, uint8_t* staging, uint64_t table_va,
            size_t n) {
+    std::lock_guard<std::mutex> lk(run_mu);
     // decode 每 token 只读 16 行：槽位数按需收缩，避免每 token 分配 512 槽
     const size_t depth = std::min(DEPTH, n);
     std::vector<OVERLAPPED> ovs(depth);
@@ -314,17 +319,26 @@ struct PleWin {
   }
 };
 
+// 两个读取器，各自独立的句柄与 IOCP：
+//   g_ple_win    同步小批量（decode 每 token 16 行、NOSORT 调试路径），绑定槽的线程调用；
+//   g_ple_win_fl PLE flight（prefill gather：pump 线程 run / 小批 issue+wait_all）。
+// flight 会在 chunk 结束时发起、在后台线程跑到下一个 chunk 的 L0，期间 GPU 可能已
+// 交给另一个槽做 decode。两者共用一个 IOCP 时会互相取走对方的完成包（槽位按
+// OVERLAPPED 地址回推，取错即越界写堆 / 栈上 OVERLAPPED 被提前释放），并发服务下
+// 进程 0xC0000005。flight 同一时刻只有一个（新 flight 前必先 join 旧的），故
+// g_ple_win_fl 天然独占。
 static PleWin g_ple_win;
+static PleWin g_ple_win_fl;
 
 static void ple_uring_open(const char* path) {
   // 名字沿用 Linux 版本；Windows 下建立 IOCP 句柄
-  g_ple_win.setup(path);
+  if (g_ple_win.setup(path)) g_ple_win_fl.setup(path);
 }
 
-static bool ple_uring_ready() { return g_ple_win.ok(); }
+static bool ple_uring_ready() { return g_ple_win.ok() && g_ple_win_fl.ok(); }
 static int ple_pump_count() { return 1; }
-#define PLE_PUMP g_ple_win
-#define PLE_PUMP_I(i) g_ple_win
+#define PLE_PUMP g_ple_win_fl
+#define PLE_PUMP_I(i) g_ple_win_fl
 
 struct PleWinPrefetch {
   struct Buffer {
