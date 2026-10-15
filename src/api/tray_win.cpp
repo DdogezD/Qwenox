@@ -112,8 +112,7 @@ std::wstring g_perf;      // 最近一次 running 时的 SNAP 文本（仅 UI �
 const UINT WM_PROBE_DONE = WM_APP + 2;
 
 constexpr UINT_PTR kTimerStatus = 1;
-constexpr UINT_PTR kTimerPerf = 2;
-constexpr uint64_t kPerfTtlMs = 6000;  // 两个 3s 轮询周期：数据必须会过期
+constexpr uint64_t kPerfTtlMs = 6000;  // 三个 2s 轮询周期：数据必须会过期
 
 enum MenuId : UINT {
     kIdConsole = 1, kIdCopyUrl, kIdEngStart, kIdEngStop,
@@ -127,12 +126,15 @@ std::wstring state_text() {
                               : TR(L"Qwenox · 运行中", L"Qwenox · running");
     if (g_eng.state == "starting")
         return TR(L"Qwenox · 启动中…", L"Qwenox · starting…");
+    const std::wstring busy =
+        g_eng.port_foreign ? TR(L"（引擎端口被占用）", L" (engine port in use)") : L"";
     if (g_eng.state == "exited")
-        return TR(L"Qwenox · 已退出", L"Qwenox · exited");
-    return TR(L"Qwenox · 已停止", L"Qwenox · stopped");
+        return TR(L"Qwenox · 已退出", L"Qwenox · exited") + busy;
+    return TR(L"Qwenox · 已停止", L"Qwenox · stopped") + busy;
 }
 
-// ---- PerfSnap：3s 轮询引擎行协议的 SNAP 动词（移植自 launch_win.cpp）----------
+// ---- PerfSnap：引擎行协议 SNAP 动词的 tooltip 文本（移植自 launch_win.cpp）----
+// SNAP 行由 enginesup::status() 的心跳探测顺带取回（同一条连接，2s 一次）。
 std::wstring perf_count(uint64_t v) {  // 12K 风格缩写
     wchar_t b[24];
     if (v >= 10000) swprintf(b, ARRAYSIZE(b), L"%lluK", (unsigned long long)((v + 500) / 1000));
@@ -140,29 +142,14 @@ std::wstring perf_count(uint64_t v) {  // 12K 风格缩写
     return b;
 }
 
-// 空串 = 查询失败 / 已过期 / idle：tooltip 回归纯状态。
-std::wstring perf_tip() {
-    const auto ep = g_hooks.engine_endpoint();
-    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s == INVALID_SOCKET) return {};
-    const DWORD tv = 500;  // 本机回环，500ms 足够；挡住引擎卡死连累 UI 线程
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof tv);
-    sockaddr_in addr{};
-    engine_net::address(engine_net::connect_host(ep.first), ep.second, &addr);
-    char buf[256];
-    int n = -1;
-    if (connect(s, (sockaddr*)&addr, sizeof addr) == 0 &&
-        send(s, "SNAP\n", 5, 0) == 5)
-        n = recv(s, buf, sizeof buf - 1, 0);
-    closesocket(s);
-    if (n <= 0) return {};
-    buf[n] = '\0';
+// 空串 = 没取到 / 已过期 / idle：tooltip 回归纯状态。
+std::wstring perf_text(const std::string& line) {
+    if (line.empty()) return {};
     // P ts_ms state req pp_toks done total tg_inst tg_avg accept_pct
     unsigned long long ts = 0, req = 0, done = 0, total = 0;
     unsigned st = 0;
     double pp = 0, tg_inst = 0, tg_avg = 0, accept = -1;
-    if (sscanf(buf, "P %llu %u %llu %lf %llu %llu %lf %lf %lf", &ts, &st, &req, &pp,
+    if (sscanf(line.c_str(), "P %llu %u %llu %lf %llu %llu %lf %lf %lf", &ts, &st, &req, &pp,
                &done, &total, &tg_inst, &tg_avg, &accept) != 9)
         return {};
     if (st == 0) return {};
@@ -194,10 +181,10 @@ void tray_update_tip() {
 void tray_balloon(const std::wstring& title, const std::wstring& text);  // 定义在下方
 
 // ---- 状态探测 worker ---------------------------------------------------------
-// UI 线程不做任何 socket 操作：status() 的端口探测（500ms 上限）与 perf_tip()
-// 的 SNAP 查询（阻塞 connect，某些机器环回 RST 被过滤驱动延迟 ~2s）都会卡满
-// 超时。探测放 worker 线程，结果经 WM_PROBE_DONE 回 UI 线程应用（气泡/菜单/
-// 定时器只许在 UI 线程动）。g_eng/g_perf 仅 UI 线程访问；互斥锁只保护
+// UI 线程不做任何 socket 操作：status() 的心跳探测（connect + SNAP 往返，各
+// 500ms 上限）在引擎卡死或环回 RST 被过滤驱动延迟时会卡满超时。探测放 worker
+// 线程，结果经 WM_PROBE_DONE 回 UI 线程应用（气泡/菜单/定时器只许在 UI 线程动）。
+// g_eng/g_perf 仅 UI 线程访问；互斥锁只保护
 // worker → UI 的交接字段。
 
 std::mutex g_probe_mtx;
@@ -224,9 +211,10 @@ void probe_worker() {
         if (g_probe_quit) return;
         lk.unlock();
         const auto ep = g_hooks.engine_endpoint();
-        enginesup::Status eng = enginesup::status(ep.first, ep.second);
+        std::string snap;  // 心跳连接顺带取回的 SNAP 行
+        enginesup::Status eng = enginesup::status(ep.first, ep.second, &snap);
         std::wstring perf;
-        if (eng.state == "running") perf = perf_tip();
+        if (eng.state == "running") perf = perf_text(snap);
         lk.lock();
         g_probe_eng = std::move(eng);
         g_probe_perf = std::move(perf);
@@ -247,15 +235,12 @@ void apply_probe() {
         g_probe_result_ready = false;
     }
     if (g_eng.state == "running" && prev != "running") {
-        SetTimer(g_hwnd, kTimerPerf, 3000, nullptr);
         if (prev == "starting")
             tray_balloon(TR(L"引擎已就绪", L"Engine ready"),
                          to_w(g_base_url + "/v1") + L"\n" +
                              TR(L"双击图标打开控制台，右键查看更多",
                                 L"Double-click the icon to open the console; "
                                 L"right-click for more"));
-    } else if (g_eng.state != "running" && prev == "running") {
-        KillTimer(g_hwnd, kTimerPerf);
     }
     if (g_eng.state == "exited" && (prev == "running" || prev == "starting")) {
         const std::string code = std::to_string(g_eng.exit_code);
@@ -455,7 +440,7 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (msg == WM_TIMER) {
-        probe_kick();  // kTimerStatus(2s) / kTimerPerf(3s) 都只是踢探测 worker
+        probe_kick();  // kTimerStatus(2s)：只踢探测 worker
         return 0;
     }
     if (msg == WM_PROBE_DONE) {
@@ -508,7 +493,7 @@ int tray_run(http::Server& srv, const TrayHooks& hooks) {
     // HTTP 服务在 worker 线程跑，主线程跑消息循环
     std::thread worker([&srv] { srv.run(); });
     worker.detach();
-    std::thread(probe_worker).detach();  // 引擎状态/SNAP 探测（socket 操作）
+    std::thread(probe_worker).detach();  // 引擎心跳探测（状态 + SNAP，socket 操作）
 
     tray_add();
     probe_kick();  // 初始状态（可能有外部引擎已在听）

@@ -31,54 +31,65 @@ Status g_st;
 bool g_stopping = false;  // stop() 主动停止：监管线程把退出记为 stopped 而非 exited
 #endif
 
-// 能连上 host:port 说明对端已在 LISTEN（跨平台探测，Linux 也用于 external 判定）。
-// 带 500ms 超时：阻塞 connect 对黑洞地址（防火墙丢包的远程 IP）会挂 ~20s，
-// 而 status() 被托盘 UI 线程每 2s 周期调用，不能忍受这种停顿。
-bool port_listening(const std::string& host, int port) {
+// 探测的两段超时（connect、读回复）各 500ms：阻塞 connect 对黑洞地址（防火墙
+// 丢包的远程 IP）会挂 ~20s，某些机器环回 RST 被过滤驱动延迟 ~2s；status() 由托盘
+// 探测 worker 每 2s 调用、控制台接口也会调，最坏 ~1s 一次。
+constexpr int kProbeMs = 500;
+
 #ifdef _WIN32
-    const SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s == INVALID_SOCKET) return false;
+using sock_t = SOCKET;
+constexpr sock_t kBadSock = INVALID_SOCKET;
 #else
-    const int s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s < 0) return false;
+using sock_t = int;
+constexpr sock_t kBadSock = -1;
 #endif
-    sockaddr_in addr{};
-    if (!engine_net::address(engine_net::connect_host(host), port, &addr)) {
-#ifdef _WIN32
-        closesocket(s);
+#ifdef MSG_NOSIGNAL
+constexpr int kNoSigpipe = MSG_NOSIGNAL;  // 对端先关时 send 不触发 SIGPIPE
 #else
-        close(s);
+constexpr int kNoSigpipe = 0;
 #endif
-        return false;
-    }
-#ifdef _WIN32
-    u_long nb = 1;
-    ioctlsocket(s, FIONBIO, &nb);
-    bool ok = connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == 0;
-    if (!ok && WSAGetLastError() == WSAEWOULDBLOCK) {
-#else
-    const int fl = fcntl(s, F_GETFL, 0);
-    fcntl(s, F_SETFL, fl | O_NONBLOCK);
-    bool ok = connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == 0;
-    if (!ok && errno == EINPROGRESS) {
-#endif
-        fd_set wfds;
-        FD_ZERO(&wfds);
-        FD_SET(s, &wfds);
-        timeval tv{0, 500 * 1000};
-        if (select(static_cast<int>(s) + 1, nullptr, &wfds, nullptr, &tv) > 0) {
-            int soerr = 0;
-            socklen_t sl = sizeof soerr;
-            getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soerr), &sl);
-            ok = soerr == 0;
-        }
-    }
+
+void close_sock(sock_t s) {
 #ifdef _WIN32
     closesocket(s);
 #else
     close(s);
 #endif
-    return ok;
+}
+
+void set_nonblocking(sock_t s) {
+#ifdef _WIN32
+    u_long nb = 1;
+    ioctlsocket(s, FIONBIO, &nb);
+#else
+    fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
+#endif
+}
+
+bool connect_pending() {
+#ifdef _WIN32
+    return WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+    return errno == EINPROGRESS;
+#endif
+}
+
+bool would_block() {
+#ifdef _WIN32
+    return WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+#endif
+}
+
+// 等 s 可写（connect 完成）或可读，最多 ms 毫秒。
+bool wait_sock(sock_t s, bool for_write, int ms) {
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(s, &fds);
+    timeval tv{ms / 1000, (ms % 1000) * 1000};
+    return select(static_cast<int>(s) + 1, for_write ? nullptr : &fds,
+                  for_write ? &fds : nullptr, nullptr, &tv) > 0;
 }
 
 #ifdef _WIN32
@@ -132,7 +143,7 @@ DWORD WINAPI tee_thread(LPVOID param) {
     return 0;
 }
 
-// 监管线程：starting →（端口在听）→ running →（进程退出）→ exited/stopped；
+// 监管线程：starting →（心跳应答）→ running →（进程退出）→ exited/stopped；
 // starting 超过 START_TIMEOUT 秒则杀掉并记 exited。
 DWORD WINAPI monitor_thread(LPVOID) {
     long timeout = 1800;
@@ -144,7 +155,7 @@ DWORD WINAPI monitor_thread(LPVOID) {
     const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(timeout) * 1000;
     for (;;) {
         if (WaitForSingleObject(g_proc, 0) == WAIT_OBJECT_0) break;  // 提前退出
-        if (port_listening(g_host, g_port)) {
+        if (probe(g_host, g_port) == Probe::alive) {
             std::lock_guard<std::mutex> lk(g_mtx);
             if (g_st.state == "starting") g_st.state = "running";
             break;
@@ -185,19 +196,79 @@ bool supported() {
 #endif
 }
 
-Status status(const std::string& host, int port) {
+Probe probe(const std::string& host, int port, std::string* snap) {
+    if (snap) snap->clear();
+    const sock_t s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == kBadSock) return Probe::down;
+    sockaddr_in addr{};
+    if (!engine_net::address(engine_net::connect_host(host), port, &addr)) {
+        close_sock(s);
+        return Probe::down;
+    }
+    set_nonblocking(s);
+    bool ok = connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == 0;
+    if (!ok && connect_pending() && wait_sock(s, true, kProbeMs)) {
+        int soerr = 0;
+        socklen_t sl = sizeof soerr;
+        getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soerr), &sl);
+        ok = soerr == 0;
+    }
+    if (!ok) {
+        close_sock(s);
+        return Probe::down;
+    }
+    // 已连上：从这里起任何失败（发不出、超时、对端关闭、回复不对）都算 foreign
+    std::string line;
+    bool got = false;
+    if (send(s, "SNAP\n", 5, kNoSigpipe) == 5) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kProbeMs);
+        char buf[256];
+        while (line.size() < 1024) {
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  deadline - std::chrono::steady_clock::now()).count();
+            if (left <= 0 || !wait_sock(s, false, static_cast<int>(left))) break;
+            const int n = static_cast<int>(recv(s, buf, sizeof buf, 0));
+            if (n < 0 && would_block()) continue;
+            if (n <= 0) break;
+            line.append(buf, static_cast<size_t>(n));
+            const size_t nl = line.find('\n');
+            if (nl != std::string::npos) {
+                line.resize(nl);
+                got = true;
+                break;
+            }
+        }
+    }
+    close_sock(s);
+    // SNAP 的应答格式：P ts_ms state req pp_toks done total tg_inst tg_avg accept_pct
+    if (!got || line.compare(0, 2, "P ") != 0) return Probe::foreign;
+    if (snap) *snap = line;
+    return Probe::alive;
+}
+
+Status status(const std::string& host, int port, std::string* snap) {
+    if (snap) snap->clear();
     Status s;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
         s = g_st;  // 只拷贝快照：端口探测在锁外做（connect 可能慢，不能拿着锁）
     }
     if (s.state == "stopped" || s.state == "exited") {
-        if (port_listening(host, port)) {
-            // 端口在听但不是本进程拉起的：外部引擎（start_win.exe / 脚本）
+        const Probe p = probe(host, port, snap);
+        if (p == Probe::alive) {
+            // 引擎在应答但不是本进程拉起的：外部引擎（start_win.exe / 脚本）
             s.state = "running";
             s.external = true;
             s.pid = 0;
+        } else if (p == Probe::foreign) {
+            s.port_foreign = true;
+            if (!s.detail.empty()) s.detail += "; ";
+            s.detail += "engine port " + std::to_string(port) +
+                        " is in use but does not answer the engine protocol";
         }
+    } else if (s.state == "running" && snap) {
+        // 本进程拉起的引擎：状态由监管线程判定，这里只顺带取 SNAP（失败留空串）
+        probe(host, port, snap);
     }
     return s;
 }

@@ -16,13 +16,24 @@ struct Status {
     unsigned long exit_code = 0;    // state == exited 时有效
     std::string log;                // 引擎日志路径
     bool external = false;          // 端口在听但不是本进程拉起的（如 start_win.exe）
-    std::string detail;             // 附加说明（启动超时等）
+    std::string detail;             // 附加说明（启动超时、端口被占用等）
+    bool port_foreign = false;      // 未运行，但引擎端口被不说引擎协议的程序占着
 };
 
 bool supported();  // 仅 Windows 为 true
 
+// 引擎存活探测（心跳）：connect（500ms 上限）→ 发 "SNAP\n" → 500ms 内读回一行。
+//   alive   回的是 "P ..."：对端确实是 Qwenox 引擎
+//   foreign 端口能连上，但没按引擎协议应答（别的程序占着端口 / 引擎卡住或尚未进入 accept 循环）
+//   down    连不上
+// SNAP 是引擎认得的"安静"动词：这种连接在引擎日志里不留 connected/disconnected。
+// snap 非空时带回 SNAP 行（托盘 tooltip 的性能数据），一次连接两用。
+enum class Probe { down, foreign, alive };
+Probe probe(const std::string& host, int port, std::string* snap = nullptr);
+
 // host/port 是 ENGINE_HOST/ENGINE_PORT 的当前有效值（探测外部引擎用）。
-Status status(const std::string& host, int port);
+// snap 非空且引擎在运行时，顺带取回 SNAP 行（同一条探测连接；取不到为空串）。
+Status status(const std::string& host, int port, std::string* snap = nullptr);
 
 // root 是 service.conf 所在目录：引擎 exe 为 <root>/build/qwenox-engine-win.exe，
 // cwd 与 logs\ 都以 root 为基准。已在运行/启动中返回 false。

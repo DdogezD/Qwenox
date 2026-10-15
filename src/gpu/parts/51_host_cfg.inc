@@ -3523,11 +3523,24 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
   std::string line;
   bool alive = true;
   int bad_lines = 0;  // unrecognized lines seen on this connection
+  // Connection log policy: the tray/console liveness probe (one SNAP or PING
+  // per connection, every 2 s) stays silent. "connected" is printed when the
+  // first other verb arrives (or the first unrecognized line), and only then
+  // is the matching "disconnected" printed. A connection that closes without
+  // sending any line at all is logged too: no internal client does that, so
+  // it points at a broken client or a foreign scanner.
+  bool announced = false, any_line = false;
   while (alive && lb.readline(line)) {
     if (line.empty()) continue;
     std::istringstream ss(line);
     std::string verb;
     ss >> verb;
+    any_line = true;
+    if (!announced && verb != "PING" && verb != "SNAP") {
+      announced = true;
+      fprintf(stderr, "%s serve: conn %llu: client connected (first verb %.16s)\n",
+              log_ts(), (unsigned long long)c.id, verb.c_str());
+    }
     if (verb == "PING") {
       alive = c.send("PONG\n");
     } else if (verb == "INFO") {
@@ -3723,7 +3736,12 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
       if (s.owner == c.id) s.owner = 0;
   }
   sock_close(cfd);
-  fprintf(stderr, "%s serve: client disconnected\n", log_ts());
+  if (announced)
+    fprintf(stderr, "%s serve: conn %llu: client disconnected\n", log_ts(),
+            (unsigned long long)c.id);
+  else if (!any_line)
+    fprintf(stderr, "%s serve: conn %llu: client connected and closed without "
+            "sending anything\n", log_ts(), (unsigned long long)c.id);
 }
 
 static int run(GpuModel& m, const std::string& host, int port) {
@@ -3828,7 +3846,7 @@ static int run(GpuModel& m, const std::string& host, int port) {
     sockfd_t cfd = accept(lfd, nullptr, nullptr);
     if (cfd < 0) continue;
     setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof one);
-    fprintf(stderr, "%s serve: client connected\n", log_ts());
+    // "client connected" is logged by conn_main once it has seen a verb
     std::thread(conn_main, std::ref(m), cfd, std::cref(kvs)).detach();
   }
   return 0;
