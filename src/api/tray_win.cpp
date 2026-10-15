@@ -27,6 +27,7 @@ TrayHooks g_hooks;
 std::string g_root;       // 项目根（main 已把 CWD 切到 conf 所在目录）
 std::string g_base_url;   // 本机控制台地址
 bool g_lang_en = false;
+bool g_notify = true;     // 系统提示（气泡/toast）总开关，service.conf 可关
 
 #define TR(zh, en) (g_lang_en ? (en) : (zh))
 
@@ -53,23 +54,32 @@ void shell_open(const std::string& target) {
                       g_root.c_str(), SW_SHOWNORMAL);
 }
 
-// 界面语言：service.conf 的 "# start_win: lang=" 标记 > UI_LANG > 系统 UI 语言。
-void lang_resolve() {
+// service.conf 注释标记（"# start_win: xxx="）取值，行内前后空白剔除，缺失空串。
+std::string conf_marker(const std::string& text, const char* marker) {
+    const size_t p = text.find(marker);
+    if (p == std::string::npos) return {};
+    size_t b = p + strlen(marker);
+    size_t e = text.find_first_of("\r\n", b);
+    std::string v = text.substr(b, e == std::string::npos ? e : e - b);
+    const size_t a = v.find_first_not_of(" \t");
+    const size_t z = v.find_last_not_of(" \t");
+    return a == std::string::npos ? "" : v.substr(a, z - a + 1);
+}
+
+// 托盘界面偏好（启动时读一次，改配置须重启托盘生效）：
+// 语言："# start_win: lang=" 标记 > UI_LANG > 系统 UI 语言；
+// 系统提示："# start_win: notify=" off/0 = 全部气泡静默，缺失或其余值 = 开启。
+void prefs_resolve() {
     std::string text;
+    bool lang_set = false;
     if (svcconf::read_text_file(g_root + "\\service.conf", &text)) {
-        const char* marker = "# start_win: lang=";
-        const size_t p = text.find(marker);
-        if (p != std::string::npos) {
-            size_t b = p + strlen(marker);
-            size_t e = text.find_first_of("\r\n", b);
-            std::string v = text.substr(b, e == std::string::npos ? e : e - b);
-            const size_t a = v.find_first_not_of(" \t");
-            const size_t z = v.find_last_not_of(" \t");
-            v = a == std::string::npos ? "" : v.substr(a, z - a + 1);
-            if (v == "en") return void(g_lang_en = true);
-            if (v == "zh") return void(g_lang_en = false);
-        }
+        const std::string lang = conf_marker(text, "# start_win: lang=");
+        if (lang == "en") g_lang_en = true, lang_set = true;
+        else if (lang == "zh") g_lang_en = false, lang_set = true;
+        const std::string notify = conf_marker(text, "# start_win: notify=");
+        g_notify = notify != "off" && notify != "0";
     }
+    if (lang_set) return;
     if (const char* e = getenv("UI_LANG")) {
         if (_stricmp(e, "en") == 0) return void(g_lang_en = true);
         if (_stricmp(e, "zh") == 0) return void(g_lang_en = false);
@@ -115,7 +125,7 @@ constexpr UINT_PTR kTimerStatus = 1;
 constexpr uint64_t kPerfTtlMs = 6000;  // 三个 2s 轮询周期：数据必须会过期
 
 enum MenuId : UINT {
-    kIdConsole = 1, kIdCopyUrl, kIdAutoStart, kIdEngStart, kIdEngStop,
+    kIdConsole = 1, kIdCopyUrl, kIdAutoStart, kIdNotify, kIdEngStart, kIdEngStop,
     kIdEngineLog, kIdApiLog, kIdLogDir, kIdQuit
 };
 
@@ -339,7 +349,7 @@ std::string autostart_set(bool on) {  // 空串 = 成功，否则为错误描述
 }
 
 void tray_balloon(const std::wstring& title, const std::wstring& text) {
-    if (!g_tray_added) return;
+    if (!g_notify || !g_tray_added) return;  // 单点闸门：关闭时所有气泡静默
     g_nid.uFlags = NIF_INFO;
     lstrcpynW(g_nid.szInfoTitle, title.c_str(), ARRAYSIZE(g_nid.szInfoTitle));
     lstrcpynW(g_nid.szInfo, text.c_str(), ARRAYSIZE(g_nid.szInfo));
@@ -421,6 +431,24 @@ void on_menu(UINT id) {
                                 L"The tray will start automatically at next login."));
             break;
         }
+        case kIdNotify: {
+            // 勾选态 ↔ service.conf "# start_win: notify="，即时生效并写回
+            // （save_conf 自带 .bak 备份）；关闭时的"静默"本身就是反馈。
+            const bool want = !g_notify;
+            std::string err;
+            if (!svcconf::save_conf(g_root + "\\service.conf", {}, &err,
+                                    "# start_win: notify=", want ? "on" : "off"))
+                msgbox(TR("写入 service.conf 失败：", "Failed to write service.conf: ") +
+                           err,
+                       MB_OK | MB_ICONERROR);
+            else {
+                g_notify = want;
+                if (want)
+                    tray_balloon(TR(L"系统提示已开启", L"Notifications enabled"),
+                                 TR(L"已写回 service.conf。", L"Saved to service.conf."));
+            }
+            break;
+        }
         case kIdEngStart: engine_start(); break;
         case kIdEngStop: engine_stop(); break;
         case kIdEngineLog:
@@ -454,6 +482,8 @@ void show_menu() {
     AppendMenuW(m, MF_STRING, kIdCopyUrl, TR(L"复制 API 地址", L"Copy API URL"));
     AppendMenuW(m, MF_STRING | (autostart_get() ? MF_CHECKED : 0), kIdAutoStart,
                 TR(L"开机自启", L"Launch on startup"));
+    AppendMenuW(m, MF_STRING | (g_notify ? MF_CHECKED : 0), kIdNotify,
+                TR(L"系统提示", L"Notifications"));
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     const bool can_start = g_eng.state == "stopped" || g_eng.state == "exited";
     const bool can_stop = (g_eng.state == "running" && !g_eng.external) ||
@@ -517,7 +547,7 @@ int tray_run(http::Server& srv, const TrayHooks& hooks) {
     char cwd[MAX_PATH];
     GetCurrentDirectoryA(MAX_PATH, cwd);
     g_root = cwd;
-    lang_resolve();
+    prefs_resolve();
     // Win10+ 气泡被转成 toast，通知标题/设置页里的"应用名"取自进程
     // AppUserModelID，不注册就显示 exe 文件名（qwenox-win.exe）。
     // 注册 HKCU\...\AppUserModelIDs\Qwenox + 进程 AUMID 后显示"Qwenox"。
