@@ -278,10 +278,6 @@ bool EngineClient::send_ping_pong_c(const char* verb, std::string* line, std::st
             *line = l;
             return true;
         }
-        if (verb[0] == 'C' && !l.empty() && l[0] == 'C') {
-            *line = l;
-            return true;
-        }
         if (verb[0] == 'V' && !l.empty() && l[0] == 'V') {
             *line = l;
             return true;
@@ -297,10 +293,6 @@ bool EngineClient::info(std::string* line, std::string* err) {
 
 bool EngineClient::memory(std::string* line, std::string* err) {
     return send_ping_pong_c("MEM", line, err);
-}
-
-bool EngineClient::cstat(std::string* line, std::string* err) {
-    return send_ping_pong_c("CSTAT", line, err);
 }
 
 bool EngineClient::viz(const std::string& args, std::string* line, std::string* err) {

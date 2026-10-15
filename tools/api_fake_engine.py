@@ -91,9 +91,6 @@ def handle(conn):
             if line == "MEM":
                 send_line(conn, "M 1 100 120 200 10 20 310 900 1000 100 400 50")
                 continue
-            if line == "CSTAT":
-                send_line(conn, "C fake")
-                continue
             if line == "TESTSTATE":
                 with TRACE_LOCK:
                     send_line(conn, json.dumps(TRACE))

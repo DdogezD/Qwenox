@@ -43,7 +43,6 @@ def call(method, path, payload=None, raw=False, limit=4000):
 
 
 call("GET", "/v1/models")
-call("GET", "/cache")
 call("POST", "/v1/completions",
      {"model": MID, "prompt": "The capital of France is", "max_tokens": 6,
       "temperature": 0})

@@ -103,7 +103,7 @@ std::atomic<long long> g_req_seq{0};
 // one KV pool; 1 = batch-1) and takes one GEN per connection.  Up to g_slots
 // generations are in flight here, each on its own pooled engine connection;
 // the rest wait in this front-end queue until a slot is released.  Control
-// queries (MEM/CSTAT) use g_ctl and never wait for a generation slot.
+// queries (MEM/VIZ) use g_ctl and never wait for a generation slot.
 int g_slots = 1;
 int g_kv_pool = 0;  // shared KV pool tokens from INFO (0 = old engine, unknown)
 std::vector<std::unique_ptr<qwenox::EngineClient>> g_pool;  // g_slots clients
@@ -1865,24 +1865,6 @@ void handle_models(const http::Request&, http::Response* r, http::Stream*) {
     r->body = json_py::dumps(j, /*spaced=*/false);
 }
 
-void handle_cache(const http::Request&, http::Response* r, http::Stream*) {
-    std::string line, err;
-    {
-        std::lock_guard<std::mutex> lk(g_conn_mtx);
-        if (!g_ctl.connected()) g_ctl.connect(g_cfg.engine_addr, &err);
-    }
-    if (!g_ctl.cstat(&line, &err)) {
-        // The live service surfaces an engine-side probe failure this way.
-        r->status = 500;
-        r->body = http::error_json("internal error: TimeoutError: ", "server_error",
-                                   "server_error");
-        return;
-    }
-    json j;
-    j["engine_cstat"] = line;
-    r->body = json_py::dumps(j, /*spaced=*/false);
-}
-
 void handle_memory(const http::Request&, http::Response* r, http::Stream*) {
     std::string line, err;
     {
@@ -3349,7 +3331,7 @@ bool probe_engine() {
     // instead of blocking the listen socket for minutes; the caller then
     // retries in reprobe_engine_loop so the pool still reaches full width
     // once the engine is up. The control connection keeps the short
-    // timeouts: MEM/CSTAT answer at once. The connect itself is bounded
+    // timeouts: MEM answers at once. The connect itself is bounded
     // too: on some machines a refused loopback connect takes ~2s to come
     // back (filter driver), delaying startup.
     g_ctl.set_timeouts(5.0, 5.0);
@@ -3664,7 +3646,6 @@ int main(int argc, char** argv) {
     srv.on("GET", "/memory", handle_memory);
     srv.on("GET", "/power", handle_power);
     srv.on("GET", "/viz", handle_viz);
-    srv.on("GET", "/cache", handle_cache);
     srv.on("GET", "/reqstat/summary", handle_reqstat_summary);
     srv.on("GET", "/reqstat/tail", handle_reqstat_tail);
     srv.on("GET", "/reqstat/page", handle_reqstat_page);

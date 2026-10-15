@@ -98,8 +98,6 @@ class EngineClient {
     bool info(std::string* line, std::string* err);
     // Send MEM and return the raw `M ...` engine-memory line.
     bool memory(std::string* line, std::string* err);
-    // Send CSTAT and return the raw `C ...` line.
-    bool cstat(std::string* line, std::string* err);
     // Send `VIZ[ args]` and return the raw `V {json}` line (QWENOX_VIZ taps).
     bool viz(const std::string& args, std::string* line, std::string* err);
 
