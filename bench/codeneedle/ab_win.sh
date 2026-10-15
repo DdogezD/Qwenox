@@ -38,12 +38,15 @@ export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
 FAILS=()
 fail() { FAILS+=("$1"); echo "  FAIL: $1"; }
 stamp() { echo; echo "=== [$(date +%H:%M:%S)] $*"; }
+# logq FILE PATTERN: does the engine log contain PATTERN? grep reads to EOF (no -q): with
+# pipefail, an early-exiting grep -q SIGPIPEs tr and the pipeline reports "not found".
+logq() { tr '\r' '\n' < "$1" | grep -a -- "$2" > /dev/null; }
 
 [[ -f "$BIN" ]] || { echo "missing engine: $BIN"; echo "CODENEEDLE FAIL"; exit 1; }
 REV=$($PY -c "import json;print(json.load(open('bench/codeneedle/set.json',encoding='utf-8'))['rev'])")
 git cat-file -e "$REV^{commit}" 2> /dev/null || {
   echo "question set needs commit ${REV:0:10} (git fetch first)"; echo "CODENEEDLE FAIL"; exit 1; }
-if command -v tasklist > /dev/null && tasklist 2>/dev/null | grep -qi "qwenox"; then
+if command -v tasklist > /dev/null && tasklist 2>/dev/null | grep -i "qwenox" > /dev/null; then
   echo "a qwenox process is running - stop the service first (the test needs the whole GPU)"
   echo "CODENEEDLE FAIL"; exit 1
 fi
@@ -78,7 +81,7 @@ serve() {  # serve TAG A4
   ENG_PID=$!
   local t0=$(date +%s)
   while :; do
-    if tr '\r' '\n' < "$log" | grep -q "serve: listening"; then
+    if logq "$log" "serve: listening"; then
       echo "  [$tag] listening after $(( $(date +%s) - t0 ))s"; return 0
     fi
     if ! kill -0 $ENG_PID 2>/dev/null; then
@@ -99,7 +102,7 @@ trap stop_eng EXIT
 
 engine_errors() {
   local e
-  e=$(tr '\r' '\n' < $L/eng_$1.log | grep -E "hipError|HIP error|Exception Code|FATAL|abort|KV pool exhausted|cannot fit|rejected" | head -3)
+  e=$(tr '\r' '\n' < $L/eng_$1.log | grep -aE "hipError|HIP error|Exception Code|FATAL|abort|KV pool exhausted|cannot fit|rejected" | head -3)
   if [[ -n "$e" ]]; then echo "$e" | sed 's/^/  engine log: /'; fail "engine error in $1"; fi
 }
 run() {  # run TAG
@@ -110,7 +113,7 @@ run() {  # run TAG
 stamp "1/3 MOE_A4 unset (reference)"
 if serve a4off 0; then
   run cn_a4off; engine_errors a4off
-  tr '\r' '\n' < $L/eng_a4off.log | grep -q "W4A4 iu4 on" && fail "A4 path ran with the switch off"
+  logq $L/eng_a4off.log "W4A4 iu4 on" && fail "A4 path ran with the switch off"
 else
   fail "engine (A4 off) did not start"
 fi
@@ -119,8 +122,8 @@ stop_eng
 stamp "2/3 MOE_A4=$A4"
 if serve a4on "$A4"; then
   run cn_a4on; engine_errors a4on
-  tr '\r' '\n' < $L/eng_a4on.log | grep -m1 "QWENOX_MOE_A4" | sed 's/^/  engine log: /'
-  tr '\r' '\n' < $L/eng_a4on.log | grep -q "W4A4 iu4 on" || fail "A4 path never ran (no log line)"
+  tr '\r' '\n' < $L/eng_a4on.log | grep -a "QWENOX_MOE_A4" | head -1 | sed 's/^/  engine log: /'
+  logq $L/eng_a4on.log "W4A4 iu4 on" || fail "A4 path never ran (no log line)"
 else
   fail "engine (A4=$A4) did not start"
 fi
