@@ -129,12 +129,14 @@ int main(int argc, char** argv) {
     out << "// static_gen.inc —— 由 tools/gen_static_inc.cpp 生成,请勿手工编辑!\n"
            "// 来源目录 src/api/static/,HTML 文件路由去 .html 后缀(index 对应根路径)。\n"
            "// main.cpp include 本文件后按 kStaticAssets 逐条注册 GET 路由。\n"
+           "// file 是原始文件名：WEB_DIR（默认项目根 web/）下有同名文件时优先返回磁盘版。\n"
            "#ifndef QWENOX_STATIC_GEN_INC_\n"
            "#define QWENOX_STATIC_GEN_INC_\n"
            "#include <cstddef>\n"
            "\n"
            "struct StaticAsset {\n"
            "    const char* url;\n"
+           "    const char* file;\n"
            "    const char* mime;\n"
            "    const unsigned char* data;\n"
            "    std::size_t len;\n"
@@ -157,7 +159,7 @@ int main(int argc, char** argv) {
     }
     out << "\n\nstatic const StaticAsset kStaticAssets[] = {\n";
     for (const Asset& a : assets)
-        out << "    {\"" << a.url << "\", \"" << a.mime << "\", " << a.symbol << ", "
+        out << "    {\"" << a.url << "\", \"" << a.file << "\", \"" << a.mime << "\", " << a.symbol << ", "
             << a.data.size() << "},\n";
     out << "};\n"
            "#endif  // QWENOX_STATIC_GEN_INC_\n";

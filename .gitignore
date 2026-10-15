@@ -3,6 +3,7 @@ src/api/static_gen.inc
 logs/
 models/
 dev-docs/
+web/
 *.tmp.*
 start_win.exe
 settings_win.exe

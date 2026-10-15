@@ -2336,14 +2336,54 @@ void handle_reqstat_page(const http::Request& q, http::Response* r,
 // GET 静态页 —— src/api/static/ 下的文件由构建时工具(tools/gen_static_inc.cpp)
 // 嵌入 static_gen.inc，路由在 kStaticAssets，启动时逐条注册 GET。
 // dashboard 页面加载后用同源 fetch 轮询 /health 与 /memory，这里只负责回内容。
+//
+// 磁盘覆盖：g_web_dir（service.conf/环境变量 WEB_DIR，默认 conf 所在目录的 web/）
+// 下有同名文件时，每次请求现读现回，改页面只需刷新浏览器、不用重编 API。只按
+// kStaticAssets 里的固定文件名查找，URL 不参与拼路径；读不到就回内置版本。
 #include "static_gen.inc"
+
+std::string g_web_dir;  // 静态页磁盘覆盖目录；空 = 只用内置
+
+static std::string web_override_path(const StaticAsset& a) { return g_web_dir + "/" + a.file; }
 
 http::Server::Handler make_static_handler(const StaticAsset& asset) {
     return [asset](const http::Request&, http::Response* r, http::Stream*) {
         r->content_type = asset.mime;
         r->set("Cache-Control", "no-store");
+        if (!g_web_dir.empty()) {
+            std::string body;
+            if (svcconf::read_text_file(web_override_path(asset), &body)) {
+                r->set("X-Qwenox-Static", "disk");
+                r->body = std::move(body);
+                return;
+            }
+        }
         r->body.assign(reinterpret_cast<const char*>(asset.data), asset.len);
     };
+}
+
+// 启动时解析 WEB_DIR 并列出当前被磁盘版覆盖的页面（之后增删文件不必重启，
+// 只是这份清单不再更新）。相对路径以 conf 所在目录为基准。
+static void init_web_dir() {
+    const std::string conf_v = svcconf::cfg(g_svc_conf, "WEB_DIR", "");
+    std::string dir = conf_v.empty() ? g_conf_root + "/web" : conf_v;
+    const bool absolute = dir[0] == '/' || dir[0] == '\\' || (dir.size() > 1 && dir[1] == ':');
+    if (!absolute) dir = g_conf_root + "/" + dir;
+    while (dir.size() > 1 && (dir.back() == '/' || dir.back() == '\\')) dir.pop_back();
+    std::error_code ec;
+    if (!std::filesystem::is_directory(std::filesystem::path(dir), ec)) {
+        // 默认的 web/ 不存在是常态，不提示；显式配了却找不到才警告
+        if (!conf_v.empty())
+            fprintf(stderr, "[warn] WEB_DIR=%s 不是目录，静态页只用内置版本\n", dir.c_str());
+        g_web_dir = dir;  // 仍保留：之后建了目录、放进文件也能生效
+        return;
+    }
+    g_web_dir = dir;
+    std::string list;
+    for (const StaticAsset& a : kStaticAssets)
+        if (std::filesystem::is_regular_file(std::filesystem::path(web_override_path(a)), ec)) list += std::string(" ") + a.file;
+    fprintf(stderr, "qwenox-api: web: %s 下的同名文件优先于内置页面%s%s\n", dir.c_str(),
+            list.empty() ? "（当前没有）" : "，当前覆盖:", list.c_str());
 }
 
 void handle_health(const http::Request&, http::Response* r, http::Stream*) {
@@ -4583,6 +4623,7 @@ int main(int argc, char** argv) {
     // 双击运行时给用户一个可直接点的入口
     fprintf(stderr, "qwenox-api: console: http://127.0.0.1:%d/\n", srv.port());
 
+    init_web_dir();
     for (const StaticAsset& a : kStaticAssets) srv.on("GET", a.url, make_static_handler(a));
     srv.on("GET", "/v1/models", handle_models);
     srv.on("GET", "/health", handle_health);

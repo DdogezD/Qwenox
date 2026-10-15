@@ -115,6 +115,29 @@ The engine uses `tools/run_capped.sh`, with a default memory cap of 86 GiB and a
 If there is no progress in logs, engine I/O, or GPU GTT allocation for 60 seconds during loading, startup stops; the maximum
 startup time is 360 seconds. Exit only cleans up the processes started this time.
 
+### Custom web pages (no rebuild)
+
+The console and visualization pages are embedded into the API at build time; the
+sources are in `src/api/static/`: `index.html`, `dashboard.html`, `app.js`,
+`skin-cassette.css`, `skin-punch.css`, `viz-live.html`, `viz-model.html`. When
+`web/` in the project root (the directory holding `service.conf`) contains a file
+with the same name, the API serves that file instead. It is read on every request,
+so an edit takes effect on browser refresh, with no rebuild or restart.
+
+1. Create `web/`, copy the file you want to change from `src/api/static/` into it, and edit it.
+   Only the file names above are recognized; other files are not served.
+2. Refresh the browser. The response header `X-Qwenox-Static: disk` means the file on disk was used.
+3. To go back to the built-in version, delete the file from `web/`.
+
+`web/` is git-ignored, so `git pull` never conflicts with your edits. The trade-off:
+after an upgrade, old files in `web/` still replace the new built-in pages, and new
+features may be missing or broken on those pages. When `web/` exists, the API startup
+log lists the overridden files (`qwenox-api: web: ...`); after upgrading, merge them
+with the new `src/api/static/` or delete them.
+
+`WEB_DIR` in `service.conf` selects another directory (relative paths are based on
+the project root). For development, `WEB_DIR=src/api/static` makes source edits live.
+
 ### Anthropic Messages API
 
 Besides the OpenAI endpoints, the API serves the Anthropic protocol:

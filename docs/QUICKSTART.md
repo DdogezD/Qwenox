@@ -149,6 +149,26 @@ curl -X POST http://127.0.0.1:8731/admin/overrides -H 'Content-Type: application
 加载阶段持续 60 秒没有日志、引擎 I/O 或 GPU GTT 分配进展会停止;最长
 启动时间 360 秒。退出只清理本次启动的进程。
 
+### 自定义网页（不用重编）
+
+控制台和可视化页面编译时嵌入 API，源文件在 `src/api/static/`：`index.html`、
+`dashboard.html`、`app.js`、`skin-cassette.css`、`skin-punch.css`、`viz-live.html`、
+`viz-model.html`。项目根（`service.conf` 所在目录）的 `web/` 里有同名文件时，API
+返回这份文件。每次请求都现读，改完刷新浏览器就生效，不用重编，也不用重启。
+
+1. 新建 `web/`，把要改的文件从 `src/api/static/` 拷进去再改。只认上面这几个文件名，
+   放别的文件不会被提供。
+2. 刷新浏览器。响应头带 `X-Qwenox-Static: disk` 说明用的是磁盘上的文件。
+3. 想恢复内置版本，删掉 `web/` 里对应的文件即可。
+
+`web/` 不入库，`git pull` 不会和自己的修改冲突。代价是升级后 `web/` 里的旧文件
+仍会顶替新版内置页面，新功能可能在页面上看不到或出错。API 启动时如果 `web/` 存在，
+日志会列出当前被覆盖的文件（`qwenox-api: web: ... 当前覆盖: ...`），升级后对照新版
+`src/api/static/` 合并或删掉。
+
+`service.conf` 的 `WEB_DIR` 可以换目录，相对路径以项目根为基准。开发时设
+`WEB_DIR=src/api/static`，改源码即生效。
+
 ### Anthropic Messages 接口
 
 除 OpenAI 接口外,API 还提供 Anthropic 协议:`POST /v1/messages` 和
