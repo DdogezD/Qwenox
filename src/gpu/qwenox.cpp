@@ -164,6 +164,7 @@
 #include "parts/26_kernels_moe_gguf.inc"
 #include "parts/27_kernels_moe_lut.inc"
 #include "parts/28_kernels_hgn_v2.inc"
+#include "parts/29_npu.inc"
 #include "parts/30_host_util.inc"
 #include "parts/31_vision.inc"
 #include "parts/40_model.inc"

@@ -5563,7 +5563,21 @@ struct GpuModel {
       }
       static const bool sg_fuse = !env_zero("QWENOX_MOE_SG_FUSE");
       KP("moe:shared");
+#ifdef QWENOX_NPU
+      // M2 重叠：共享专家 gate/up 提交给 NPU 后继续跑路由专家（占 MoE 时间
+      // 大头），收尾压在 moe:reduce 前——NPU 的 ~1.5ms 被整个路由阶段盖住。
+      // sg_fuse 关时共享专家在 moe_b_shared（路由之后）算，没有重叠点。
+      bool npu_pend = false;
+      if (sg_fuse) {
+        char sg[128], su[128];
+        snprintf(sg, sizeof sg, "layers.%d.mlp.shared_expert.gate_proj.weight", l);
+        snprintf(su, sizeof su, "layers.%d.mlp.shared_expert.up_proj.weight", l);
+        npu_pend = npu_shexp_submit(l, P, sg, su);
+      }
+      if (sg_fuse && !npu_pend) moe_b_shared_ey(l, P);
+#else
       if (sg_fuse) moe_b_shared_ey(l, P);
+#endif
       KP("moe:route");
       moe_routing.run(d_topidsb, d_topwb, d_tokidx, d_pweight, d_eoff, d_pairids, P, k, E);
       // §11.5 多 tile 共享解码（mt）：tile 按 128 slot 合并（同专家两个 64-slot
@@ -5674,6 +5688,11 @@ struct GpuModel {
         moe_lut_down(moelut::kI4R, pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d, mid,
                      g_str, pairs_f16);
       KP("moe:reduce");
+#ifdef QWENOX_NPU
+      // NPU 收尾压在 reduce 入队前：host 在此 WaitHost 时 GPU 仍在跑路由专家，
+      // finish 的 down_proj+sgate 入队早于 reduce，与 M1 的 GPU 侧顺序一致。
+      if (npu_pend) moe_b_shared_ey(l, P);
+#endif
       const unsigned waves = (unsigned)P * (d / 128);
       static const int moe_rep = [] {  // diagnostic: QWENOX_MOE_REP=<layer>
         const char* e = getenv("QWENOX_MOE_REP");
@@ -5885,6 +5904,149 @@ struct GpuModel {
       gemm(u, x, yu, P);
     }
   }
+#ifdef QWENOX_NPU
+  // ---- NPU 卸载（29_npu.inc；运行时 QWENOX_NPU=1 启用，QWENOX_NPU_MINP 调
+  // 行数门槛，默认 4097——NPU kernel 固定算满 4096 行，P 不超过它时纯亏）----
+  std::unique_ptr<NpuGemm> npu_;
+  bool npu_off_ = false;  // 初始化或运行失败过一次 -> 永久回退 GPU
+  int npu_a_ = -1, npu_cg_ = -1, npu_cu_ = -1;
+  std::vector<int> npu_bg_, npu_bu_;  // 每层 gate/up 的 B 缓冲
+  std::vector<char> npu_wready_;      // 每层：B 已编码
+  float* d_npu_se_ = nullptr;         // [maxbatch][1280] gate|up 两半（M2 收尾用：
+                                      // d_guvb/d_hidb 那时被路由专家 pairs 占用）
+  int npu_pend_l_ = -1, npu_pend_P_ = 0;  // 已提交未收尾的共享专家（M2 重叠）
+
+  static int npu_minp() {
+    static const int v = [] {
+      const char* s = getenv("QWENOX_NPU_MINP");
+      return s && *s ? atoi(s) : 4097;
+    }();
+    return v;
+  }
+
+  bool npu_init() {
+    std::string err;
+    npu_.reset(NpuGemm::Create(err));
+    if (!npu_) {
+      fprintf(stderr, "%s NPU 卸载不可用：%s（回退 GPU）\n", log_ts(), err.c_str());
+      npu_off_ = true;
+      return false;
+    }
+    npu_a_ = npu_->NewBuffer(NpuGemm::kABytes);
+    npu_cg_ = npu_->NewBuffer(NpuGemm::kCBytes);
+    npu_cu_ = npu_->NewBuffer(NpuGemm::kCBytes);
+    bool ok = npu_a_ >= 0 && npu_cg_ >= 0 && npu_cu_ >= 0;
+    npu_bg_.resize(g_cfg.layers, -1);
+    npu_bu_.resize(g_cfg.layers, -1);
+    for (int l = 0; ok && l < g_cfg.layers; ++l) {
+      npu_bg_[l] = npu_->NewBuffer(NpuGemm::kBBytes);
+      npu_bu_[l] = npu_->NewBuffer(NpuGemm::kBBytes);
+      ok = npu_bg_[l] >= 0 && npu_bu_[l] >= 0;
+    }
+    if (!ok) {
+      fprintf(stderr, "%s NPU 卸载不可用：固定页分配失败（回退 GPU）\n", log_ts());
+      npu_off_ = true;
+      npu_.reset();
+      return false;
+    }
+    // A 缓冲清一次零：NPU kernel 固定读满 4096 行，本 chunk 未编码的行得是零
+    memset(npu_->Host(npu_a_), 0, NpuGemm::kABytes);
+    npu_wready_.assign(g_cfg.layers, 0);
+    CK(hipMalloc(&d_npu_se_, (size_t)maxbatch * 1280 * 4));
+    fprintf(stderr,
+            "%s NPU 卸载就绪：共享专家 gate/up（%d 层，%.0f MB 固定页，P>=%d 时 "
+            "前 4096 行给 NPU）\n",
+            log_ts(), g_cfg.layers,
+            (g_cfg.layers * 2.0 * NpuGemm::kBBytes + NpuGemm::kABytes +
+             2.0 * NpuGemm::kCBytes) / 1e6,
+            npu_minp());
+    return true;
+  }
+
+  // 层 l 的 gate/up 权重编码进 pinned B 缓冲（每层一次；gemm_wbf16 把任意
+  // dtype 反量化成 bf16——数值与 GPU GEMM 的输入一致，之后才是 NPU 的
+  // 块浮点量化，误差由 KLD 把关）。
+  bool npu_enc_layer(int l, const char* gname, const char* uname) {
+    const WView ws[2] = {wview(ckpt.at(gname)), wview(ckpt.at(uname))};
+    if (ws[0].rows != 640 || ws[0].cols != 2560 || ws[1].rows != 640 ||
+        ws[1].cols != 2560) {
+      npu_off_ = true;  // 形状不符（不是本模型）：整体回退
+      return false;
+    }
+    const int bids[2] = {npu_bg_[l], npu_bu_[l]};
+    constexpr size_t groups = (size_t)2560 * 1024 / 8;
+    for (int i = 0; i < 2; ++i) {
+      const uint16_t* wbf = gemm_wbf16(ws[i]);
+      k_npu_enc_w<<<(unsigned)((groups + 255) / 256), 256, 0, g_str>>>(
+          wbf, (uint8_t*)npu_->Dev(bids[i]), 640);
+    }
+    CK(hipStreamSynchronize(g_str));
+    npu_->FinalizeWeights(bids[0]);
+    npu_->FinalizeWeights(bids[1]);
+    npu_wready_[l] = 1;
+    return true;
+  }
+
+  // M2 提交：编码 A（行 [0, min(P,4096))）后把 gate/up 两次 run 交给 worker，
+  // 立即返回——NPU 与后续 GPU 路由专家阶段重叠。true = 已挂上
+  // npu_pend_，调用方必须在消费 d_eyb/d_sgb 之前调 npu_shexp_finish()。
+  bool npu_shexp_submit(int l, int P, const char* gname, const char* uname) {
+    static const bool want = [] {
+      const char* s = getenv("QWENOX_NPU");
+      return s && *s && strcmp(s, "0") != 0;
+    }();
+    if (!want || npu_off_ || P < npu_minp() || npu_pend_l_ >= 0) return false;
+    if (!npu_ && !npu_init()) return false;
+    if (!npu_->Healthy()) {
+      npu_off_ = true;
+      return false;
+    }
+    if (!npu_wready_[l] && !npu_enc_layer(l, gname, uname)) return false;
+    const int nr = (int)std::min<uint64_t>(P, NpuGemm::kM);
+    const unsigned mt = (nr + kNpuTileM - 1) / kNpuTileM;
+    k_npu_enc_a<<<mt * (2560 / kNpuTileK), 256, 0, g_str>>>(
+        d_xb, (uint8_t*)npu_->Dev(npu_a_), nr, 2560);
+    const int bs[2] = {npu_bg_[l], npu_bu_[l]}, cs[2] = {npu_cg_, npu_cu_};
+    if (!npu_->Submit(g_str, npu_a_, bs, cs, 2)) {
+      npu_off_ = true;  // host func 没排上：什么都没写，安全回退
+      return false;
+    }
+    npu_pend_l_ = l;
+    npu_pend_P_ = P;
+    return true;
+  }
+
+  // M2 收尾（也供 M1 提交后立即调用）：GPU 算剩余行（GEMM 行独立）-> 等
+  // NPU -> 解码到 d_npu_se_ 两半 -> silu 到 d_hidb。之后 d_eyb/d_sgb 由
+  // moe_b_shared_ey 尾部公共代码产出。d_npu_se_ 而不是 d_guvb：收尾发生在
+  // 路由专家阶段之后，d_guvb 正装着路由 pairs 等 reduce。
+  void npu_shexp_finish(int l, int P) {
+    npu_pend_l_ = -1;
+    const int nr = (int)std::min<uint64_t>(P, NpuGemm::kM);
+    char buf[128], ub[128];
+    snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.gate_proj.weight", l);
+    snprintf(ub, sizeof ub, "layers.%d.mlp.shared_expert.up_proj.weight", l);
+    if (P > nr) {
+      const WView g = wview(ckpt.at(buf)), u = wview(ckpt.at(ub));
+      gemm(g, d_xb + (size_t)nr * 2560, d_npu_se_ + (size_t)nr * 640, P - nr);
+      gemm(u, d_xb + (size_t)nr * 2560, d_npu_se_ + (size_t)P * 640 + (size_t)nr * 640,
+           P - nr);
+    }
+    if (!npu_->Wait(g_str)) {  // host func 排不上：CPU 侧直接等，结果仍有效
+      npu_->WaitHost();
+      npu_off_ = true;
+    }
+    constexpr size_t groups = (size_t)NpuGemm::kM * NpuGemm::kN / 8;
+    constexpr unsigned blocks = (unsigned)((groups + 255) / 256);
+    k_npu_dec_c<<<blocks, 256, 0, g_str>>>((const uint8_t*)npu_->Dev(npu_cg_), d_npu_se_,
+                                           nr, 640, 640);
+    k_npu_dec_c<<<blocks, 256, 0, g_str>>>((const uint8_t*)npu_->Dev(npu_cu_),
+                                           d_npu_se_ + (size_t)P * 640, nr, 640, 640);
+    k_silu_mul<<<(P * 640 + 255) / 256, 256, 0, g_str>>>(d_npu_se_, d_npu_se_ + (size_t)P * 640,
+                                                         d_hidb, P * 640);
+  }
+#endif  // QWENOX_NPU
+
   // Shared expert output d_eyb [P][d] and gate logit d_sgb [P].
   void moe_b_shared_ey(int l, int P) {
     char buf[128];
@@ -5893,6 +6055,25 @@ struct GpuModel {
       char ub[128];
       snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.gate_proj.weight", l);
       snprintf(ub, sizeof ub, "layers.%d.mlp.shared_expert.up_proj.weight", l);
+#ifdef QWENOX_NPU
+      bool npu_did = false;
+      if (npu_pend_l_ >= 0) {
+        if (npu_pend_l_ == l && npu_pend_P_ == P) {  // M2：moe_b_v2 入口已提交，收尾
+          npu_shexp_finish(l, P);
+          npu_did = true;
+        } else {  // 挂着不匹配的提交——不该发生；丢弃在飞结果，永久回退
+          fprintf(stderr, "%s NPU: pend L%d/P%d != L%d/P%d，丢弃并回退 GPU\n", log_ts(),
+                  npu_pend_l_, npu_pend_P_, l, P);
+          npu_->WaitHost();
+          npu_pend_l_ = -1;
+          npu_off_ = true;
+        }
+      } else if (npu_shexp_submit(l, P, buf, ub)) {
+        npu_shexp_finish(l, P);  // 无重叠点的调用点：提交完立即收尾
+        npu_did = true;
+      }
+      if (!npu_did) {
+#endif
       if (se_gate_up_merged(wview(ckpt.at(buf)), wview(ckpt.at(ub)), P)) {
         k_silu_mul_g<<<(P * 640 + 255) / 256, 256, 0, g_str>>>(d_guvb, d_hidb, 640, P);
       } else {
@@ -5900,6 +6081,9 @@ struct GpuModel {
         k_silu_mul<<<(P * 640 + 255) / 256, 256, 0, g_str>>>(d_guvb, d_guvb + (size_t)P * 640,
                                                              d_hidb, P * 640);
       }
+#ifdef QWENOX_NPU
+      }
+#endif
     }
     snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.down_proj.weight", l);
     gemm(wview(ckpt.at(buf)), d_hidb, d_eyb, P);
