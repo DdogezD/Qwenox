@@ -4361,6 +4361,10 @@ struct GpuModel {
     const int vrow0 = slot_vsnap_row0_(bs);
     const int cutr = slot_cut_r_(bs);
     const int* const vb = vseg ? nullptr : vbptr();
+#ifdef QWENOX_NPU
+    // M4：xb 此刻就绪；提交 q_proj 后整个 indexer + k/v GEMM 都是 NPU 窗口
+    if (!state_only && slot < 0 && r0 == 0) npu_qg_submit(l, P, xb);
+#endif
     {
       KP_SUB("qsa:idx");
       // rope cos/sin table for the indexer kernels below (idempotent; the QSA
@@ -4675,6 +4679,14 @@ struct GpuModel {
     if (!state_only) {
     KP_SUB("qsa:proj");
     snprintf(buf, sizeof buf, "layers.%d.self_attn.q_proj.weight", l);
+#ifdef QWENOX_NPU
+    const int nqg = npu_qg_pend_rows(l);  // M4：NPU 已覆盖的行数
+    if (nqg > 0) {
+      if (P > nqg)  // 尾部行 GPU 补（GEMM 行独立），与 NPU 并行
+        gemm(wview(ckpt.at(buf)), xb + (size_t)nqg * 2560,
+             qgb + (size_t)nqg * 12288, P - nqg);
+    } else
+#endif
     gemm(wview(ckpt.at(buf)), xb, qgb, P);
     snprintf(buf, sizeof buf, "layers.%d.self_attn.k_proj.weight", l);
     gemm(wview(ckpt.at(buf)), xb, kbb, P);
@@ -4683,6 +4695,9 @@ struct GpuModel {
     KP_SUB_END();
     }
     if (getenv("QWENOX_VGDUMP")) {  // D2-S1b bisect: q/k/v proj outs
+#ifdef QWENOX_NPU
+      npu_qg_finish_all(l, xb);  // dump qgb 前强制收尾
+#endif
       char tag[12];
       snprintf(tag, sizeof tag, "qg%d", l);
       vg_dump_buf(tag, P, qgb, (size_t)P * 12288 * 4);
@@ -4713,6 +4728,9 @@ struct GpuModel {
       // directly (qsplit skips its gs copy). QWENOX_QSA_GATE_BF16=0 disables.
       static const bool gate_bf16_on = !env_zero("QWENOX_QSA_GATE_BF16");
       const bool gate_bf16 = gate_bf16_on && P > 8 && !vseg;
+#ifdef QWENOX_NPU
+      npu_qg_finish_q(l);  // M4：qsplit 读 q 半前收尾（qsa:idx+k/v 已盖窗口）
+#endif
       KP_SUB("qsa:prep");
       k_qsa_qsplit<true><<<dim3(24, P), 256, 0, g_str>>>(
           qgb, qnw, qsb, gate_bf16 ? nullptr : gsb, 256, g_cfg.norm_eps, base,
@@ -4722,6 +4740,9 @@ struct GpuModel {
         snprintf(tag, sizeof tag, "qs%d", l);
         vg_dump_buf(tag, P, qsb, (size_t)P * 6144 * 4);
       }
+#ifdef QWENOX_NPU
+      npu_qg_submit_g(l, xb);  // M4：gate 半趁 qsa:flash（~200ms）跑
+#endif
       int dense_P = qsa_dense ? P : min(P, std::max(0, 2051 - base));
       if (qsa_kv_fp32) {
         float* kc = d_kc + qsa_off;
@@ -4877,6 +4898,9 @@ struct GpuModel {
       }
       KP_SUB("qsa:gate");
       if (gate_bf16) {  // see qsplit above
+#ifdef QWENOX_NPU
+        npu_qg_finish_g(l);  // M4：qsa:flash 已跑完，收尾 gate 半
+#endif
         const uint64_t n4 = (uint64_t)P * 6144 / 4;
         k_sigmoid_gate_bf16_v4<<<(unsigned)((n4 + 255) / 256), 256, 0, g_str>>>(
             attnb, qgb, xbf16b, n4);
@@ -4887,6 +4911,9 @@ struct GpuModel {
       }
       KP_SUB_END();
     } else {
+#ifdef QWENOX_NPU
+      npu_qg_finish_all(l, xb);  // M4：loop 逐 token 读 qg 全部
+#endif
       for (int t = 0; t < P; t++) {
         const int* pabs = d_posarr + base + t;  // absolute position
         const float* qg = qgb + (size_t)t * 12288;
@@ -5956,6 +5983,26 @@ struct GpuModel {
     }();
     return on;
   }
+  // M4：QSA q/gate（q_proj 12288x2560 = q 6 片 + gate 6 片），分半提交：
+  // 单段 NPU 连续负载压到 6 片 ~4.4ms（12 片 ~9ms 在独占下也硬死机过）。
+  // q 半在 qsa_idx_b 入口提交（窗口 = qsa:idx ~5ms + k/v GEMM），qsplit 前
+  // 收尾；gate 半在 qsa:flash 前提交（~200ms 窗口），sigmoid gate 前收尾。
+  // 依赖 gate_bf16 路径（默认开；QWENOX_QSA_GATE_BF16=0 时 qsplit 提前消费
+  // gate 半，与分半冲突 -> 不卸载）。B 缓冲按 QSA 序号 qi=l/4。
+  // QWENOX_NPU_QG=1 开（默认关：分半提交版仍触发硬死机，方向已封，
+  // 见 NPU-WIN-FEASIBILITY.md §6f；仅 slot<0 && r0==0 的正常 prefill 提交）。
+  std::vector<std::array<int, 12>> npu_bqg_;  // [nqsa][12]
+  std::vector<char> npu_qgready_;             // [nqsa]
+  int npu_cqg_[12] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+  int npu_pend_qg_l_ = -1, npu_pend_qg_P_ = 0;  // 已提交未收尾的 qg
+  int npu_pend_qg_stage_ = 0;  // 1=q 半在飞 2=q 半已收尾 3=gate 半在飞
+  static bool npu_qg_on() {
+    static const bool on = [] {
+      const char* s = getenv("QWENOX_NPU_QG");
+      return s && *s && strcmp(s, "0") != 0;
+    }();
+    return on;
+  }
 
   static int npu_minp() {
     static const int v = [] {
@@ -5998,6 +6045,20 @@ struct GpuModel {
           ok = npu_bz_[gi][s] >= 0;
         }
     }
+    const int nqsa = g_cfg.layers / 4;
+    if (ok && npu_qg_on()) {
+      npu_bqg_.resize(nqsa);
+      npu_qgready_.assign(nqsa, 0);
+      for (int i = 0; ok && i < 12; ++i) {
+        npu_cqg_[i] = npu_->NewBuffer(NpuGemm::kCBytes);
+        ok = npu_cqg_[i] >= 0;
+      }
+      for (int qi = 0; ok && qi < nqsa; ++qi)
+        for (int s = 0; s < 12; ++s) {
+          npu_bqg_[qi][s] = npu_->NewBuffer(NpuGemm::kBBytes);
+          ok = npu_bqg_[qi][s] >= 0;
+        }
+    }
     if (!ok) {
       fprintf(stderr, "%s NPU 卸载不可用：固定页分配失败（回退 GPU）\n", log_ts());
       npu_off_ = true;
@@ -6011,12 +6072,14 @@ struct GpuModel {
     const double mb =
         (g_cfg.layers * 2.0 * NpuGemm::kBBytes + NpuGemm::kABytes +
          2.0 * NpuGemm::kCBytes +
-         (npu_z_on() ? (double)ngdn * 6 * NpuGemm::kBBytes + 6.0 * NpuGemm::kCBytes : 0)) /
+         (npu_z_on() ? (double)ngdn * 6 * NpuGemm::kBBytes + 6.0 * NpuGemm::kCBytes : 0) +
+         (npu_qg_on() ? (double)nqsa * 12 * NpuGemm::kBBytes + 12.0 * NpuGemm::kCBytes : 0)) /
         1e6;
     fprintf(stderr,
-            "%s NPU 卸载就绪：共享专家 gate/up（%d 层）%s（%.0f MB 固定页，P>=%d 时 "
+            "%s NPU 卸载就绪：共享专家 gate/up（%d 层）%s%s（%.0f MB 固定页，P>=%d 时 "
             "前 4096 行给 NPU）\n",
-            log_ts(), g_cfg.layers, npu_z_on() ? " + GDN z 门控（6 片/层）" : "", mb,
+            log_ts(), g_cfg.layers, npu_z_on() ? " + GDN z 门控（6 片/层）" : "",
+            npu_qg_on() ? " + QSA q/gate（12 片/层）" : "", mb,
             npu_minp());
     return true;
   }
@@ -6184,6 +6247,147 @@ struct GpuModel {
     char buf[128];
     snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_z.weight", l);
     gemm(wview(ckpt.at(buf)), xb, zb, P);
+  }
+
+  // ---- M4：QSA q/gate（q_proj [12288][2560]，q=片 0..5，gate=片 6..11）----
+  bool npu_enc_qg(int qi, const WView& w) {
+    const uint16_t* wbf = gemm_wbf16(w);  // [12288][2560] bf16（d_wbf16）
+    constexpr size_t groups = (size_t)2560 * 1024 / 8;
+    for (int s = 0; s < 12; ++s)
+      k_npu_enc_w<<<(unsigned)((groups + 255) / 256), 256, 0, g_str>>>(
+          wbf + (size_t)s * 1024 * 2560, (uint8_t*)npu_->Dev(npu_bqg_[qi][s]),
+          1024);
+    CK(hipStreamSynchronize(g_str));
+    for (int s = 0; s < 12; ++s) npu_->FinalizeWeights(npu_bqg_[qi][s]);
+    npu_qgready_[qi] = 1;
+    return true;
+  }
+
+  // q 半提交（qsa_idx_b 入口，xb 此刻就绪；到 qsplit 消费还有整个
+  // indexer + k/v GEMM 的窗口）。只交片 0..5，单段 ~4.4ms。
+  int npu_qg_submit(int l, int P, const float* xb) {
+    static const bool want = [] {
+      const char* s = getenv("QWENOX_NPU");
+      return s && *s && strcmp(s, "0") != 0;
+    }();
+    if (!want || !npu_qg_on() || npu_off_ || P < npu_minp()) return 0;
+    if (npu_pend_qg_l_ >= 0) return 0;  // 上一个还没收尾（不该发生）：不叠提交
+    static const bool gate_bf16_ok = !env_zero("QWENOX_QSA_GATE_BF16");
+    if (!gate_bf16_ok) return 0;  // qsplit 会提前读 gate 半，与分半提交冲突
+    if (!npu_ && !npu_init()) return 0;
+    if (!npu_->Healthy()) {
+      npu_off_ = true;
+      return 0;
+    }
+    char buf[128];
+    snprintf(buf, sizeof buf, "layers.%d.self_attn.q_proj.weight", l);
+    const WView w = wview(ckpt.at(buf));
+    if (w.rows != 12288 || w.cols != 2560) {
+      npu_off_ = true;  // 形状不符（不是本模型）：整体回退
+      return 0;
+    }
+    const int qi = l / 4;
+    if (!npu_qgready_[qi] && !npu_enc_qg(qi, w)) return 0;
+    const int nr = (int)std::min<uint64_t>(P, NpuGemm::kM);
+    const unsigned mt = (nr + kNpuTileM - 1) / kNpuTileM;
+    k_npu_enc_a<<<mt * (2560 / kNpuTileK), 256, 0, g_str>>>(
+        xb, (uint8_t*)npu_->Dev(npu_a_), nr, 2560);
+    if (!npu_->Submit(g_str, npu_a_, npu_bqg_[qi].data(), npu_cqg_, 6)) {
+      npu_off_ = true;  // host func 没排上：什么都没写，安全回退
+      return 0;
+    }
+    npu_pend_qg_l_ = l;
+    npu_pend_qg_P_ = P;
+    npu_pend_qg_stage_ = 1;
+    return nr;
+  }
+
+  // 本层有未收尾 qg 时返回 NPU 覆盖行数（qsa_main_b 据此跳过/补尾 GPU gemm）
+  int npu_qg_pend_rows(int l) const {
+    return npu_pend_qg_l_ == l
+               ? (int)std::min<uint64_t>(npu_pend_qg_P_, NpuGemm::kM)
+               : 0;
+  }
+
+  // q 半收尾（qsplit 前）：Wait + 解码片 0..5 到 d_qgb 列 [0,6144)。
+  // 层不匹配（不该发生）：禁 NPU + GPU 全量重算 q_proj 保正确性。
+  void npu_qg_finish_q(int l) {
+    if (npu_pend_qg_l_ < 0) return;
+    if (npu_pend_qg_l_ != l) {
+      fprintf(stderr,
+              "[npu] qg pend mismatch: submitted l=%d, consumed l=%d; "
+              "disabling NPU\n",
+              npu_pend_qg_l_, l);
+      npu_->WaitHost();
+      npu_off_ = true;
+      char buf[128];
+      snprintf(buf, sizeof buf, "layers.%d.self_attn.q_proj.weight",
+               npu_pend_qg_l_);
+      gemm(wview(ckpt.at(buf)), d_xb, d_qgb, npu_pend_qg_P_);
+      npu_pend_qg_l_ = -1;
+      npu_pend_qg_stage_ = 0;
+      return;
+    }
+    if (npu_pend_qg_stage_ != 1) return;
+    if (!npu_->Wait(g_str)) {  // host func 排不上：CPU 侧直接等，结果仍有效
+      npu_->WaitHost();
+      npu_off_ = true;
+    }
+    const int nr = (int)std::min<uint64_t>(npu_pend_qg_P_, NpuGemm::kM);
+    constexpr size_t groups = (size_t)NpuGemm::kM * NpuGemm::kN / 8;
+    constexpr unsigned blocks = (unsigned)((groups + 255) / 256);
+    for (int s = 0; s < 6; ++s)
+      k_npu_dec_c<<<blocks, 256, 0, g_str>>>(
+          (const uint8_t*)npu_->Dev(npu_cqg_[s]), d_qgb + s * 1024, nr, 1024,
+          12288);
+    npu_pend_qg_stage_ = 2;
+  }
+
+  // gate 半提交（qsa:flash 前，~200ms 窗口）。失败则 GPU 全量重算覆盖行
+  // （q 半已被 qsplit 消费，重写无害；gate 列必须补上）。
+  void npu_qg_submit_g(int l, const float* xb) {
+    if (npu_pend_qg_l_ != l || npu_pend_qg_stage_ != 2) return;
+    const int nr = (int)std::min<uint64_t>(npu_pend_qg_P_, NpuGemm::kM);
+    const unsigned mt = (nr + kNpuTileM - 1) / kNpuTileM;
+    k_npu_enc_a<<<mt * (2560 / kNpuTileK), 256, 0, g_str>>>(
+        xb, (uint8_t*)npu_->Dev(npu_a_), nr, 2560);
+    if (!npu_->Submit(g_str, npu_a_, npu_bqg_[l / 4].data() + 6, npu_cqg_ + 6,
+                      6)) {
+      fprintf(stderr, "[npu] qg gate submit 失败，GPU 重算（禁用 NPU）\n");
+      npu_off_ = true;
+      char buf[128];
+      snprintf(buf, sizeof buf, "layers.%d.self_attn.q_proj.weight", l);
+      gemm(wview(ckpt.at(buf)), d_xb, d_qgb, nr);
+      npu_pend_qg_l_ = -1;
+      npu_pend_qg_stage_ = 0;
+      return;
+    }
+    npu_pend_qg_stage_ = 3;
+  }
+
+  // gate 半收尾（sigmoid gate 前，qsa:flash 已跑完）：解码片 6..11。
+  void npu_qg_finish_g(int l) {
+    if (npu_pend_qg_l_ != l || npu_pend_qg_stage_ != 3) return;
+    if (!npu_->Wait(g_str)) {
+      npu_->WaitHost();
+      npu_off_ = true;
+    }
+    const int nr = (int)std::min<uint64_t>(npu_pend_qg_P_, NpuGemm::kM);
+    constexpr size_t groups = (size_t)NpuGemm::kM * NpuGemm::kN / 8;
+    constexpr unsigned blocks = (unsigned)((groups + 255) / 256);
+    for (int s = 6; s < 12; ++s)
+      k_npu_dec_c<<<blocks, 256, 0, g_str>>>(
+          (const uint8_t*)npu_->Dev(npu_cqg_[s]), d_qgb + s * 1024, nr, 1024,
+          12288);
+    npu_pend_qg_l_ = -1;
+    npu_pend_qg_stage_ = 0;
+  }
+
+  // 调试路径（vgdump/qsa_loop）用：q 收尾 -> gate 提交 -> gate 收尾。
+  void npu_qg_finish_all(int l, const float* xb) {
+    npu_qg_finish_q(l);
+    npu_qg_submit_g(l, xb);
+    npu_qg_finish_g(l);
   }
 #endif  // QWENOX_NPU
 
