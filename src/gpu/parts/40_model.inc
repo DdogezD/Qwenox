@@ -6,6 +6,15 @@ struct KvOverflow : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
+// 客户端断连/取消打断 prompt 预填（prefill_batch 分段循环在段间检查 abort_flag——
+// 与 yield_point 同一个"只有持久槽位状态存活"的安全点）。抛点前已写入的 KV 页
+// 属于槽位持久状态，serve 的 catch 走槽位 reset 回收，与 KvOverflow 相同。
+// decode/spec 路径不 armed 它：verify 批次有回合本地状态，中途抛会破坏回滚语义，
+// 那边的取消仍走 emit/cancel 标志的回合边界回滚。
+struct ReqCancelled : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
 struct GpuModel {
   const Checkpoint& ckpt;
   bool ple_on = true;
@@ -346,6 +355,11 @@ struct GpuModel {
   void yield_point() {
     if (yield_fn) yield_fn(*this);
   }
+  // 客户端断连/取消标志（serve 模式下 gen_one 指向 Conn::cancel，平时为
+  // nullptr）：仅 prompt 预填期间 armed，prefill_batch 在分段间检查并抛
+  // ReqCancelled。投机 verify 也走 prefill_batch，但那时该指针为空——
+  // verify 中途不能抛（回合本地状态存活），取消由回合边界处理。
+  std::atomic<bool>* abort_flag = nullptr;
   // D1b mid-chunk GPU lending (serve mode, nslots > 1): while a long prompt
   // chunk is enqueued layer by layer, queued decode workers may borrow the
   // GPU for light rounds (chunks of at most conc_rmax_ rows) running on a
@@ -6642,6 +6656,10 @@ struct GpuModel {
         }
       }
       off += n;
+      // 客户端已断连/取消：不再为已断开的请求预填剩余分段（长 prompt 可能还有
+      // 几万 token）。段间取消延迟 ≤ 一个分段；抛点状态语义同 yield_point。
+      if (abort_flag && abort_flag->load(std::memory_order_relaxed))
+        throw ReqCancelled("prefill aborted: client gone");
       // Concurrent serve: prompt prefill hands the GPU over between chunks
       // (only persistent slot state is live here; spec verify never yields).
       if (prog_total > 0 && off < N) yield_point();
