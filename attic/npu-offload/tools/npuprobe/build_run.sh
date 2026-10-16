@@ -25,4 +25,5 @@ rm -f out/npuio.exe out/npuio.o
 "$TR/bin/hipcc.exe" out/npuio.o -o out/npuio.exe -Xlinker out/xrt_coreutil.lib 2>&1 | cut -c1-300 | tail -30
 [ -f out/npuio.exe ] || { echo "RESULT: FAIL (build)"; exit 1; }
 echo "build OK"
+[ "${1:-}" = build ] && exit 0
 cd out && ./npuio.exe ../npu "${1:-20}"

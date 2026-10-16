@@ -7,3 +7,5 @@
 *.py    text eol=lf
 # Windows 批处理保持 CRLF
 *.bat   text eol=crlf
+# 补丁按原样保存（git apply 要求与目标文件换行一致，仓库内是 LF）
+*.patch text eol=lf

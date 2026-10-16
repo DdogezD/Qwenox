@@ -3429,10 +3429,6 @@ struct GpuModel {
                      float* beta48b, float* zb) {
     char buf[128];
     KP_SUB("gdn:proj");
-    int npu_z_nr = 0;  // M3：NPU 覆盖的 z 行数（0 = 全 GPU）
-#ifdef QWENOX_NPU
-    npu_z_nr = npu_z_submit(l, P, xb);  // 先提交，NPU 与下面三个 GEMM 重叠
-#endif
     snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_qkv.weight", l);
     gemm(wview(ckpt.at(buf)), xb, qkvb, P);
     snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_a.weight", l);
@@ -3440,15 +3436,6 @@ struct GpuModel {
     snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_b.weight", l);
     gemm(wview(ckpt.at(buf)), xb, beta48b, P);
     snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_z.weight", l);
-#ifdef QWENOX_NPU
-    if (npu_z_nr > 0) {
-      if (P > npu_z_nr)  // NPU 固定算满 4096 行，剩余行 GPU 补（GEMM 行独立）
-        gemm(wview(ckpt.at(buf)), xb + (size_t)npu_z_nr * 2560,
-             zb + (size_t)npu_z_nr * 6144, P - npu_z_nr);
-      npu_pend_z_l_ = l;  // 收尾推迟到 conv+scan 之后（zb 首个消费点前）
-      npu_pend_z_P_ = P;
-    } else
-#endif
     gemm(wview(ckpt.at(buf)), xb, zb, P);
     KP_SUB_END();
   }
@@ -3514,9 +3501,6 @@ struct GpuModel {
     k_gdn_verify_vseg<<<dim3(48, (unsigned)nseg), 512, 0, g_str>>>(
         d_convb, d_g48b, d_beta48b, sg, 10240);
     KP_SUB_END();
-#ifdef QWENOX_NPU
-    npu_z_pend_finish(l, R, d_xb, d_zb);  // M3：合批 verify 路径同样收尾
-#endif
     KP_SUB("gdn:norm");
     k_gdn_gatednorm_b<true><<<dim3(48, (unsigned)((R + 31) / 32)), 128, 0, g_str>>>(
         d_convb + 4096, d_zb, gnw, nullptr, g_cfg.norm_eps, 10240, 6144, d_xbf16b,
@@ -3558,9 +3542,6 @@ struct GpuModel {
     vgd_g("gq", qkvb, (size_t)P * 10240 * 4);
     vgd_g("ga", g48b, (size_t)P * 48 * 4);
     vgd_g("bt", beta48b, (size_t)P * 48 * 4);
-#ifdef QWENOX_NPU
-    if (vgl == l) npu_z_pend_finish(l, P, xb, zb);  // dump zb 前强制收尾
-#endif
     vgd_g("zb", zb, (size_t)P * 6144 * 4);
     float* convst = slot_d_convst(bs) + (size_t)gi * 3 * 10240;
     const float* cw = d_convw + (size_t)gi * 10240 * 4;
@@ -3725,9 +3706,6 @@ struct GpuModel {
         if (pipe) CK(hipStreamWaitEvent(g_str, ev_s[lastw & 1], 0));
       }
       KP_SUB_END();
-#ifdef QWENOX_NPU
-      npu_z_pend_finish(l, P, xb, zb);  // M3：conv+scan 已盖过 NPU，收尾 z
-#endif
       KP_SUB("gdn:norm");
       k_gdn_gatednorm_b<true><<<dim3(48, (P + 31) / 32), 128, 0, g_str>>>(
           convb + 4096, zb, gnw, nullptr, g_cfg.norm_eps, 10240, 6144,
@@ -3742,9 +3720,6 @@ struct GpuModel {
     }
     if (state_only)
       throw std::runtime_error("gdn_b: state_only needs the batched (non-loop) path");
-#ifdef QWENOX_NPU
-    npu_z_pend_finish(l, P, xb, zb);  // M3：loop 路径消费 zb 前收尾
-#endif
     for (int t = 0; t < P; t++) {
       float* qkv = qkvb + (size_t)t * 10240;
       k_gdn_conv<<<(10240 + 255) / 256, 256, 0, g_str>>>(qkv, cw, convst, qkv, 10240);
@@ -4361,10 +4336,6 @@ struct GpuModel {
     const int vrow0 = slot_vsnap_row0_(bs);
     const int cutr = slot_cut_r_(bs);
     const int* const vb = vseg ? nullptr : vbptr();
-#ifdef QWENOX_NPU
-    // M4：xb 此刻就绪；提交 q_proj 后整个 indexer + k/v GEMM 都是 NPU 窗口
-    if (!state_only && slot < 0 && r0 == 0) npu_qg_submit(l, P, xb);
-#endif
     {
       KP_SUB("qsa:idx");
       // rope cos/sin table for the indexer kernels below (idempotent; the QSA
@@ -4679,14 +4650,6 @@ struct GpuModel {
     if (!state_only) {
     KP_SUB("qsa:proj");
     snprintf(buf, sizeof buf, "layers.%d.self_attn.q_proj.weight", l);
-#ifdef QWENOX_NPU
-    const int nqg = npu_qg_pend_rows(l);  // M4：NPU 已覆盖的行数
-    if (nqg > 0) {
-      if (P > nqg)  // 尾部行 GPU 补（GEMM 行独立），与 NPU 并行
-        gemm(wview(ckpt.at(buf)), xb + (size_t)nqg * 2560,
-             qgb + (size_t)nqg * 12288, P - nqg);
-    } else
-#endif
     gemm(wview(ckpt.at(buf)), xb, qgb, P);
     snprintf(buf, sizeof buf, "layers.%d.self_attn.k_proj.weight", l);
     gemm(wview(ckpt.at(buf)), xb, kbb, P);
@@ -4695,9 +4658,6 @@ struct GpuModel {
     KP_SUB_END();
     }
     if (getenv("QWENOX_VGDUMP")) {  // D2-S1b bisect: q/k/v proj outs
-#ifdef QWENOX_NPU
-      npu_qg_finish_all(l, xb);  // dump qgb 前强制收尾
-#endif
       char tag[12];
       snprintf(tag, sizeof tag, "qg%d", l);
       vg_dump_buf(tag, P, qgb, (size_t)P * 12288 * 4);
@@ -4728,9 +4688,6 @@ struct GpuModel {
       // directly (qsplit skips its gs copy). QWENOX_QSA_GATE_BF16=0 disables.
       static const bool gate_bf16_on = !env_zero("QWENOX_QSA_GATE_BF16");
       const bool gate_bf16 = gate_bf16_on && P > 8 && !vseg;
-#ifdef QWENOX_NPU
-      npu_qg_finish_q(l);  // M4：qsplit 读 q 半前收尾（qsa:idx+k/v 已盖窗口）
-#endif
       KP_SUB("qsa:prep");
       k_qsa_qsplit<true><<<dim3(24, P), 256, 0, g_str>>>(
           qgb, qnw, qsb, gate_bf16 ? nullptr : gsb, 256, g_cfg.norm_eps, base,
@@ -4740,9 +4697,6 @@ struct GpuModel {
         snprintf(tag, sizeof tag, "qs%d", l);
         vg_dump_buf(tag, P, qsb, (size_t)P * 6144 * 4);
       }
-#ifdef QWENOX_NPU
-      npu_qg_submit_g(l, xb);  // M4：gate 半趁 qsa:flash（~200ms）跑
-#endif
       int dense_P = qsa_dense ? P : min(P, std::max(0, 2051 - base));
       if (qsa_kv_fp32) {
         float* kc = d_kc + qsa_off;
@@ -4898,9 +4852,6 @@ struct GpuModel {
       }
       KP_SUB("qsa:gate");
       if (gate_bf16) {  // see qsplit above
-#ifdef QWENOX_NPU
-        npu_qg_finish_g(l);  // M4：qsa:flash 已跑完，收尾 gate 半
-#endif
         const uint64_t n4 = (uint64_t)P * 6144 / 4;
         k_sigmoid_gate_bf16_v4<<<(unsigned)((n4 + 255) / 256), 256, 0, g_str>>>(
             attnb, qgb, xbf16b, n4);
@@ -4911,9 +4862,6 @@ struct GpuModel {
       }
       KP_SUB_END();
     } else {
-#ifdef QWENOX_NPU
-      npu_qg_finish_all(l, xb);  // M4：loop 逐 token 读 qg 全部
-#endif
       for (int t = 0; t < P; t++) {
         const int* pabs = d_posarr + base + t;  // absolute position
         const float* qg = qgb + (size_t)t * 12288;
@@ -5615,21 +5563,7 @@ struct GpuModel {
       }
       static const bool sg_fuse = !env_zero("QWENOX_MOE_SG_FUSE");
       KP("moe:shared");
-#ifdef QWENOX_NPU
-      // M2 重叠：共享专家 gate/up 提交给 NPU 后继续跑路由专家（占 MoE 时间
-      // 大头），收尾压在 moe:reduce 前——NPU 的 ~1.5ms 被整个路由阶段盖住。
-      // sg_fuse 关时共享专家在 moe_b_shared（路由之后）算，没有重叠点。
-      bool npu_pend = false;
-      if (sg_fuse) {
-        char sg[128], su[128];
-        snprintf(sg, sizeof sg, "layers.%d.mlp.shared_expert.gate_proj.weight", l);
-        snprintf(su, sizeof su, "layers.%d.mlp.shared_expert.up_proj.weight", l);
-        npu_pend = npu_shexp_submit(l, P, sg, su);
-      }
-      if (sg_fuse && !npu_pend) moe_b_shared_ey(l, P);
-#else
       if (sg_fuse) moe_b_shared_ey(l, P);
-#endif
       KP("moe:route");
       moe_routing.run(d_topidsb, d_topwb, d_tokidx, d_pweight, d_eoff, d_pairids, P, k, E);
       // §11.5 多 tile 共享解码（mt）：tile 按 128 slot 合并（同专家两个 64-slot
@@ -5740,11 +5674,6 @@ struct GpuModel {
         moe_lut_down(moelut::kI4R, pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d, mid,
                      g_str, pairs_f16);
       KP("moe:reduce");
-#ifdef QWENOX_NPU
-      // NPU 收尾压在 reduce 入队前：host 在此 WaitHost 时 GPU 仍在跑路由专家，
-      // finish 的 down_proj+sgate 入队早于 reduce，与 M1 的 GPU 侧顺序一致。
-      if (npu_pend) moe_b_shared_ey(l, P);
-#endif
       const unsigned waves = (unsigned)P * (d / 128);
       static const int moe_rep = [] {  // diagnostic: QWENOX_MOE_REP=<layer>
         const char* e = getenv("QWENOX_MOE_REP");
@@ -5956,441 +5885,6 @@ struct GpuModel {
       gemm(u, x, yu, P);
     }
   }
-#ifdef QWENOX_NPU
-  // ---- NPU 卸载（29_npu.inc；运行时 QWENOX_NPU=1 启用，QWENOX_NPU_MINP 调
-  // 行数门槛，默认 4097——NPU kernel 固定算满 4096 行，P 不超过它时纯亏）----
-  std::unique_ptr<NpuGemm> npu_;
-  bool npu_off_ = false;  // 初始化或运行失败过一次 -> 永久回退 GPU
-  int npu_a_ = -1, npu_cg_ = -1, npu_cu_ = -1;
-  std::vector<int> npu_bg_, npu_bu_;  // 每层 gate/up 的 B 缓冲
-  std::vector<char> npu_wready_;      // 每层：B 已编码
-  float* d_npu_se_ = nullptr;         // [maxbatch][1280] gate|up 两半（M2 收尾用：
-                                      // d_guvb/d_hidb 那时被路由专家 pairs 占用）
-  int npu_pend_l_ = -1, npu_pend_P_ = 0;  // 已提交未收尾的共享专家（M2 重叠）
-  // M3：GDN z 门控（in_proj_z 6144x2560 = 6 片 N=1024）。gdn_proj_in_b 提交，
-  // gdn_b 的 gated norm（z 消费点）前收尾：NPU 的 ~4.4ms 被 qkv GEMM +
-  // conv + scan（~42ms）盖住。B 缓冲按 GDN 序号 gi = l-(l+1)/4 索引。
-  // 实测稳态仅 +0.4%（gdn:proj -95ms/chunk，被带宽争抢抵消大半），且 NPU
-  // 高频提交在多租户下触发过整机挂死——默认关，QWENOX_NPU_Z=1 开。
-  std::vector<std::array<int, 6>> npu_bz_;  // [ngdn][6] z 的 B 切片
-  std::vector<char> npu_zready_;            // [ngdn]
-  int npu_cz_[6] = {-1, -1, -1, -1, -1, -1};
-  int npu_pend_z_l_ = -1, npu_pend_z_P_ = 0;  // 已提交未收尾的 z
-  static bool npu_z_on() {
-    static const bool on = [] {
-      const char* s = getenv("QWENOX_NPU_Z");
-      return s && *s && strcmp(s, "0") != 0;
-    }();
-    return on;
-  }
-  // M4：QSA q/gate（q_proj 12288x2560 = q 6 片 + gate 6 片），分半提交：
-  // 单段 NPU 连续负载压到 6 片 ~4.4ms（12 片 ~9ms 在独占下也硬死机过）。
-  // q 半在 qsa_idx_b 入口提交（窗口 = qsa:idx ~5ms + k/v GEMM），qsplit 前
-  // 收尾；gate 半在 qsa:flash 前提交（~200ms 窗口），sigmoid gate 前收尾。
-  // 依赖 gate_bf16 路径（默认开；QWENOX_QSA_GATE_BF16=0 时 qsplit 提前消费
-  // gate 半，与分半冲突 -> 不卸载）。B 缓冲按 QSA 序号 qi=l/4。
-  // QWENOX_NPU_QG=1 开（默认关：分半提交版仍触发硬死机，方向已封，
-  // 见 NPU-WIN-FEASIBILITY.md §6f；仅 slot<0 && r0==0 的正常 prefill 提交）。
-  std::vector<std::array<int, 12>> npu_bqg_;  // [nqsa][12]
-  std::vector<char> npu_qgready_;             // [nqsa]
-  int npu_cqg_[12] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
-  int npu_pend_qg_l_ = -1, npu_pend_qg_P_ = 0;  // 已提交未收尾的 qg
-  int npu_pend_qg_stage_ = 0;  // 1=q 半在飞 2=q 半已收尾 3=gate 半在飞
-  static bool npu_qg_on() {
-    static const bool on = [] {
-      const char* s = getenv("QWENOX_NPU_QG");
-      return s && *s && strcmp(s, "0") != 0;
-    }();
-    return on;
-  }
-
-  static int npu_minp() {
-    static const int v = [] {
-      const char* s = getenv("QWENOX_NPU_MINP");
-      return s && *s ? atoi(s) : 4097;
-    }();
-    return v;
-  }
-
-  bool npu_init() {
-    std::string err;
-    npu_.reset(NpuGemm::Create(err));
-    if (!npu_) {
-      fprintf(stderr, "%s NPU 卸载不可用：%s（回退 GPU）\n", log_ts(), err.c_str());
-      npu_off_ = true;
-      return false;
-    }
-    npu_a_ = npu_->NewBuffer(NpuGemm::kABytes);
-    npu_cg_ = npu_->NewBuffer(NpuGemm::kCBytes);
-    npu_cu_ = npu_->NewBuffer(NpuGemm::kCBytes);
-    bool ok = npu_a_ >= 0 && npu_cg_ >= 0 && npu_cu_ >= 0;
-    npu_bg_.resize(g_cfg.layers, -1);
-    npu_bu_.resize(g_cfg.layers, -1);
-    for (int l = 0; ok && l < g_cfg.layers; ++l) {
-      npu_bg_[l] = npu_->NewBuffer(NpuGemm::kBBytes);
-      npu_bu_[l] = npu_->NewBuffer(NpuGemm::kBBytes);
-      ok = npu_bg_[l] >= 0 && npu_bu_[l] >= 0;
-    }
-    const int ngdn = g_cfg.layers - g_cfg.layers / 4;
-    if (ok && npu_z_on()) {
-      npu_bz_.resize(ngdn);
-      npu_zready_.assign(ngdn, 0);
-      for (int i = 0; ok && i < 6; ++i) {
-        npu_cz_[i] = npu_->NewBuffer(NpuGemm::kCBytes);
-        ok = npu_cz_[i] >= 0;
-      }
-      for (int gi = 0; ok && gi < ngdn; ++gi)
-        for (int s = 0; s < 6; ++s) {
-          npu_bz_[gi][s] = npu_->NewBuffer(NpuGemm::kBBytes);
-          ok = npu_bz_[gi][s] >= 0;
-        }
-    }
-    const int nqsa = g_cfg.layers / 4;
-    if (ok && npu_qg_on()) {
-      npu_bqg_.resize(nqsa);
-      npu_qgready_.assign(nqsa, 0);
-      for (int i = 0; ok && i < 12; ++i) {
-        npu_cqg_[i] = npu_->NewBuffer(NpuGemm::kCBytes);
-        ok = npu_cqg_[i] >= 0;
-      }
-      for (int qi = 0; ok && qi < nqsa; ++qi)
-        for (int s = 0; s < 12; ++s) {
-          npu_bqg_[qi][s] = npu_->NewBuffer(NpuGemm::kBBytes);
-          ok = npu_bqg_[qi][s] >= 0;
-        }
-    }
-    if (!ok) {
-      fprintf(stderr, "%s NPU 卸载不可用：固定页分配失败（回退 GPU）\n", log_ts());
-      npu_off_ = true;
-      npu_.reset();
-      return false;
-    }
-    // A 缓冲清一次零：NPU kernel 固定读满 4096 行，本 chunk 未编码的行得是零
-    memset(npu_->Host(npu_a_), 0, NpuGemm::kABytes);
-    npu_wready_.assign(g_cfg.layers, 0);
-    CK(hipMalloc(&d_npu_se_, (size_t)maxbatch * 1280 * 4));
-    const double mb =
-        (g_cfg.layers * 2.0 * NpuGemm::kBBytes + NpuGemm::kABytes +
-         2.0 * NpuGemm::kCBytes +
-         (npu_z_on() ? (double)ngdn * 6 * NpuGemm::kBBytes + 6.0 * NpuGemm::kCBytes : 0) +
-         (npu_qg_on() ? (double)nqsa * 12 * NpuGemm::kBBytes + 12.0 * NpuGemm::kCBytes : 0)) /
-        1e6;
-    fprintf(stderr,
-            "%s NPU 卸载就绪：共享专家 gate/up（%d 层）%s%s（%.0f MB 固定页，P>=%d 时 "
-            "前 4096 行给 NPU）\n",
-            log_ts(), g_cfg.layers, npu_z_on() ? " + GDN z 门控（6 片/层）" : "",
-            npu_qg_on() ? " + QSA q/gate（12 片/层）" : "", mb,
-            npu_minp());
-    return true;
-  }
-
-  // 层 l 的 gate/up 权重编码进 pinned B 缓冲（每层一次；gemm_wbf16 把任意
-  // dtype 反量化成 bf16——数值与 GPU GEMM 的输入一致，之后才是 NPU 的
-  // 块浮点量化，误差由 KLD 把关）。
-  bool npu_enc_layer(int l, const char* gname, const char* uname) {
-    const WView ws[2] = {wview(ckpt.at(gname)), wview(ckpt.at(uname))};
-    if (ws[0].rows != 640 || ws[0].cols != 2560 || ws[1].rows != 640 ||
-        ws[1].cols != 2560) {
-      npu_off_ = true;  // 形状不符（不是本模型）：整体回退
-      return false;
-    }
-    const int bids[2] = {npu_bg_[l], npu_bu_[l]};
-    constexpr size_t groups = (size_t)2560 * 1024 / 8;
-    for (int i = 0; i < 2; ++i) {
-      const uint16_t* wbf = gemm_wbf16(ws[i]);
-      k_npu_enc_w<<<(unsigned)((groups + 255) / 256), 256, 0, g_str>>>(
-          wbf, (uint8_t*)npu_->Dev(bids[i]), 640);
-    }
-    CK(hipStreamSynchronize(g_str));
-    npu_->FinalizeWeights(bids[0]);
-    npu_->FinalizeWeights(bids[1]);
-    npu_wready_[l] = 1;
-    return true;
-  }
-
-  // M2 提交：编码 A（行 [0, min(P,4096))）后把 gate/up 两次 run 交给 worker，
-  // 立即返回——NPU 与后续 GPU 路由专家阶段重叠。true = 已挂上
-  // npu_pend_，调用方必须在消费 d_eyb/d_sgb 之前调 npu_shexp_finish()。
-  bool npu_shexp_submit(int l, int P, const char* gname, const char* uname) {
-    static const bool want = [] {
-      const char* s = getenv("QWENOX_NPU");
-      return s && *s && strcmp(s, "0") != 0;
-    }();
-    if (!want || npu_off_ || P < npu_minp() || npu_pend_l_ >= 0) return false;
-    if (!npu_ && !npu_init()) return false;
-    if (!npu_->Healthy()) {
-      npu_off_ = true;
-      return false;
-    }
-    if (!npu_wready_[l] && !npu_enc_layer(l, gname, uname)) return false;
-    const int nr = (int)std::min<uint64_t>(P, NpuGemm::kM);
-    const unsigned mt = (nr + kNpuTileM - 1) / kNpuTileM;
-    k_npu_enc_a<<<mt * (2560 / kNpuTileK), 256, 0, g_str>>>(
-        d_xb, (uint8_t*)npu_->Dev(npu_a_), nr, 2560);
-    const int bs[2] = {npu_bg_[l], npu_bu_[l]}, cs[2] = {npu_cg_, npu_cu_};
-    if (!npu_->Submit(g_str, npu_a_, bs, cs, 2)) {
-      npu_off_ = true;  // host func 没排上：什么都没写，安全回退
-      return false;
-    }
-    npu_pend_l_ = l;
-    npu_pend_P_ = P;
-    return true;
-  }
-
-  // M2 收尾（也供 M1 提交后立即调用）：GPU 算剩余行（GEMM 行独立）-> 等
-  // NPU -> 解码到 d_npu_se_ 两半 -> silu 到 d_hidb。之后 d_eyb/d_sgb 由
-  // moe_b_shared_ey 尾部公共代码产出。d_npu_se_ 而不是 d_guvb：收尾发生在
-  // 路由专家阶段之后，d_guvb 正装着路由 pairs 等 reduce。
-  void npu_shexp_finish(int l, int P) {
-    npu_pend_l_ = -1;
-    const int nr = (int)std::min<uint64_t>(P, NpuGemm::kM);
-    char buf[128], ub[128];
-    snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.gate_proj.weight", l);
-    snprintf(ub, sizeof ub, "layers.%d.mlp.shared_expert.up_proj.weight", l);
-    if (P > nr) {
-      const WView g = wview(ckpt.at(buf)), u = wview(ckpt.at(ub));
-      gemm(g, d_xb + (size_t)nr * 2560, d_npu_se_ + (size_t)nr * 640, P - nr);
-      gemm(u, d_xb + (size_t)nr * 2560, d_npu_se_ + (size_t)P * 640 + (size_t)nr * 640,
-           P - nr);
-    }
-    if (!npu_->Wait(g_str)) {  // host func 排不上：CPU 侧直接等，结果仍有效
-      npu_->WaitHost();
-      npu_off_ = true;
-    }
-    constexpr size_t groups = (size_t)NpuGemm::kM * NpuGemm::kN / 8;
-    constexpr unsigned blocks = (unsigned)((groups + 255) / 256);
-    k_npu_dec_c<<<blocks, 256, 0, g_str>>>((const uint8_t*)npu_->Dev(npu_cg_), d_npu_se_,
-                                           nr, 640, 640);
-    k_npu_dec_c<<<blocks, 256, 0, g_str>>>((const uint8_t*)npu_->Dev(npu_cu_),
-                                           d_npu_se_ + (size_t)P * 640, nr, 640, 640);
-    k_silu_mul<<<(P * 640 + 255) / 256, 256, 0, g_str>>>(d_npu_se_, d_npu_se_ + (size_t)P * 640,
-                                                         d_hidb, P * 640);
-  }
-
-  // ---- M3：GDN z 门控（in_proj_z 6144x2560 = 6 片 N=1024）------------------
-  // 提交/收尾都在 gdn_proj_in_b 内：NPU 的 ~4.4ms 被同函数的 qkv GEMM
-  // （~12ms）盖住，无需跨函数 pend。z 消费点（gated norm）在 conv/scan 之后，
-  // 收尾只是等 NPU + 解码，不进关键路径。
-  bool npu_enc_z(int gi, const WView& w) {
-    const uint16_t* wbf = gemm_wbf16(w);  // [6144][2560] bf16（d_wbf16）
-    constexpr size_t groups = (size_t)2560 * 1024 / 8;
-    for (int s = 0; s < 6; ++s)
-      k_npu_enc_w<<<(unsigned)((groups + 255) / 256), 256, 0, g_str>>>(
-          wbf + (size_t)s * 1024 * 2560, (uint8_t*)npu_->Dev(npu_bz_[gi][s]), 1024);
-    CK(hipStreamSynchronize(g_str));
-    for (int s = 0; s < 6; ++s) npu_->FinalizeWeights(npu_bz_[gi][s]);
-    npu_zready_[gi] = 1;
-    return true;
-  }
-
-  // 返回 NPU 覆盖的行数 nr（0 = 未提交，调用方走全 GPU z GEMM）。
-  int npu_z_submit(int l, int P, const float* xb) {
-    static const bool want = [] {
-      const char* s = getenv("QWENOX_NPU");
-      return s && *s && strcmp(s, "0") != 0;
-    }();
-    if (!want || !npu_z_on() || npu_off_ || P < npu_minp()) return 0;
-    if (!npu_ && !npu_init()) return 0;
-    if (!npu_->Healthy()) {
-      npu_off_ = true;
-      return 0;
-    }
-    char buf[128];
-    snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_z.weight", l);
-    const WView w = wview(ckpt.at(buf));
-    if (w.rows != 6144 || w.cols != 2560) {
-      npu_off_ = true;  // 形状不符（不是本模型）：整体回退
-      return 0;
-    }
-    const int gi = l - (l + 1) / 4;
-    if (!npu_zready_[gi] && !npu_enc_z(gi, w)) return 0;
-    const int nr = (int)std::min<uint64_t>(P, NpuGemm::kM);
-    const unsigned mt = (nr + kNpuTileM - 1) / kNpuTileM;
-    k_npu_enc_a<<<mt * (2560 / kNpuTileK), 256, 0, g_str>>>(
-        xb, (uint8_t*)npu_->Dev(npu_a_), nr, 2560);
-    if (!npu_->Submit(g_str, npu_a_, npu_bz_[gi].data(), npu_cz_, 6)) {
-      npu_off_ = true;  // host func 没排上：什么都没写，安全回退
-      return 0;
-    }
-    return nr;
-  }
-
-  // 等 NPU + 把 6 条 C 流解码进 zb 的列区间 [s*1024, s*1024+1024)。
-  void npu_z_finish(float* zb, int nr) {
-    if (!npu_->Wait(g_str)) {  // host func 排不上：CPU 侧直接等，结果仍有效
-      npu_->WaitHost();
-      npu_off_ = true;
-    }
-    constexpr size_t groups = (size_t)NpuGemm::kM * NpuGemm::kN / 8;
-    constexpr unsigned blocks = (unsigned)((groups + 255) / 256);
-    for (int s = 0; s < 6; ++s)
-      k_npu_dec_c<<<blocks, 256, 0, g_str>>>(
-          (const uint8_t*)npu_->Dev(npu_cz_[s]), zb + s * 1024, nr, 1024, 6144);
-  }
-
-  // zb 首个消费点前的兜底收尾：提交与消费之间隔着 conv+scan，NPU 有充足窗口。
-  // 层/P 不匹配（不该发生）时禁用 NPU 并用 GPU 全量重算 z 保正确性。
-  void npu_z_pend_finish(int l, int P, const float* xb, float* zb) {
-    if (npu_pend_z_l_ < 0) return;
-    const int pl = npu_pend_z_l_, pP = npu_pend_z_P_;
-    npu_pend_z_l_ = -1;
-    if (pl == l && pP == P) {
-      npu_z_finish(zb, (int)std::min<uint64_t>(P, NpuGemm::kM));
-      return;
-    }
-    fprintf(stderr,
-            "[npu] z pend mismatch: submitted l=%d P=%d, consumed l=%d P=%d; "
-            "disabling NPU\n",
-            pl, pP, l, P);
-    npu_->WaitHost();
-    npu_off_ = true;
-    char buf[128];
-    snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_z.weight", l);
-    gemm(wview(ckpt.at(buf)), xb, zb, P);
-  }
-
-  // ---- M4：QSA q/gate（q_proj [12288][2560]，q=片 0..5，gate=片 6..11）----
-  bool npu_enc_qg(int qi, const WView& w) {
-    const uint16_t* wbf = gemm_wbf16(w);  // [12288][2560] bf16（d_wbf16）
-    constexpr size_t groups = (size_t)2560 * 1024 / 8;
-    for (int s = 0; s < 12; ++s)
-      k_npu_enc_w<<<(unsigned)((groups + 255) / 256), 256, 0, g_str>>>(
-          wbf + (size_t)s * 1024 * 2560, (uint8_t*)npu_->Dev(npu_bqg_[qi][s]),
-          1024);
-    CK(hipStreamSynchronize(g_str));
-    for (int s = 0; s < 12; ++s) npu_->FinalizeWeights(npu_bqg_[qi][s]);
-    npu_qgready_[qi] = 1;
-    return true;
-  }
-
-  // q 半提交（qsa_idx_b 入口，xb 此刻就绪；到 qsplit 消费还有整个
-  // indexer + k/v GEMM 的窗口）。只交片 0..5，单段 ~4.4ms。
-  int npu_qg_submit(int l, int P, const float* xb) {
-    static const bool want = [] {
-      const char* s = getenv("QWENOX_NPU");
-      return s && *s && strcmp(s, "0") != 0;
-    }();
-    if (!want || !npu_qg_on() || npu_off_ || P < npu_minp()) return 0;
-    if (npu_pend_qg_l_ >= 0) return 0;  // 上一个还没收尾（不该发生）：不叠提交
-    static const bool gate_bf16_ok = !env_zero("QWENOX_QSA_GATE_BF16");
-    if (!gate_bf16_ok) return 0;  // qsplit 会提前读 gate 半，与分半提交冲突
-    if (!npu_ && !npu_init()) return 0;
-    if (!npu_->Healthy()) {
-      npu_off_ = true;
-      return 0;
-    }
-    char buf[128];
-    snprintf(buf, sizeof buf, "layers.%d.self_attn.q_proj.weight", l);
-    const WView w = wview(ckpt.at(buf));
-    if (w.rows != 12288 || w.cols != 2560) {
-      npu_off_ = true;  // 形状不符（不是本模型）：整体回退
-      return 0;
-    }
-    const int qi = l / 4;
-    if (!npu_qgready_[qi] && !npu_enc_qg(qi, w)) return 0;
-    const int nr = (int)std::min<uint64_t>(P, NpuGemm::kM);
-    const unsigned mt = (nr + kNpuTileM - 1) / kNpuTileM;
-    k_npu_enc_a<<<mt * (2560 / kNpuTileK), 256, 0, g_str>>>(
-        xb, (uint8_t*)npu_->Dev(npu_a_), nr, 2560);
-    if (!npu_->Submit(g_str, npu_a_, npu_bqg_[qi].data(), npu_cqg_, 6)) {
-      npu_off_ = true;  // host func 没排上：什么都没写，安全回退
-      return 0;
-    }
-    npu_pend_qg_l_ = l;
-    npu_pend_qg_P_ = P;
-    npu_pend_qg_stage_ = 1;
-    return nr;
-  }
-
-  // 本层有未收尾 qg 时返回 NPU 覆盖行数（qsa_main_b 据此跳过/补尾 GPU gemm）
-  int npu_qg_pend_rows(int l) const {
-    return npu_pend_qg_l_ == l
-               ? (int)std::min<uint64_t>(npu_pend_qg_P_, NpuGemm::kM)
-               : 0;
-  }
-
-  // q 半收尾（qsplit 前）：Wait + 解码片 0..5 到 d_qgb 列 [0,6144)。
-  // 层不匹配（不该发生）：禁 NPU + GPU 全量重算 q_proj 保正确性。
-  void npu_qg_finish_q(int l) {
-    if (npu_pend_qg_l_ < 0) return;
-    if (npu_pend_qg_l_ != l) {
-      fprintf(stderr,
-              "[npu] qg pend mismatch: submitted l=%d, consumed l=%d; "
-              "disabling NPU\n",
-              npu_pend_qg_l_, l);
-      npu_->WaitHost();
-      npu_off_ = true;
-      char buf[128];
-      snprintf(buf, sizeof buf, "layers.%d.self_attn.q_proj.weight",
-               npu_pend_qg_l_);
-      gemm(wview(ckpt.at(buf)), d_xb, d_qgb, npu_pend_qg_P_);
-      npu_pend_qg_l_ = -1;
-      npu_pend_qg_stage_ = 0;
-      return;
-    }
-    if (npu_pend_qg_stage_ != 1) return;
-    if (!npu_->Wait(g_str)) {  // host func 排不上：CPU 侧直接等，结果仍有效
-      npu_->WaitHost();
-      npu_off_ = true;
-    }
-    const int nr = (int)std::min<uint64_t>(npu_pend_qg_P_, NpuGemm::kM);
-    constexpr size_t groups = (size_t)NpuGemm::kM * NpuGemm::kN / 8;
-    constexpr unsigned blocks = (unsigned)((groups + 255) / 256);
-    for (int s = 0; s < 6; ++s)
-      k_npu_dec_c<<<blocks, 256, 0, g_str>>>(
-          (const uint8_t*)npu_->Dev(npu_cqg_[s]), d_qgb + s * 1024, nr, 1024,
-          12288);
-    npu_pend_qg_stage_ = 2;
-  }
-
-  // gate 半提交（qsa:flash 前，~200ms 窗口）。失败则 GPU 全量重算覆盖行
-  // （q 半已被 qsplit 消费，重写无害；gate 列必须补上）。
-  void npu_qg_submit_g(int l, const float* xb) {
-    if (npu_pend_qg_l_ != l || npu_pend_qg_stage_ != 2) return;
-    const int nr = (int)std::min<uint64_t>(npu_pend_qg_P_, NpuGemm::kM);
-    const unsigned mt = (nr + kNpuTileM - 1) / kNpuTileM;
-    k_npu_enc_a<<<mt * (2560 / kNpuTileK), 256, 0, g_str>>>(
-        xb, (uint8_t*)npu_->Dev(npu_a_), nr, 2560);
-    if (!npu_->Submit(g_str, npu_a_, npu_bqg_[l / 4].data() + 6, npu_cqg_ + 6,
-                      6)) {
-      fprintf(stderr, "[npu] qg gate submit 失败，GPU 重算（禁用 NPU）\n");
-      npu_off_ = true;
-      char buf[128];
-      snprintf(buf, sizeof buf, "layers.%d.self_attn.q_proj.weight", l);
-      gemm(wview(ckpt.at(buf)), d_xb, d_qgb, nr);
-      npu_pend_qg_l_ = -1;
-      npu_pend_qg_stage_ = 0;
-      return;
-    }
-    npu_pend_qg_stage_ = 3;
-  }
-
-  // gate 半收尾（sigmoid gate 前，qsa:flash 已跑完）：解码片 6..11。
-  void npu_qg_finish_g(int l) {
-    if (npu_pend_qg_l_ != l || npu_pend_qg_stage_ != 3) return;
-    if (!npu_->Wait(g_str)) {
-      npu_->WaitHost();
-      npu_off_ = true;
-    }
-    const int nr = (int)std::min<uint64_t>(npu_pend_qg_P_, NpuGemm::kM);
-    constexpr size_t groups = (size_t)NpuGemm::kM * NpuGemm::kN / 8;
-    constexpr unsigned blocks = (unsigned)((groups + 255) / 256);
-    for (int s = 6; s < 12; ++s)
-      k_npu_dec_c<<<blocks, 256, 0, g_str>>>(
-          (const uint8_t*)npu_->Dev(npu_cqg_[s]), d_qgb + s * 1024, nr, 1024,
-          12288);
-    npu_pend_qg_l_ = -1;
-    npu_pend_qg_stage_ = 0;
-  }
-
-  // 调试路径（vgdump/qsa_loop）用：q 收尾 -> gate 提交 -> gate 收尾。
-  void npu_qg_finish_all(int l, const float* xb) {
-    npu_qg_finish_q(l);
-    npu_qg_submit_g(l, xb);
-    npu_qg_finish_g(l);
-  }
-#endif  // QWENOX_NPU
-
   // Shared expert output d_eyb [P][d] and gate logit d_sgb [P].
   void moe_b_shared_ey(int l, int P) {
     char buf[128];
@@ -6399,25 +5893,6 @@ struct GpuModel {
       char ub[128];
       snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.gate_proj.weight", l);
       snprintf(ub, sizeof ub, "layers.%d.mlp.shared_expert.up_proj.weight", l);
-#ifdef QWENOX_NPU
-      bool npu_did = false;
-      if (npu_pend_l_ >= 0) {
-        if (npu_pend_l_ == l && npu_pend_P_ == P) {  // M2：moe_b_v2 入口已提交，收尾
-          npu_shexp_finish(l, P);
-          npu_did = true;
-        } else {  // 挂着不匹配的提交——不该发生；丢弃在飞结果，永久回退
-          fprintf(stderr, "%s NPU: pend L%d/P%d != L%d/P%d，丢弃并回退 GPU\n", log_ts(),
-                  npu_pend_l_, npu_pend_P_, l, P);
-          npu_->WaitHost();
-          npu_pend_l_ = -1;
-          npu_off_ = true;
-        }
-      } else if (npu_shexp_submit(l, P, buf, ub)) {
-        npu_shexp_finish(l, P);  // 无重叠点的调用点：提交完立即收尾
-        npu_did = true;
-      }
-      if (!npu_did) {
-#endif
       if (se_gate_up_merged(wview(ckpt.at(buf)), wview(ckpt.at(ub)), P)) {
         k_silu_mul_g<<<(P * 640 + 255) / 256, 256, 0, g_str>>>(d_guvb, d_hidb, 640, P);
       } else {
@@ -6425,9 +5900,6 @@ struct GpuModel {
         k_silu_mul<<<(P * 640 + 255) / 256, 256, 0, g_str>>>(d_guvb, d_guvb + (size_t)P * 640,
                                                              d_hidb, P * 640);
       }
-#ifdef QWENOX_NPU
-      }
-#endif
     }
     snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.down_proj.weight", l);
     gemm(wview(ckpt.at(buf)), d_hidb, d_eyb, P);

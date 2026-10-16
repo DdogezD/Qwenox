@@ -17,6 +17,7 @@ int main(int argc, char** argv) {
   int it = 0;
   for (;; ++it) {
     Copy<<<2048, 256>>>((const uint4*)a, (uint4*)b, bytes / 16);
+    if (hipGetLastError() != hipSuccess) { std::printf("launch failed\n"); return 2; }
     if (it % 8 == 7) {
       hipDeviceSynchronize();
       if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() >= secs) break;

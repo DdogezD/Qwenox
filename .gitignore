@@ -18,5 +18,5 @@ data/*.bin
 # 兜底词表：tokenizer.json 体量大（~20MB），与 models/ 一样本地放置不入库
 data/tokenizer/*
 !data/tokenizer/README.md
-# npucheck 构建产物（logs/ 已被通用模式覆盖）
-tools/npucheck/out/
+# npucheck 构建产物（遗弃库；logs/ 已被通用模式覆盖）
+attic/npu-offload/tools/npucheck/out/
