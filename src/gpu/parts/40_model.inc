@@ -49,6 +49,7 @@ struct GpuModel {
     double ema = 1.0;  // decayed draft-token accept ratio (starts optimistic)
     int cd = 0;        // rounds the leg stays closed (probes when it hits 0)
     int rounds = 0;
+    bool last_full = false;  // previous ngram round committed its whole draft
     static bool disabled() {
       static const int v = [] {
         const char* e = getenv("QWENOX_NGRAM_GATE");
@@ -64,8 +65,23 @@ struct GpuModel {
     // A probe round measures the content with a short capped draft; a good
     // result reopens the leg to full-length drafts on the next round.
     bool probing() const { return !disabled() && rounds >= 4 && ema < 0.7; }
+    // QWENOX_NGRAM_SAMPLE_CAP=N (sampled requests, chain-sample; default 0 =
+    // off): until an ngram round commits its whole draft, cap the next draft
+    // at N tokens. A sampled ngram round costs checkpoint + verify + replay +
+    // sync whatever the draft length (Windows 10-16: ~115 ms capped at 8 vs
+    // ~135 ms for 64 at depth 0, ~130 vs ~215 ms at 64K; an MTP round is
+    // ~61 ms), so the cap only trims part of it and gives up long accepts on
+    // repetitive text — A/B (code + prose, 0/64K) was within noise.
+    static int sample_cap() {
+      static const int v = [] {
+        const char* e = getenv("QWENOX_NGRAM_SAMPLE_CAP");
+        return e ? std::max(0, std::min(64, atoi(e))) : 0;
+      }();
+      return v;
+    }
     void update(int keep, int proposed) {
       ++rounds;
+      last_full = keep >= proposed;
       ema += ((double)keep / std::max(1, proposed) - ema) * 0.25;
       if (rounds >= 4 && ema < 0.7 && cd == 0) cd = 32;
     }
@@ -8589,6 +8605,90 @@ struct GpuModel {
         d_grow + (size_t)vsnap_row0_ * ngdn * kGdnRowF, (size_t)ngdn * kGdnRowF, d_S, n);
   }
 
+  // QWENOX_SPEC_CONF=θ (sampled MTP rounds; default 0.9, 0 = GammaCtl):
+  // per-round draft length from the draft's own confidence. Draft step j is
+  // always verified; step j+1 is drafted only while the top-1 probability of
+  // step j's prepared draft distribution is >= θ, up to kSpecConfMax steps
+  // (OccGamma still caps rows under concurrency). The rule reads only q, so a
+  // seeded request stays reproducible and the target distribution is exact.
+  // Windows 10-16 (round cost T = 35 + 7.9·γ ms, early stops cost nothing):
+  // offline replay of a forced-γ7 SPEC_DUMP picked θ 0.9 (stopping before
+  // verifying a low-confidence draft and reshaping the draft temperature
+  // were worse); serve A/B vs adaptive γ, seeds 1-3, 512 tok — code 0K
+  // 57.5 -> 63.2, 64K 51.3 -> 63.4; prose 0K 40.2 -> 42.2, 64K 36.4 -> 39.3.
+  static constexpr int kSpecConfMax = 7;
+  static float spec_conf() {
+    static const float v = [] {
+      const char* e = getenv("QWENOX_SPEC_CONF");
+      return e ? std::max(0.f, std::min(1.f, (float)atof(e))) : 0.9f;
+    }();
+    return v;
+  }
+  // True when drafting should stop after step j (of g planned). sparse = the
+  // prepared sparse probabilities, else dense = prepared full-vocab probs.
+  static bool spec_conf_stop(int j, int g, const std::vector<float>* sparse,
+                             const std::vector<float>& dense) {
+    const float th = spec_conf();
+    if (th <= 0.f || j + 1 >= g) return false;
+    float m = 0.f;
+    if (sparse)
+      for (float v : *sparse) m = std::max(m, v);
+    else
+      for (float v : dense) m = std::max(m, v);
+    return m < th;
+  }
+
+  // QWENOX_SPEC_DUMP=path (observation only): one JSON line per sampled MTP
+  // round of chain-sample, for offline acceptance studies (draft-length stop
+  // rules, draft temperature). q = q position of the round, g drafts, a
+  // accepted; qt = top-1 prob of each draft distribution; per evaluated row
+  // (0..min(a, g-1)): x = draft token, qx/px = its draft/target probability,
+  // ov = sum min(p, q) (the row's expected acceptance), q/p = the prepared
+  // sparse distributions as [id, prob] pairs.
+  template <typename SD>
+  void spec_dump_round(int q, int g, int a, const std::vector<int>& drafts,
+                       const std::vector<SD>& q_sd, const std::vector<SD>& p_sd) {
+    static FILE* f = [] {
+      const char* e = getenv("QWENOX_SPEC_DUMP");
+      return e && *e ? fopen(e, "a") : nullptr;
+    }();
+    if (!f || g < 1 || (int)q_sd.size() < g) return;
+    auto prob = [](const SD& d, int id) {
+      for (size_t j = 0; j < d.ids.size(); j++)
+        if (d.ids[j] == id) return d.pr[j];
+      return 0.0f;
+    };
+    auto pairs = [&](const SD& d) {
+      fputc('[', f);
+      for (size_t j = 0; j < d.ids.size(); j++)
+        fprintf(f, "%s[%d,%.5g]", j ? "," : "", d.ids[j], d.pr[j]);
+      fputc(']', f);
+    };
+    fprintf(f, "{\"q\":%d,\"g\":%d,\"a\":%d,\"qt\":[", q, g, a);
+    for (int j = 0; j < g; j++) {
+      float m = 0.0f;
+      for (float v : q_sd[j].pr) m = std::max(m, v);
+      fprintf(f, "%s%.5g", j ? "," : "", m);
+    }
+    fprintf(f, "],\"rows\":[");
+    const int nr = std::min(a + 1, g);
+    for (int j = 0; j < nr && j < (int)p_sd.size(); j++) {
+      const SD& qd = q_sd[j];
+      const SD& pd = p_sd[j];
+      double ov = 0;
+      for (size_t u = 0; u < qd.ids.size(); u++)
+        ov += std::min(qd.pr[u], prob(pd, qd.ids[u]));
+      fprintf(f, "%s{\"x\":%d,\"qx\":%.5g,\"px\":%.5g,\"ov\":%.5g,\"q\":", j ? "," : "",
+              drafts[j], prob(qd, drafts[j]), prob(pd, drafts[j]), ov);
+      pairs(qd);
+      fprintf(f, ",\"p\":");
+      pairs(pd);
+      fputc('}', f);
+    }
+    fprintf(f, "]}\n");
+    fflush(f);
+  }
+
   struct GammaCtl {
     static constexpr float kPrior = 0.8f, kPriorN = 4.f;
     bool adapt = false;
@@ -8679,6 +8779,14 @@ struct GpuModel {
         fprintf(stderr, "\n");
       }
       if (!adapt) return;
+      if (strstr(tag, "sample") && spec_conf() > 0) {
+        // QWENOX_SPEC_CONF drove the draft lengths: hist is per-round γ.
+        fprintf(stderr, "%s spec-conf θ=%.2f: rounds per γ", tag, spec_conf());
+        for (int G = 1; G <= 8; G++)
+          if (hist[G]) fprintf(stderr, " %d:%d", G, hist[G]);
+        fprintf(stderr, "\n");
+        return;
+      }
       fprintf(stderr, "%s gamma-adapt: rounds per γ", tag);
       for (int G = 1; G <= 8; G++)
         if (hist[G]) fprintf(stderr, " %d:%d", G, hist[G]);
@@ -9507,7 +9615,8 @@ struct GpuModel {
     while ((int)out.size() < gen) {
       yield_point();  // round top: mtp_pos == pos-1, d_R == h_{pos-1}
       int q = pos - 1;
-      int g = std::min(gctl.cur, gen - (int)out.size());
+      int g = std::min(spec_conf() > 0 ? kSpecConfMax : gctl.cur,
+                       gen - (int)out.size());
       size_t chist_sz = chist.size();
       mtp_ckpt_save();
       Sampler draft_sampler = sampler.fork_stream(
@@ -9557,6 +9666,10 @@ struct GpuModel {
           // speculative draft steps are discarded before committed ingest.
           CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4,
                             hipMemcpyDeviceToDevice, g_str));
+        }
+        if (spec_conf_stop(j, g, q_sparse[j] ? &q_sd[j].pr : nullptr, q_rows[j])) {
+          g = j + 1;
+          break;
         }
       }
       auto t1 = std::chrono::steady_clock::now();
@@ -9773,8 +9886,8 @@ struct GpuModel {
     std::vector<std::vector<float>> q_rows(8);
     int depth_hits[8] = {0}, depth_tot[8] = {0};
     int accepted = 0, ng_rounds = 0, mtp_rounds = 0, ng_roll = 0,
-        mtp_roll = 0, fallback = 0;
-    double verify_ms = 0, replay_ms = 0;
+        mtp_roll = 0, fallback = 0, ng_keep = 0, ng_prop = 0;
+    double verify_ms = 0, replay_ms = 0, ng_ms = 0;
     // ngram verify chunking: same env semantics as the greedy chain; the
     // level lives in the shared Model member (see ng_chunk_init).
     ng_chunk_init();
@@ -9822,11 +9935,14 @@ struct GpuModel {
       const bool ng_open = ng_gate.open();
       if (ng_open && ng_gate.probing())
         want = std::min(want, std::max(8, ngram.n_min));
+      if (ng_open && NgGate::sample_cap() > 0 && !ng_gate.last_full)
+        want = std::min(want, std::max(NgGate::sample_cap(), ngram.n_min));
       std::vector<int> draft =
           (want > 0 && ng_open)
               ? ngram.draft(chist, cur, want)
               : std::vector<int>{};
       bool stop = false;
+      const auto t_round = std::chrono::steady_clock::now();
       // GPU sampling prep (direction A) applies to all three legs below.
       const bool smg = sms_gpu_active(sampler) && sms_round_shared(sampler);
       if (!draft.empty() && ng_legacy) {
@@ -9921,6 +10037,8 @@ struct GpuModel {
         if (next >= 0) cur = next;
         accepted += keep;
         ++ng_rounds;
+        ng_keep += keep;
+        ng_prop += (int)draft.size();
         ng_gate.update(keep, (int)draft.size());
         last_spec_proposed += (int)draft.size();
         if (mtp_ok) {
@@ -9936,6 +10054,7 @@ struct GpuModel {
                                         tokens.begin() + keep + 1),
                        keep + 1, base - 1);
         }
+        ng_ms += elapsed(t_round);
       } else if (!draft.empty()) {
         // ---- chunked ngram round, sampling semantics: the Sampler view ----
         // walks rows in draft order across chunks, so the draw stream matches
@@ -10058,6 +10177,8 @@ struct GpuModel {
         if (cont >= 0) cur = cur_c;
         accepted += keep_round;
         ++ng_rounds;
+        ng_keep += keep_round;
+        ng_prop += (int)draft.size();
         ng_gate.update(keep_round, (int)draft.size());
         last_spec_proposed += (int)draft.size();
         if (!ng_cs_fixed) {
@@ -10066,10 +10187,12 @@ struct GpuModel {
           else if (!round_full)
             ng_cs = std::max(8, ng_cs / 2);
         }
+        ng_ms += elapsed(t_round);
       } else if (mtp_ok) {
         // ---- MTP round (ngram table missed): spec_loop_sample's round ----
         int q = pos - 1;
-        int g = std::min({gctl.cur, gen - (int)out.size(), maxctx - pos - 1});
+        int g = std::min({spec_conf() > 0 ? kSpecConfMax : gctl.cur,
+                          gen - (int)out.size(), maxctx - pos - 1});
         if (g < 1) break;  // context edge: no room for even one draft
         // Row budget + occupancy γ. A sampled round's γ shapes its RNG draws:
         // for a client-seeded request OccGamma sees a deterministic B (nslots)
@@ -10124,6 +10247,10 @@ struct GpuModel {
             // Draft 1's indexer ring rows are truth; later drafts pollute.
             CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4,
                               hipMemcpyDeviceToDevice, g_str));
+          }
+          if (spec_conf_stop(j, g, q_sparse[j] ? &q_sd[j].pr : nullptr, q_rows[j])) {
+            g = j + 1;
+            break;
           }
         }
         std::vector<int> vt;
@@ -10221,6 +10348,7 @@ struct GpuModel {
           if (accept_sampler.uniform() >= threshold) break;
           target_view.remember(drafts[a]);
         }
+        if (smg_v) spec_dump_round(q, g, a, drafts, q_sd, p_sd);
         int next;
         float next_lp = 0.0f;
         target_view.rng = sampler.rng;
@@ -10349,6 +10477,11 @@ struct GpuModel {
             last_spec_rounds, ng_rounds, mtp_rounds, fallback,
             last_spec_rounds ? (double)out.size() / last_spec_rounds : 0.0,
             accepted, last_spec_proposed, last_spec_rollbacks);
+    if (ng_rounds)
+      fprintf(stderr,
+              "chain-sample ngram: rounds=%d accepted=%d proposed=%d "
+              "time=%.0f ms (%.1f ms/round)\n",
+              ng_rounds, ng_keep, ng_prop, ng_ms, ng_ms / ng_rounds);
     if (mtp_rounds) {
       fprintf(stderr, "chain-sample mtp depth acc:");
       for (int j = 0; j < 8 && depth_tot[j]; j++)
