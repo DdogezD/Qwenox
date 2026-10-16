@@ -3,15 +3,20 @@
 // 路径，OverdriveN/5 在 APU 上读不到功耗（参考 Easy-GPU-Tools backend_adl.c）。
 // Linux: amdgpu hwmon sysfs power1_average。两条路都失败时 available=false，
 // 前端显示不可用。读数是传感器瞬时值，纯驱动调用，不影响推理。
+//
+// 目标平台只有 gfx1151。实测（docs/POWER.md）：ADL 在 gfx1151 上唯一真实的功耗
+// 是整封装 ASIC_P(23)；GFX_P(30)/CPU_P(33) 是残桩，SoC 功耗传感器不存在，T_CPU
+// 恒 0。单独的 CPU 功耗对纯用户态不可得（SMU/能量 MSR 需 ring 0，详见文档）。
+// gfx_watts/cpu_watts/soc_watts 保留在接口里（前端按 null 隐藏），当前恒为 -1。
 #pragma once
 
 namespace power {
 
 struct Reading {
     bool available = false;
-    int socket_watts = -1;  // 整封装（APU 含 CPU+GPU+SoC）
-    int gfx_watts = -1;     // GPU 域（Linux sysfs 无单独读数）
-    int cpu_watts = -1;     // CPU 域（同上）
+    int socket_watts = -1;  // 整封装（CPU+GPU+SoC），gfx1151 上唯一真实的功耗
+    int gfx_watts = -1;     // 未使用（gfx1151 的 GFX_P 是残桩，不上报）
+    int cpu_watts = -1;     // 未使用（APU 上无准确的 CPU 功耗来源）
 
     // 温度（°C，整数；读不到为 -1）。与功耗同一次传感器快照。
     // Windows: ADL PMLog TEMPERATURE_*；Linux: GPU = amdgpu hwmon temp1(edge)/

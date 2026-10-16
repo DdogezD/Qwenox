@@ -3090,6 +3090,10 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // speculative one would report the previous request's acceptance
     m.live_spec_rounds = m.live_spec_commits = m.live_spec_proposed = 0;
     std::vector<kvsnap::Pending> pend;  // SSD captures, committed at turn end
+    // prefill 期间的断连中断：armed 仅覆盖下面的 ingest 段（cuts 循环 + 最后一段），
+    // prefill_batch 在分段间检查并抛 ReqCancelled。ingest 一结束立即 disarm——
+    // 后面的投机 verify 也走 prefill_batch，但回合本地状态存活时不能抛。
+    m.abort_flag = &c.cancel;
     static const bool cut_prof = getenv("QWENOX_PROF") != nullptr;
     auto cut_tp = t0;
     auto cut_lap = [&](const char* what) {
@@ -3136,6 +3140,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       m.cut_hit = m.cut_mtp_hit = false;
     }
     cur = m.prefill_batch(seg, (int)done_upto);
+    m.abort_flag = nullptr;  // ingest 完成：后续 verify 批次不许抛 ReqCancelled
     cut_lap("last-prefill");
     if (inpass_cc) {
       const bool mtp_cut = (use_spec || chain_mtp) && m.cut_mtp_hit;
@@ -3496,12 +3501,33 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       if (hist.size() >= kvs.min_tokens) kvsnap::capture(m, hist, mtp_live, pend);
       kvsnap::commit(m, hist, pend);
     }
+  } catch (const ReqCancelled& e) {
+    // 客户端在 prompt 预填期间断连/取消：decode 取消的同款收尾，D cancel 行。
+    // 已写入的分段 KV 属槽位持久状态，直接 reset 回收（同 KvOverflow 注释的语义）。
+    fprintf(stderr, "%s serve: req %lld %s\n", log_ts(), (long long)g.req,
+            e.what());
+    m.abort_flag = nullptr;
+    m.prog_total = 0;
+    m.pf_end = 0;
+    m.cut_abs = -1;
+    m.cut_r_ = 0;
+    m.cut_busy = false;
+    m.mtp_tap_capture = m.spec_snap = m.ngram_verify_active = false;
+    m.reset_state();
+    hist.clear();
+    mtp_live = false;
+    char cb[96];
+    snprintf(cb, sizeof cb, "D %lld cancel 0 0 0.0 0.0\n", (long long)g.req);
+    finish(cb);
+    perfsnap::write_idle();
+    viz::finish(s);
   } catch (const std::exception& e) {
     // prefill/decode failure, or KvOverflow (pool exhausted by concurrent
     // requests: this one is the later): the partial state is unknown, so
     // drop it (returning the slot's pages to the pool) and fail the request
     fprintf(stderr, "%s serve: req %lld failed: %s\n", log_ts(),
             (long long)g.req, e.what());
+    m.abort_flag = nullptr;
     m.prog_total = 0;
     m.mtp_tap_capture = m.spec_snap = m.ngram_verify_active = false;
     m.reset_state();
