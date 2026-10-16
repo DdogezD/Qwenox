@@ -337,6 +337,7 @@ MTP 开、视觉塔开、prefill chunk 8192):
 - [BENCHMARK.md](docs/BENCHMARK.md) — 性能测试工具
 - [bench/README.md](bench/README.md) — 任务级评测(长上下文代码捞针 A/B)
 - [PORTING-WINDOWS.md](docs/PORTING-WINDOWS.md) — Windows 移植与实测
+- [POWER.md](docs/POWER.md) — 功耗/温度读数的可信度与平台差异（为什么 APU 上没有单独的 CPU 功耗）
 
 测试:`bash build.sh test` 跑 kernel 单测(不加载模型,预期 ALL PASS);`python3 tools/bpw.py` 统计
 `models/` 下各权重的 bpw。

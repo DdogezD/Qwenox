@@ -376,6 +376,7 @@ columns are Task Manager readings in GB):
 - [BENCHMARK_EN.md](docs/BENCHMARK_EN.md) — benchmark tools
 - [bench/README.md](bench/README.md) — task-level evaluation (long-context code-needle A/B, in Chinese)
 - [PORTING-WINDOWS_EN.md](docs/PORTING-WINDOWS_EN.md) — Windows port and measurements
+- [POWER.md](docs/POWER.md) — power/temperature reading accuracy by platform, and why per-CPU watts is unavailable on APUs (in Chinese)
 
 Tests: `bash build.sh test` runs the kernel unit tests (no model loaded, expect ALL PASS);
 `python3 tools/bpw.py` reports the bpw of each weight file under `models/`.

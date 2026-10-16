@@ -15,9 +15,7 @@ namespace {
 // ADL2_New_QueryPMLogData_Get 返回全部传感器快照，按 ADL_PMLOG_SENSORS
 // 枚举直接索引。
 constexpr int ADL_PMLOG_MAX_SENSORS = 256;
-constexpr int ADL_PMLOG_ASIC_POWER = 23;          // W，整封装
-constexpr int ADL_PMLOG_GFX_POWER = 30;           // W，GPU 域
-constexpr int ADL_PMLOG_CPU_POWER = 33;           // W，CPU 域
+constexpr int ADL_PMLOG_ASIC_POWER = 23;          // W，整封装（gfx1151 上唯一真实的功耗）
 constexpr int ADL_PMLOG_SSPAIRED_ASICPOWER = 46;  // W，APU 整封装
 constexpr int ADL_PMLOG_BOARD_POWER = 73;         // W，板卡
 constexpr int ADL_PMLOG_TEMPERATURE_EDGE = 8;     // °C，GPU 边缘
@@ -71,7 +69,6 @@ void adl_init() {
         pm.size = static_cast<int>(sizeof(pm));
         if (g_query(g_ctx, i, &pm) != 0) continue;
         if (pm.sensors[ADL_PMLOG_ASIC_POWER].supported ||
-            pm.sensors[ADL_PMLOG_GFX_POWER].supported ||
             pm.sensors[ADL_PMLOG_SSPAIRED_ASICPOWER].supported ||
             pm.sensors[ADL_PMLOG_TEMPERATURE_EDGE].supported ||
             pm.sensors[ADL_PMLOG_TEMPERATURE_GFX].supported ||
@@ -110,10 +107,9 @@ Reading read() {
     out.socket_watts = sensor_value(pm, ADL_PMLOG_ASIC_POWER);
     if (out.socket_watts < 0) out.socket_watts = sensor_value(pm, ADL_PMLOG_SSPAIRED_ASICPOWER);
     if (out.socket_watts < 0) out.socket_watts = sensor_value(pm, ADL_PMLOG_BOARD_POWER);
-    out.gfx_watts = sensor_value(pm, ADL_PMLOG_GFX_POWER);
-    out.cpu_watts = sensor_value(pm, ADL_PMLOG_CPU_POWER);
-    out.available =
-        out.socket_watts >= 0 || out.gfx_watts >= 0 || out.cpu_watts >= 0;
+    // gfx1151 实测（docs/POWER.md）：GFX_P(30)/CPU_P(33) 都是残桩（GPU 满载 99%
+    // 只报 11W、CPU 满载只报 3W），SoC 功耗传感器不存在——都不读，只上报整封装。
+    out.available = out.socket_watts >= 0;
     out.gpu_temp_c = temp_value(pm, ADL_PMLOG_TEMPERATURE_GFX);
     if (out.gpu_temp_c < 0) out.gpu_temp_c = temp_value(pm, ADL_PMLOG_TEMPERATURE_EDGE);
     out.gpu_hotspot_c = temp_value(pm, ADL_PMLOG_TEMPERATURE_HOTSPOT);
