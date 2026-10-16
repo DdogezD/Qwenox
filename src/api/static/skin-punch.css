@@ -445,6 +445,7 @@
 [data-style="punch"] .table tbody tr:nth-child(6n+2) td,
 [data-style="punch"] .table tbody tr:nth-child(6n+3) td { background: var(--bar); }
 [data-style="punch"] .table td.r, [data-style="punch"] .table th.r { text-align: right; }
+[data-style="punch"] .table th .th-avg { font-weight: 400; color: var(--ink-mid); }
 [data-style="punch"] .table tbody tr:hover td { background-image: linear-gradient(var(--highlight), var(--highlight)); }
 
 [data-style="punch"] #req-table th:first-child, [data-style="punch"] #req-table td:first-child {

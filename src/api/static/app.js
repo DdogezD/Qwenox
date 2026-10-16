@@ -64,6 +64,7 @@ const I18N = {
     "usage.note": "v1 数据来自 /reqstat/tail 最近 1000 条记录，更早的历史需要后端按天聚合端点后接入。",
     "req.from": "起", "req.to": "止", "req.size": "每页", "req.clear": "清除筛选",
     "req.time": "时间", "req.cache": "缓存", "req.accept": "接受率",
+    "req.avg": "均值",
     "req.prev_page": "上一页", "req.next_page": "下一页",
     "req.note_server": "服务端分页（/reqstat/page），可翻阅全部历史；日期与 finish/drafter 为前端过滤（过滤时仅覆盖最近 1000 条）。",
     "req.note_filtered": "已设筛选：后端不支持按条件检索，仅在 /reqstat/tail 最近 1000 条内过滤分页。",
@@ -175,6 +176,7 @@ const I18N = {
     "usage.note": "v1: newest 1000 records via /reqstat/tail; older history needs a backend per-day aggregation endpoint.",
     "req.from": "From", "req.to": "To", "req.size": "Per page", "req.clear": "Clear filters",
     "req.time": "Time", "req.cache": "Cache", "req.accept": "Acceptance",
+    "req.avg": "avg",
     "req.prev_page": "Prev", "req.next_page": "Next",
     "req.note_server": "Server-side paging (/reqstat/page) over the full history; date and finish/drafter filters are client-side (newest 1000 records only).",
     "req.note_filtered": "Filters active: the backend has no conditional search, so filtering covers only the newest 1000 records from /reqstat/tail.",
@@ -1107,6 +1109,14 @@ function fillRequestRows(rows) {
     });
     tbody.appendChild(tr);
   }
+  // 表头 decode tok/s 均值：当前页显示行，口径与 /reqstat/summary 一致（Σoutput ÷ Σdecode 时间）
+  let outTok = 0, decMs = 0;
+  for (const r of rows) {
+    if (r.decode_ms > 0 && r.output_tokens > 0) { outTok += r.output_tokens; decMs += r.decode_ms; }
+  }
+  document.getElementById("req-avg-decode").textContent = decMs > 0
+    ? "(" + t("req.avg") + " " + fmtInt(Math.round((outTok * 1000) / decMs)) + ")"
+    : "";
 }
 
 async function renderRequests(force) {
