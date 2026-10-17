@@ -60,6 +60,7 @@ const I18N = {
     "usage.d30": "近 30 天",
     "usage.cached": "缓存命中",
     "usage.prompt_tokens": "prompt tokens", "usage.output_tokens": "output tokens",
+    "usage.total_tokens": "合计 tokens",
     "usage.empty": "范围内没有请求记录",
     "usage.note": "v1 数据来自 /reqstat/tail 最近 1000 条记录，更早的历史需要后端按天聚合端点后接入。",
     "req.from": "起", "req.to": "止", "req.size": "每页", "req.clear": "清除筛选",
@@ -172,6 +173,7 @@ const I18N = {
     "usage.d30": "30 days",
     "usage.cached": "Cache hit",
     "usage.prompt_tokens": "prompt tokens", "usage.output_tokens": "output tokens",
+    "usage.total_tokens": "total tokens",
     "usage.empty": "no requests in range",
     "usage.note": "v1: newest 1000 records via /reqstat/tail; older history needs a backend per-day aggregation endpoint.",
     "req.from": "From", "req.to": "To", "req.size": "Per page", "req.clear": "Clear filters",
@@ -930,6 +932,8 @@ function enterSample() {
 // ---------------- 用量 ----------------
 
 let usageAgg = [];  // [{day, requests, prompt, cached, gen}]，图表重绘用
+let usageGeom = null;  // 最近一次绘制的绘图区几何，鼠标悬浮命中用
+let usageTipDay = null;  // 当前提示框对应的日期对象，避免每次 mousemove 重建 DOM
 
 async function enterUsage() {
   try {
@@ -977,6 +981,8 @@ function renderUsage() {
 }
 
 function drawUsageChart() {
+  usageGeom = null;
+  hideUsageTip();
   const cv = document.getElementById("usage-chart");
   if (document.getElementById("page-usage").classList.contains("hidden")) return;
   const dpr = window.devicePixelRatio || 1;
@@ -1030,12 +1036,74 @@ function drawUsageChart() {
       g.fillText(d.day.slice(5), x + bw / 2, MT + ph + 6);
     }
   });
+  usageGeom = { ML, MT, pw, ph, slot, bw, n };
 }
 function niceCeil(v) {
   const p = Math.pow(10, Math.floor(Math.log10(v)));
   const m = v / p;
   return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p;
 }
+
+function hideUsageTip() {
+  usageTipDay = null;
+  const tip = document.getElementById("usage-tip");
+  if (tip) tip.classList.add("hidden");
+}
+
+// 悬浮命中按整天列（slot）计算：小柱子也容易指到；绘图区之外隐藏提示。
+function usageTipAt(ev) {
+  const cv = document.getElementById("usage-chart");
+  const box = cv.parentElement;
+  const br = box.getBoundingClientRect();
+  const x = ev.clientX - br.left, y = ev.clientY - br.top;
+  if (!usageGeom || x < usageGeom.ML || x >= usageGeom.ML + usageGeom.pw ||
+      y < usageGeom.MT || y > usageGeom.MT + usageGeom.ph) {
+    hideUsageTip();
+    return;
+  }
+  const i = Math.min(usageGeom.n - 1,
+    Math.max(0, Math.floor((x - usageGeom.ML) / usageGeom.slot)));
+  const d = usageAgg[i];
+  if (!d) { hideUsageTip(); return; }
+
+  const tip = document.getElementById("usage-tip");
+  if (usageTipDay !== d) {
+    usageTipDay = d;
+    tip.textContent = "";
+    const day = document.createElement("div");
+    day.className = "tip-day";
+    day.textContent = d.day;
+    tip.appendChild(day);
+    const hit = d.prompt ? Math.round((d.cached * 100) / d.prompt) + "%" : "—";
+    for (const [label, value] of [
+      [t("common.requests"), fmtInt(d.requests)],
+      [t("usage.prompt_tokens"), fmtInt(d.prompt)],
+      [t("usage.cached"), fmtInt(d.cached) + " (" + hit + ")"],
+      [t("usage.output_tokens"), fmtInt(d.gen)],
+      [t("usage.total_tokens"), fmtInt(d.prompt + d.gen)],
+    ]) {
+      const row = document.createElement("div");
+      row.className = "tip-row";
+      const l = document.createElement("span");
+      l.textContent = label;
+      const v = document.createElement("b");
+      v.textContent = value;
+      row.append(l, v);
+      tip.appendChild(row);
+    }
+  }
+  tip.classList.remove("hidden");
+  const tw = tip.offsetWidth, th = tip.offsetHeight;
+  let left = x + 16, top = y + 16;
+  if (left + tw > br.width - 6) left = x - tw - 16;
+  if (left < 6) left = 6;
+  if (top + th > br.height - 6) top = y - th - 16;
+  if (top < 6) top = 6;
+  tip.style.left = left + "px";
+  tip.style.top = top + "px";
+}
+document.getElementById("usage-chart").addEventListener("mousemove", usageTipAt);
+document.getElementById("usage-chart").addEventListener("mouseleave", hideUsageTip);
 // 图表盒子随窗口/布局伸缩（含切页时从隐藏变可见），观察盒子本身而不是 window
 let resizeT = null;
 new ResizeObserver(() => {

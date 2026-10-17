@@ -587,6 +587,33 @@
 [data-style="cassette"] .lg { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; }
 [data-style="cassette"] .lg-prompt { background: var(--chart-prompt); }
 [data-style="cassette"] .lg-gen { background: var(--chart-gen); margin-left: 18px; }
+/* 悬浮提示：跟着鼠标显示当前日期列的用量，不接收指针事件 */
+[data-style="cassette"] .chart-tip {
+  position: absolute;
+  z-index: 3;
+  pointer-events: none;
+  min-width: 156px;
+  padding: 8px 10px;
+  border: 1px solid var(--p-dim);
+  border-radius: 4px;
+  background: var(--scr-bg);
+  color: var(--p);
+  font-family: var(--f-crt);
+  font-size: 12px;
+  line-height: 1.55;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  box-shadow: var(--glow);
+}
+[data-style="cassette"] .chart-tip .tip-day {
+  margin-bottom: 4px;
+  padding-bottom: 4px;
+  border-bottom: 1px dashed var(--p-dim);
+  color: var(--p-mid);
+}
+[data-style="cassette"] .chart-tip .tip-row { display: flex; justify-content: space-between; gap: 16px; }
+[data-style="cassette"] .chart-tip .tip-row span { color: var(--p-mid); }
+[data-style="cassette"] .chart-tip .tip-row b { font-weight: 400; }
 
 /* ================= 走带模块 ================= */
 [data-style="cassette"] .sidebar {
