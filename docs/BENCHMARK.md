@@ -53,7 +53,11 @@ build/qwenox-bench.exe run
    arena、graph 或内存分配等任意异常都会终止测试。
 2. **Prefill 性能**：读取 `data/qsa-oracle/*.tokens` 中的 token 文件，
    每个文件单独测量，最后输出每个 prompt 和整体加权平均值。
-3. **TG / MTP 解码性能**：使用三类固定的英语测试场景：Python 代码生成、
+3. **增量 prefill（KV 延续）**：先用最大的 token 文件建立一个深上下文
+   基座（默认 32768 token，不计时），然后链式地追加测量若干小批量
+   增量（默认 101/301/501/1001/2501 token），深度随阶梯递增，模拟
+   agent 式多轮对话的增量 prefill 路径。可用 `BENCH_INCREMENT=0` 关闭。
+4. **TG / MTP 解码性能**：使用三类固定的英语测试场景：Python 代码生成、
    创意写作、常识问答。每个场景输出 TG 速度和 MTP 草稿 token 接受率。
 
 ## 配置覆盖
@@ -64,6 +68,10 @@ build/qwenox-bench.exe run
 |---|---:|---|
 | `QWENOX_BENCH_FORMAT` | 自动 | 强制选择 `hgn` 或 `gguf` |
 | `BENCH_PREFILL_REPEATS` | `2` | 每个 prefill prompt 的采样次数 |
+| `BENCH_INCREMENT` | `1` | 是否运行增量 prefill 段（`0` 关闭） |
+| `BENCH_INCREMENT_REPEATS` | `2` | 增量阶梯的重复轮数 |
+| `BENCH_INCREMENT_BASE` | `32768` | 增量段的基座上下文深度（token） |
+| `BENCH_INCREMENT_SIZES` | `101,301,501,1001,2501` | 增量批量大小阶梯（逗号分隔） |
 | `BENCH_DECODE_REPEATS` | `2` | 每个解码场景的采样次数 |
 | `BENCH_DECODE_TOKENS` | `128` | 每次解码生成的 token 数 |
 | `PREFILL_CHUNK` | `0` | prefill 分段大小；`0` 使用平台默认值 |

@@ -48,7 +48,12 @@ environment overrides instead.
 2. **Prefill** — benchmarks every `data/qsa-oracle/*.tokens` file. Each file
    is measured from a reset state after a non-measured engine warm-up. The
    report includes one row per prompt and a weighted average over all prompts.
-3. **TG / MTP decode** — loads the tokenizer configured by `TOKENIZER_DIR` and
+3. **Increment prefill (KV continuation)** — establishes a deep base context
+   once from the largest token file (32768 tokens by default, not timed), then
+   times chained incremental prefill calls (101/301/501/1001/2501 tokens by
+   default) so the depth grows like an agent-style conversation. Disable with
+   `BENCH_INCREMENT=0`.
+4. **TG / MTP decode** — loads the tokenizer configured by `TOKENIZER_DIR` and
    runs three fixed English workloads: Python code generation, creative
    writing, and common-sense question answering. Each row reports decode
    tokens/second and the weighted MTP draft acceptance rate. The benchmark
@@ -66,6 +71,10 @@ These do not change which model files are selected:
 | --- | ---: | --- |
 | `QWENOX_BENCH_FORMAT` | auto | `hgn` or `gguf` |
 | `BENCH_PREFILL_REPEATS` | `2` | Samples per prefill prompt |
+| `BENCH_INCREMENT` | `1` | Run the increment prefill stage (`0` disables) |
+| `BENCH_INCREMENT_REPEATS` | `2` | Ladder repetitions in the increment stage |
+| `BENCH_INCREMENT_BASE` | `32768` | Base context depth for the increment stage |
+| `BENCH_INCREMENT_SIZES` | `101,301,501,1001,2501` | Comma-separated increment batch sizes |
 | `BENCH_DECODE_REPEATS` | `2` | Samples per decode workload |
 | `BENCH_DECODE_TOKENS` | `128` | Generated tokens per decode sample |
 | `PREFILL_CHUNK` | `0` | Prefill chunk size; `0` uses the platform default |

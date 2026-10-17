@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cerrno>
 #include <climits>
+#include <cstdlib>
 #include <new>
 
 namespace {
@@ -429,6 +430,12 @@ struct DecodeRow {
   double acceptance = 0;
 };
 
+struct IncrementRow {
+  size_t base = 0;
+  size_t tokens = 0;
+  double ms = 0;
+};
+
 struct BenchSummary {
   std::string format;
   std::string model_path;
@@ -436,6 +443,10 @@ struct BenchSummary {
   int prefill_repeats = 0;
   std::vector<PrefillRow> prefill_rows;
   double prefill_avg = 0;
+  bool increment_ran = false;
+  int increment_repeats = 0;
+  size_t increment_base = 0;
+  std::vector<IncrementRow> increment_rows;
   bool decode_ran = false;
   int decode_gamma = 0;
   int decode_generated = 0;
@@ -456,6 +467,15 @@ static void print_summary(const BenchSummary& summary) {
     printf("  %-18s %10zu %12.1f\n", row.name.c_str(), row.tokens, row.rate);
   printf("  %-18s %10s %12.1f  (weighted average over %zu files)\n", "TOTAL", "-",
          summary.prefill_avg, summary.prefill_rows.size());
+  if (summary.increment_ran) {
+    printf("\nIncrement prefill (KV continuation, base %zu tokens, %d sample%s per size)\n",
+           summary.increment_base, summary.increment_repeats,
+           summary.increment_repeats == 1 ? "" : "s");
+    printf("  %-10s %10s %12s %12s\n", "base", "+tokens", "ms", "tok/s");
+    for (const auto& row : summary.increment_rows)
+      printf("  %-10zu %10zu %12.1f %12.1f\n", row.base, row.tokens, row.ms,
+             row.tokens * 1000.0 / row.ms);
+  }
   if (summary.decode_ran) {
     printf("\nDecode / TG (greedy, gamma=%d, %d generated tokens, %d sample%s per scenario)\n",
            summary.decode_gamma, summary.decode_generated, summary.decode_repeats,
@@ -508,6 +528,76 @@ static void run_prefill(GpuModel& model, const BenchConfig& config, int maxctx,
   summary.prefill_avg = total_tokens / total_seconds;
   printf("Prefill average: %.1f tok/s (weighted over %zu files, %d samples each)\n",
          summary.prefill_avg, files.size(), repeats);
+}
+
+// Increment (agent-style) prefill: establish a deep context once, then time
+// KV-continuation calls of L new tokens each, chained so the depth grows like
+// a real conversation. This exercises the path the from-scratch stage cannot
+// see: cached-prefix continuation, per-request PLE gather, HC chain at small P.
+// The increment slices come from the same corpus right after the base window
+// (wraps around if the ladder exceeds it).
+static void run_increment(GpuModel& model, const BenchConfig& config, int maxctx,
+                          BenchSummary& summary) {
+  if (config_int(config, "BENCH_INCREMENT", 1) == 0) return;
+  const int repeats = config_int(config, "BENCH_INCREMENT_REPEATS", 2);
+  const int base_size = config_int(config, "BENCH_INCREMENT_BASE", 32768);
+  if (repeats < 1 || base_size < 1)
+    throw std::runtime_error("BENCH_INCREMENT_REPEATS/BENCH_INCREMENT_BASE must be positive");
+  const std::string sizes_text =
+      config_value(config, "BENCH_INCREMENT_SIZES", "101,301,501,1001,2501");
+  std::vector<int> sizes;
+  for (size_t pos = 0;;) {
+    const size_t comma = sizes_text.find(',', pos);
+    const std::string item = sizes_text.substr(pos, comma - pos);
+    char* end = nullptr;
+    const long v = std::strtol(item.c_str(), &end, 10);
+    if (item.empty() || *end != 0 || v < 1 || v > INT_MAX)
+      throw std::runtime_error("invalid BENCH_INCREMENT_SIZES entry: " + item);
+    sizes.push_back((int)v);
+    if (comma == std::string::npos) break;
+    pos = comma + 1;
+  }
+  // Corpus: the largest .tokens file; base window + ladder slices from it.
+  const auto files = token_files(config);
+  auto largest = files.front();
+  for (const auto& f : files)
+    if (std::filesystem::file_size(f) > std::filesystem::file_size(largest)) largest = f;
+  const std::vector<int> corpus = read_token_file(largest);
+  if ((int)corpus.size() < base_size)
+    throw std::runtime_error("increment corpus smaller than BENCH_INCREMENT_BASE: " +
+                             largest.string());
+  size_t need = (size_t)base_size;
+  for (int s : sizes) need += (size_t)s * repeats;
+  if (need > (size_t)maxctx)
+    throw std::runtime_error("increment ladder exceeds MAX_CONTEXT");
+  summary.increment_ran = true;
+  summary.increment_repeats = repeats;
+  summary.increment_base = (size_t)base_size;
+  model.mtp_tap_capture = false;
+  model.reset_state();
+  model.prefill_batch(
+      std::vector<int>(corpus.begin(), corpus.begin() + base_size), 0, true,
+      /*quiet=*/true);
+  CK(hipDeviceSynchronize());
+  printf("\nIncrement prefill benchmark (KV continuation, base %d tokens, corpus %s)\n",
+         base_size, largest.stem().string().c_str());
+  printf("  %-10s %7s %10s %12s\n", "base", "+tokens", "ms", "tok/s");
+  size_t base = (size_t)base_size, pos = (size_t)base_size;
+  for (int sample = 0; sample < repeats; sample++) {
+    for (const int L : sizes) {
+      std::vector<int> inc((size_t)L);
+      for (int i = 0; i < L; i++)
+        inc[i] = corpus[(pos + (size_t)i) % corpus.size()];
+      pos += (size_t)L;
+      const auto start = Clock::now();
+      model.prefill_batch(inc, (int)base, true, /*quiet=*/true);
+      CK(hipDeviceSynchronize());
+      const double ms = seconds_since(start) * 1000.0;
+      printf("  %-10zu %7d %10.1f %12.1f\n", base, L, ms, L * 1000.0 / ms);
+      summary.increment_rows.push_back({base, (size_t)L, ms});
+      base += (size_t)L;
+    }
+  }
 }
 
 struct DecodeCase {
@@ -632,6 +722,7 @@ int main(int argc, char** argv) {
     summary.maxctx = maxctx;
     printf("\nPrefill benchmark\n");
     run_prefill(model, config, maxctx, summary);
+    run_increment(model, config, maxctx, summary);
     const int decode_result = run_decode(model, config, maxctx, summary);
     print_summary(summary);
     if (decode_result != 0) return decode_result;
