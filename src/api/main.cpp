@@ -3580,9 +3580,9 @@ std::string block_type(const json& block) {
     return block["type"].get<std::string>();
 }
 
-const std::string& block_string(const json& block, const char* key, const std::string& type) {
+const std::string& block_string(const json& block, const char* key, const char* type) {
     if (!block.contains(key) || !block[key].is_string())
-        http::fail(400, type + " blocks require a string " + key);
+        http::fail(400, std::string(type) + " blocks require a string " + key);
     return block[key].get_ref<const std::string&>();
 }
 
