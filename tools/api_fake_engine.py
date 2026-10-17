@@ -34,6 +34,8 @@ GUARD_CALL = [248058, 198, 27, 1628, 27362, 67017, 29, 198, 27, 15704, 28, 8656,
 GUARD_HI = [12675]
 GUARD_LOG = []
 GUARD_RESUMES = {}
+# BIAS pairs of every GEN (api_notools_ban_test.py); BIASLOG returns and clears.
+BIAS_LOG = []
 
 
 def guard_scenario(key, resumed, max_tokens):
@@ -144,6 +146,11 @@ def handle(conn):
                     send_line(conn, json.dumps(GUARD_LOG))
                     GUARD_LOG.clear()
                 continue
+            if line == "BIASLOG":
+                with TRACE_LOCK:
+                    send_line(conn, json.dumps(BIAS_LOG))
+                    BIAS_LOG.clear()
+                continue
             if line.startswith("X "):
                 record_cancel(int(line.split()[1]))
                 continue
@@ -156,6 +163,15 @@ def handle(conn):
             n_ids_at = 4 + n_eos
             n_ids = int(fields[n_ids_at])
             ids = [int(v) for v in fields[n_ids_at + 1:n_ids_at + 1 + n_ids]]
+            bias = []
+            if "BIAS" in fields[n_ids_at + 1 + n_ids:]:
+                at = fields.index("BIAS", n_ids_at + 1 + n_ids)
+                count = int(fields[at + 1])
+                bias = [[int(fields[at + 2 + 2 * i]), float(fields[at + 3 + 2 * i])]
+                        for i in range(count)]
+            with TRACE_LOCK:
+                BIAS_LOG.append({"max_tokens": int(fields[2]), "sampled": "SAMPLE" in fields,
+                                 "bias": bias})
 
             grids = []
             if "MROPE" in fields:

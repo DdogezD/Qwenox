@@ -1705,6 +1705,31 @@ ToolSetup parse_tool_setup(const json& body) {
     return result;
 }
 
+// A request with no callable tools (none declared, or tool_choice "none") has
+// no use for <tool_call> / </tool_call>, yet the model sometimes opens a call
+// anyway: an agent's title request, told to return only {"title":...},
+// answered with a tool call and the client showed "<tool_call>" as the session
+// title. Sampled requests get OpenAI's ban value (-100) on both tokens, except
+// one the client biased itself. Text that spells the tags out is not touched
+// (a prompt may ask for it). Greedy requests are left alone: the engine's bias
+// is sampler-only and it rejects a greedy request that carries one.
+// QWENOX_NOTOOLS_BAN=0 turns this off.
+void ban_tool_call_without_tools(const ToolSetup& tools, GenSpec* spec) {
+    static const bool off = [] {
+        const char* e = std::getenv("QWENOX_NOTOOLS_BAN");
+        return e != nullptr && std::strcmp(e, "0") == 0;
+    }();
+    if (off || tools.enabled() || !spec->sample || !g_tok_ready) return;
+    static const int ids[] = {g_tok.added_token_id("<tool_call>"),
+                              g_tok.added_token_id("</tool_call>")};
+    for (int id : ids) {
+        if (id < 0) continue;
+        bool client = false;
+        for (const auto& b : spec->bias) client = client || b.first == id;
+        if (!client) spec->bias.emplace_back(id, -100.0f);
+    }
+}
+
 bool responses_media_item(const json& item) {
     if (!item.is_object()) return false;
     const std::string type =
@@ -3026,6 +3051,7 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
                 ms(prep_t2, prep_t3), spec.snaps.size(), spec.ids.size());
     }
     apply_sampling(body, &spec);
+    ban_tool_call_without_tools(tool_setup, &spec);
 
     const bool stream = bool_field(body, "stream", false) && st != nullptr;
     const bool include_usage = stream_wants_usage(body);
@@ -3256,6 +3282,7 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
     if (spec.ids.empty()) http::fail(400, kEngineRejected);
     spec.snaps = compute_snap_cuts(messages, opts, rr.text, spec.ids, starts);
     apply_sampling(body, &spec);
+    ban_tool_call_without_tools(tool_setup, &spec);
 
     const std::string id = make_id("resp_");
     const long long created = now_unix();
@@ -3931,6 +3958,7 @@ void prepare_messages_request(const http::Request& q, http::Response* r, Message
     if (spec.ids.empty()) http::fail(400, kEngineRejected);
     spec.snaps = compute_snap_cuts(p->messages, opts, rr.text, spec.ids, starts);
     apply_sampling(body, &spec);
+    ban_tool_call_without_tools(p->tool_setup, &spec);
 }
 
 // Complete tool calls carry valid JSON objects; anything else (cannot happen
