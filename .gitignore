@@ -20,3 +20,6 @@ data/tokenizer/*
 !data/tokenizer/README.md
 # npucheck 构建产物（遗弃库；logs/ 已被通用模式覆盖）
 attic/npu-offload/tools/npucheck/out/
+# NPU 设备二进制（来自 gufo-npu/tools/npu，体量大不入库；fabric-clock.sh 例外）
+tools/npu/*.xclbin
+tools/npu/insts_*.txt
