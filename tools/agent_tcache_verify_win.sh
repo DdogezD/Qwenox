@@ -11,6 +11,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Stale logs would let the readiness greps below match a previous run.
+rm -f logs/agent_engine.log logs/agent_api_on.log logs/agent_api_off.log
+
 env QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1 QWENOX_MOE_LT=1 \
     QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1 QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 \
     QWENOX_PREFILL_CHUNK=16384 QWENOX_GEMM_WMMA=1 QWENOX_GDN_FUSED=1 \
@@ -29,10 +32,10 @@ for i in $(seq 1 150); do
 done
 [ "$ok" = 1 ] || { echo "引擎启动超时"; exit 1; }
 
-build/qwenox-win.exe --tokenizer models/tokenizer --engine 127.0.0.1:8732 \
+build/qwenox-win.exe --console --tokenizer models/tokenizer --engine 127.0.0.1:8732 \
   --host 127.0.0.1 --port 8733 --context 32768 > logs/agent_api_on.log 2>&1 &
 A1=$!
-QWENOX_API_TOKCACHE=0 build/qwenox-win.exe --tokenizer models/tokenizer \
+QWENOX_API_TOKCACHE=0 build/qwenox-win.exe --console --tokenizer models/tokenizer \
   --engine 127.0.0.1:8732 --host 127.0.0.1 --port 8734 --context 32768 \
   > logs/agent_api_off.log 2>&1 &
 A2=$!

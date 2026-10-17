@@ -511,6 +511,9 @@ struct GpuModel {
                           Dl = nullptr;
   };
   std::unordered_map<uint64_t, LtEntry> lt_algos;
+  // A1: (N,K,Pb) -> validated algo; Pb buckets P (ceil 64 below 1024, 256
+  // above). See the A1 comment in gemm(). Cleared together with lt_algos.
+  std::unordered_map<uint64_t, hipblasLtMatmulAlgo_t> lt_buckets;
   int* d_posarr;   // [maxctx] d_posarr[i] = i
   int* d_ringarr;  // [maxctx] d_ringarr[i] = i % 9
   int* d_tokarr;   // [maxctx] prefill token ids
@@ -2940,26 +2943,25 @@ struct GpuModel {
     // tensile kernel for every projection shape measured (5-6x over index 0),
     // so use it after a validation run; fall back to a timing scan if the
     // list is short or index 4 fails. Full descriptor set cached per (N,K,P).
+    // A1 (2026-10-17, HANDOFF-AGENT-SHORT-PREFILL): the algo is selected per
+    // (N,K,Pb), Pb = P ceiled to 64 (256 at P>=1024) — agent increments arrive
+    // with a fresh exact P every round and each exact-P miss paid a heuristic
+    // plus a queue-draining validation sync (30-90 ms, R1 lt_miss log). The
+    // layouts' leading dims (K,N,N) do not depend on P, so an algo validated
+    // at one P in the bucket is valid at every P; the descriptor set is still
+    // built per exact P (host-only, no sync). The heuristic runs with Pb
+    // layouts so the pick is uniform within a bucket (deterministic per P).
+    // QWENOX_LT_BUCKET=0 restores exact-P selection.
+    static const bool lt_bucket = [] {
+      const char* s = getenv("QWENOX_LT_BUCKET");
+      return !s || strcmp(s, "0") != 0;
+    }();
+    const int Pb = !lt_bucket ? P
+                   : P < 1024  ? ((P + 63) / 64) * 64
+                               : ((P + 255) / 256) * 256;
     uint64_t key = (N << 40) ^ (K << 20) ^ (uint64_t)P;
     auto it = lt_algos.find(key);
     if (it == lt_algos.end()) {
-      // QWENOX_LT_MISS_LOG=1: host time spent on this miss (heuristic + the
-      // validation run's stream sync), to size the per-new-P serving cost.
-      static const bool lt_miss_log = getenv("QWENOX_LT_MISS_LOG") != nullptr;
-      const auto lt_m0 = std::chrono::steady_clock::now();
-      struct LtMissLog {
-        bool on;
-        std::chrono::steady_clock::time_point t0;
-        uint64_t N, K;
-        int P;
-        ~LtMissLog() {
-          if (on)
-            fprintf(stderr, "lt_miss N=%llu K=%llu P=%d %.2f ms\n", (unsigned long long)N,
-                    (unsigned long long)K, P,
-                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
-                        .count());
-        }
-      } lt_ml{lt_miss_log, lt_m0, N, K, P};
       LtEntry e;
       hipblasLtMatmulDescCreate(&e.opd, HIPBLAS_COMPUTE_32F, HIP_R_32F);
       hipblasOperation_t opT = HIPBLAS_OP_T, opN = HIPBLAS_OP_N;
@@ -2971,52 +2973,86 @@ struct GpuModel {
       hipblasLtMatrixLayoutCreate(&e.Bl, HIP_R_16BF, K, P, K);
       hipblasLtMatrixLayoutCreate(&e.Cl, HIP_R_32F, N, P, N);
       hipblasLtMatrixLayoutCreate(&e.Dl, HIP_R_32F, N, P, N);
-      hipblasLtMatmulPreference_t pref;
-      hipblasLtMatmulPreferenceCreate(&pref);
-      hipblasLtMatmulPreferenceSetAttribute(
-          pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &lt_ws_bytes,
-          sizeof(lt_ws_bytes));
-      hipblasLtMatmulHeuristicResult_t hres[8];
-      int nres = 0;
-      hipblasLtMatmulAlgoGetHeuristic(lth, e.opd, e.Al, e.Bl, e.Cl, e.Dl, pref,
-                                      8, hres, &nres);
-      auto try_run = [&](int i) {
-        hipblasLtMatmul(lth, e.opd, &one, wp, e.Al, xp, e.Bl, &zero, y, e.Cl, y,
-                        e.Dl, &hres[i].algo, d_ltws, lt_ws_bytes, g_str);
-        if (hipStreamSynchronize(g_str) != hipSuccess) {
-          (void)hipGetLastError();
-          return false;
-        }
-        return true;
-      };
-      int bi = -1;
-      if (nres > 4 && hres[4].state == HIPBLAS_STATUS_SUCCESS &&
-          hres[4].workspaceSize <= lt_ws_bytes && try_run(4))
-        bi = 4;
-      else {  // fallback: time all candidates
-        double best = 1e30;
-        for (int i = 0; i < nres; i++) {
-          if (hres[i].state != HIPBLAS_STATUS_SUCCESS) continue;
-          if (hres[i].workspaceSize > lt_ws_bytes) continue;
-          if (!try_run(i)) continue;
-          auto t0 = std::chrono::steady_clock::now();
-          for (int r = 0; r < 3; r++) try_run(i);
-          double ms = std::chrono::duration<double, std::milli>(
+      const uint64_t bkey = (N << 40) ^ (K << 20) ^ (uint64_t)Pb;
+      auto bt = lt_buckets.find(bkey);
+      if (bt != lt_buckets.end()) {
+        e.algo = bt->second;  // validated at the bucket's first miss, host-only
+      } else {
+        // QWENOX_LT_MISS_LOG=1: host time spent on this miss (heuristic + the
+        // validation run's stream sync), to size the per-new-bucket cost.
+        static const bool lt_miss_log = getenv("QWENOX_LT_MISS_LOG") != nullptr;
+        const auto lt_m0 = std::chrono::steady_clock::now();
+        struct LtMissLog {
+          bool on;
+          std::chrono::steady_clock::time_point t0;
+          uint64_t N, K;
+          int P, Pb;
+          ~LtMissLog() {
+            if (on)
+              fprintf(stderr, "lt_miss N=%llu K=%llu P=%d Pb=%d %.2f ms\n",
+                      (unsigned long long)N, (unsigned long long)K, P, Pb,
+                      std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - t0)
-                          .count();
-          if (ms < best) {
-            best = ms;
-            bi = i;
+                          .count());
+          }
+        } lt_ml{lt_miss_log, lt_m0, N, K, P, Pb};
+        // Heuristic on bucket layouts so the pick is uniform within a bucket;
+        // the validation run below uses the exact-P set (real operands).
+        hipblasLtMatrixLayout_t bBl, bCl, bDl;
+        hipblasLtMatrixLayoutCreate(&bBl, HIP_R_16BF, K, Pb, K);
+        hipblasLtMatrixLayoutCreate(&bCl, HIP_R_32F, N, Pb, N);
+        hipblasLtMatrixLayoutCreate(&bDl, HIP_R_32F, N, Pb, N);
+        hipblasLtMatmulPreference_t pref;
+        hipblasLtMatmulPreferenceCreate(&pref);
+        hipblasLtMatmulPreferenceSetAttribute(
+            pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &lt_ws_bytes,
+            sizeof(lt_ws_bytes));
+        hipblasLtMatmulHeuristicResult_t hres[8];
+        int nres = 0;
+        hipblasLtMatmulAlgoGetHeuristic(lth, e.opd, e.Al, bBl, bCl, bDl, pref,
+                                        8, hres, &nres);
+        hipblasLtMatrixLayoutDestroy(bBl);
+        hipblasLtMatrixLayoutDestroy(bCl);
+        hipblasLtMatrixLayoutDestroy(bDl);
+        auto try_run = [&](int i) {
+          hipblasLtMatmul(lth, e.opd, &one, wp, e.Al, xp, e.Bl, &zero, y, e.Cl, y,
+                          e.Dl, &hres[i].algo, d_ltws, lt_ws_bytes, g_str);
+          if (hipStreamSynchronize(g_str) != hipSuccess) {
+            (void)hipGetLastError();
+            return false;
+          }
+          return true;
+        };
+        int bi = -1;
+        if (nres > 4 && hres[4].state == HIPBLAS_STATUS_SUCCESS &&
+            hres[4].workspaceSize <= lt_ws_bytes && try_run(4))
+          bi = 4;
+        else {  // fallback: time all candidates
+          double best = 1e30;
+          for (int i = 0; i < nres; i++) {
+            if (hres[i].state != HIPBLAS_STATUS_SUCCESS) continue;
+            if (hres[i].workspaceSize > lt_ws_bytes) continue;
+            if (!try_run(i)) continue;
+            auto t0 = std::chrono::steady_clock::now();
+            for (int r = 0; r < 3; r++) try_run(i);
+            double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+            if (ms < best) {
+              best = ms;
+              bi = i;
+            }
           }
         }
+        if (bi < 0) {
+          fprintf(stderr, "hipBLASLt: no algo for N=%llu K=%llu P=%d\n",
+                  (unsigned long long)N, (unsigned long long)K, P);
+          exit(1);
+        }
+        e.algo = hres[bi].algo;
+        hipblasLtMatmulPreferenceDestroy(pref);
+        lt_buckets.emplace(bkey, e.algo);
       }
-      if (bi < 0) {
-        fprintf(stderr, "hipBLASLt: no algo for N=%llu K=%llu P=%d\n",
-                (unsigned long long)N, (unsigned long long)K, P);
-        exit(1);
-      }
-      e.algo = hres[bi].algo;
-      hipblasLtMatmulPreferenceDestroy(pref);
       it = lt_algos.emplace(key, e).first;
     }
     const LtEntry& e = it->second;
@@ -6695,7 +6731,10 @@ struct GpuModel {
     {  // QWENOX_LT_FORGET=1 (diagnostic): every chunk re-pays the hipBLASLt
        // per-P algo miss, as a serving request with a new prompt length does.
       static const bool lt_forget = getenv("QWENOX_LT_FORGET") != nullptr;
-      if (lt_forget) lt_algos.clear();
+      if (lt_forget) {
+        lt_algos.clear();
+        lt_buckets.clear();
+      }
     }
     kv_prepare(base, base + P);  // A2/A3: back (and unshare) rows [base, base+P)
     set_vbase(base);  // P3-A: all base-reading batch kernels this chunk read d_vbase
