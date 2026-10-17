@@ -25,12 +25,16 @@ Key design points:
 
 Development machine: **GMK EVO-X2 (AMD Ryzen AI Max+ 395, Strix Halo / gfx1151)**, 122 GiB RAM.
 
-Linux (ROCm 10.1, production config, PREFILL_CHUNK=16384):
+Linux (ROCm 10.1, production config, prefill with MOE_A4=3, PREFILL_CHUNK=16384):
 
-| Metric | Value |
+| Metric | hgn v2 |
 | --- | --- |
-| Prefill (8K, chunk 16384) | ~1730–1750 tok/s (measured 10-07) |
-| Prefill (128K context) | ~1650 tok/s (measured 10-07) |
+| Prefill (2K) | ~1610–1651 tok/s (measured 10-18) |
+| Prefill (8K) | 1902.7 tok/s (measured 10-18) |
+| Prefill (32K) | 1938.5 tok/s (measured 10-18) |
+| Prefill (64K) | 1936.4 tok/s (measured 10-18) |
+| Prefill (128K) | 1840.8 tok/s (measured 10-18) |
+| Prefill weighted average | 1874.5 tok/s (7 files, 2 samples each, measured 10-18) |
 | Prefill (256K context) | ~1590 native, ~1580 with YaRN factor 2 (~0.5% overhead, measured 10-07) |
 | Decode (speculative, greedy, γ=4) | ~51 tok/s at 8K, ~50 at 64K (real text, 10-07) |
 | Decode (no speculation) | ~34 tok/s at 8K (measured 10-07, hgn v2 weights; weights with 8-bit dense read more per token, ~12–16% slower) |

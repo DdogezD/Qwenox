@@ -21,12 +21,16 @@ Qwenox 是 Qwen3.8-Flash-Next(177B MoE,qwen4_exp 架构)的本地推理引擎,�
 
 开发机器为 **GMK EVO-X2(AMD Ryzen AI Max+ 395,Strix Halo / gfx1151)**,122 GiB 内存。
 
-Linux(ROCm 10.1,生产配置,PREFILL_CHUNK=16384):
+Linux(ROCm 10.1,生产配置,prefill 开 MOE_A4=3,PREFILL_CHUNK=16384):
 
-| 指标 | 数值 |
+| 指标 | hgn v2 |
 | --- | --- |
-| Prefill(8K,chunk 16384) | 约 1730–1750 tok/s(10-07 实测) |
-| Prefill(128K 上下文) | 约 1650 tok/s(10-07 实测) |
+| Prefill(2K) | 约 1610–1651 tok/s(10-18 实测) |
+| Prefill(8K) | 1902.7 tok/s(10-18 实测) |
+| Prefill(32K) | 1938.5 tok/s(10-18 实测) |
+| Prefill(64K) | 1936.4 tok/s(10-18 实测) |
+| Prefill(128K) | 1840.8 tok/s(10-18 实测) |
+| Prefill 加权平均 | 1874.5 tok/s(7 个文件,每个 2 次采样,10-18 实测) |
 | Prefill(256K 上下文) | 原生约 1590、YaRN factor 2 约 1580 tok/s,开销约 0.5%(10-07 实测) |
 | Decode(投机,greedy,γ=4) | 8K 约 51、64K 约 50 tok/s(10-07 真实文本) |
 | Decode(不投机) | 8K 约 34 tok/s(10-07 实测,hgn v2 权重;dense 为 8-bit 的权重每 token 读量大,约低 12–16%) |
