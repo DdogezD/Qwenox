@@ -319,26 +319,40 @@ struct PleWin {
   }
 };
 
-// 两个读取器，各自独立的句柄与 IOCP：
+// 读取器，各自独立的句柄与 IOCP：
 //   g_ple_win    同步小批量（decode 每 token 16 行、NOSORT 调试路径），绑定槽的线程调用；
-//   g_ple_win_fl PLE flight（prefill gather：pump 线程 run / 小批 issue+wait_all）。
+//   g_ple_win_fls PLE flight（prefill gather：pump 线程 run / 小批 issue+wait_all）。
 // flight 会在 chunk 结束时发起、在后台线程跑到下一个 chunk 的 L0，期间 GPU 可能已
 // 交给另一个槽做 decode。两者共用一个 IOCP 时会互相取走对方的完成包（槽位按
 // OVERLAPPED 地址回推，取错即越界写堆 / 栈上 OVERLAPPED 被提前释放），并发服务下
 // 进程 0xC0000005。flight 同一时刻只有一个（新 flight 前必先 join 旧的），故
-// g_ple_win_fl 天然独占。
+// flight 实例集合天然独占；集合内每个实例只被一个 pump 线程使用（run() 还有
+// run_mu 兜底）。
+// A2：flight 实例数 = QWENOX_PLE_RINGS（默认 8，对齐 Linux io_uring 多环）。
+// 单实例单泵实测只有 ~23K IOPS（90B 随机读 47.7 GiB 表，page cache 装不下），
+// 多实例多线程把完成循环的 syscall 开销也并行掉。
+static constexpr int kPleWinFlMax = 16;
 static PleWin g_ple_win;
-static PleWin g_ple_win_fl;
+static PleWin g_ple_win_fls[kPleWinFlMax];
+static int g_ple_win_nfl = 0;
 
 static void ple_uring_open(const char* path) {
   // 名字沿用 Linux 版本；Windows 下建立 IOCP 句柄
-  if (g_ple_win.setup(path)) g_ple_win_fl.setup(path);
+  g_ple_win_nfl = 0;
+  if (!g_ple_win.setup(path)) return;
+  int want = 8;
+  if (const char* e = getenv("QWENOX_PLE_RINGS"))
+    want = std::max(1, std::min(kPleWinFlMax, atoi(e)));
+  for (int i = 0; i < want; i++) {
+    if (!g_ple_win_fls[i].setup(path)) break;
+    g_ple_win_nfl = i + 1;
+  }
 }
 
-static bool ple_uring_ready() { return g_ple_win.ok() && g_ple_win_fl.ok(); }
-static int ple_pump_count() { return 1; }
-#define PLE_PUMP g_ple_win_fl
-#define PLE_PUMP_I(i) g_ple_win_fl
+static bool ple_uring_ready() { return g_ple_win.ok() && g_ple_win_nfl > 0; }
+static int ple_pump_count() { return g_ple_win_nfl; }
+#define PLE_PUMP g_ple_win_fls[0]
+#define PLE_PUMP_I(i) g_ple_win_fls[i]
 
 struct PleWinPrefetch {
   struct Buffer {
