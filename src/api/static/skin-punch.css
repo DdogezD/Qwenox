@@ -515,6 +515,32 @@
 [data-style="punch"] .lg { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; }
 [data-style="punch"] .lg-prompt { background: var(--chart-prompt); }
 [data-style="punch"] .lg-gen { background: var(--chart-gen); margin-left: 18px; }
+/* 悬浮提示：跟着鼠标显示当前日期列的用量，不接收指针事件 */
+[data-style="punch"] .chart-tip {
+  position: absolute;
+  z-index: 3;
+  pointer-events: none;
+  min-width: 156px;
+  padding: 7px 9px;
+  border: 1.5px solid var(--ink);
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--f-print);
+  font-size: 12px;
+  line-height: 1.55;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  box-shadow: 3px 3px 0 var(--ink-faint);
+}
+[data-style="punch"] .chart-tip .tip-day {
+  margin-bottom: 4px;
+  padding-bottom: 4px;
+  border-bottom: 1px dashed var(--ink-mid);
+  color: var(--ink-mid);
+}
+[data-style="punch"] .chart-tip .tip-row { display: flex; justify-content: space-between; gap: 16px; }
+[data-style="punch"] .chart-tip .tip-row span { color: var(--ink-mid); }
+[data-style="punch"] .chart-tip .tip-row b { font-weight: 700; }
 
 /* ================= 右侧：读卡机 + 寄存器灯板（原走带模块） ================= */
 [data-style="punch"] .sidebar, [data-style="punch"] .console {

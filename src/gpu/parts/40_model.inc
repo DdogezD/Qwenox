@@ -608,6 +608,8 @@ struct GpuModel {
   // prefill scratch like d_hidb (written and consumed inside one MoE call).
   uint8_t *d_a4x = nullptr, *d_a4h = nullptr;  // [P][d/2], [P*topk][mid/2]
   float *d_a4xs = nullptr, *d_a4hs = nullptr;  // [P][d/128], [P*topk][mid/128]
+  // GGUF W4A4: [IQ4_NL | IQ4_XS | IQ3_S][sign][16 ratio levels][256 pair bytes]
+  uint8_t *d_gg_qt = nullptr;
   // GGUF routed experts (gg_on()): P == 1 scratch used by the decode graph;
   // batches reuse the prefill workspaces (see moe_gguf).
   __half* d_gg_x16 = nullptr;   // [d] F16 x
@@ -1141,12 +1143,21 @@ struct GpuModel {
                   dpf_bytes_ / 1048576.0);
         }
       }
-      if (moe_a4_env() && g_hgn_v2 && moe_q4w) {  // QWENOX_MOE_A4 (WS end, opt-in)
+      if ((moe_a4_env() && g_hgn_v2 && moe_q4w) || gg_a4_env()) {  // A4 (WS end, opt-in)
         const size_t d = g_cfg.d, km = (size_t)g_cfg.topk * g_cfg.moe_mid;
         DALLOC(&d_a4x, BP * d / 2);
         DALLOC(&d_a4xs, BP * (d / 128) * 4);
         DALLOC(&d_a4h, BP * km / 2);
         DALLOC(&d_a4hs, BP * (km / 128) * 4);
+        if (gg_on()) {
+          fprintf(stderr,
+                  "警告: QWENOX_GG_A4 已废弃（KLD +0.13 换 prefill +4%%，见 "
+                  "29_kernels_moe_gg_iu4.inc），禁止用于生产或测速口径\n");
+          DALLOC(&d_gg_qt, 3 * 8192);
+          gg_init_qtab(moegg::kIq4nl, d_gg_qt + 0 * 8192, 9.0f, g_str);
+          gg_init_qtab(moegg::kIq4xs, d_gg_qt + 1 * 8192, 9.0f, g_str);
+          gg_init_qtab(moegg::kIq3s, d_gg_qt + 2 * 8192, 9.0f, g_str);
+        }
       }
     }
     int nqsa = g_cfg.layers / 4;  // 12
@@ -2185,12 +2196,53 @@ struct GpuModel {
     }
     const size_t n4 = (size_t)P * d / 4;
     k_f32_to_f16_v4<<<(unsigned)((n4 + 255) / 256), 256, 0, g_str>>>(x, x16, n4);
-    if (!moe_ggx_up(g.tgu, g.gate, g.up, x16, tokidx, tiles, ntiles, max_tiles, hid, mid, d,
-                   g_str) ||
+    // QWENOX_GG_A4 (deprecated, forbidden for production/benchmarks, default
+    // off): linearizes each 128-K weight group in-kernel (per-32 GGUF scales
+    // -> one per-128 q map) and runs iu4 WMMA. Q8_0 down and MTP experts keep
+    // the F16 path. Verdict/evidence: see 29_kernels_moe_gg_iu4.inc header.
+    const int a4m = gg_a4_env();
+    auto qt_for = [&](int t) {
+      if (t == moegg::kIq4nl) return d_gg_qt + 0 * 8192;
+      if (t == moegg::kIq4xs) return d_gg_qt + 1 * 8192;
+      return d_gg_qt + 2 * 8192;
+    };
+    bool a4_up_ok = (a4m & 1) && d_a4x &&
+                    (g.tgu == moegg::kIq3s || g.tgu == moegg::kIq4xs || g.tgu == moegg::kIq4nl);
+    bool a4_dn_ok = (a4m & 2) && d_a4h && (g.tdn == moegg::kIq4nl || g.tdn == moegg::kIq4xs);
+    if (a4_up_ok) {
+      k_quant_a4<<<(unsigned)(((size_t)P * (d / 128) + 7) / 8), 256, 0, g_str>>>(x16, P, d,
+                                                                                d_a4x, d_a4xs);
+      a4_up_ok = moe_gg_iu4_up(g.tgu, g.gate, g.up, d_a4x, d_a4xs, tokidx, tiles, ntiles,
+                               max_tiles, hid, mid, d, qt_for(g.tgu), 9.0f, g_str);
+    }
+    if (!a4_up_ok &&
+        !moe_ggx_up(g.tgu, g.gate, g.up, x16, tokidx, tiles, ntiles, max_tiles, hid, mid, d,
+                    g_str))
+      throw std::runtime_error("moe_gguf: unsupported expert type");
+    if (a4_dn_ok) {
+      k_quant_a4<<<(unsigned)(((size_t)P * k * (mid / 128) + 7) / 8), 256, 0, g_str>>>(
+          hid, P * k, mid, d_a4h, d_a4hs);
+      a4_dn_ok = moe_gg_iu4_down(g.tdn, g.down, d_a4h, d_a4hs, tiles, ntiles, max_tiles,
+                                 (__half*)pairs, d, mid, qt_for(g.tdn), 9.0f, g_str);
+    }
+    if (!a4_dn_ok &&
         !moe_ggx_down(g.tdn, g.down, hid, tiles, ntiles, max_tiles, pairs, d, mid, g_str))
       throw std::runtime_error("moe_gguf: unsupported expert type");
-    k_moe_reduce_pw<10><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(pairs, pairids, pw, acc,
-                                                                     P, d);
+    if (a4_up_ok || a4_dn_ok) {
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        fprintf(stderr,
+                "gguf moe prefill: W4A4 iu4 DEPRECATED (up=%d down=%d; per-32 GGUF scales -> per-128 qtab)\n",
+                (int)a4_up_ok, (int)a4_dn_ok);
+      }
+    }
+    if (a4_dn_ok)
+      k_moe_reduce_pw<10, __half><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(
+          (const __half*)pairs, pairids, pw, acc, P, d);
+    else
+      k_moe_reduce_pw<10><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(pairs, pairids, pw, acc,
+                                                                       P, d);
   }
 
   // hgn q4cp routed experts through the LUT-decode WMMA kernels (QWENOX_MOE_Q4W):
