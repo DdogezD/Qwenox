@@ -1074,7 +1074,7 @@ struct Iu4W {
   int e_rows, up_off;
 };
 
-template <bool kUp>
+template <bool kUp, bool kGguf = false>
 __launch_bounds__(256) __global__
     void k_moe_iu4(Iu4W p, const uint8_t* __restrict__ x4, const float* __restrict__ xs,
                    const int* __restrict__ tokidx, const MoeTile* __restrict__ tiles,
@@ -1222,20 +1222,25 @@ __launch_bounds__(256) __global__
         g[j] = __half2float(gr[j * 32 + lane]);
         u[j] = __half2float(ur[j * 32 + lane]);
       }
-      hv2::fwht128(g[0], g[1], g[2], g[3], lane);
-      hv2::fwht128(u[0], u[1], u[2], u[3], lane);
       float v[4];
+      if constexpr (kGguf) {  // GGUF: weights are already in the plain basis
 #pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        const int i = r_block + j * 32 + lane;
-        const float gg = g[j] * hv2::kRs128 * svh_gu[i];
-        const float uu = u[j] * hv2::kRs128 * svh_gu[m + i];
-        v[j] = gg / (1.f + expf(-gg)) * uu * suh_dn[i];
+        for (int j = 0; j < 4; ++j) v[j] = g[j] / (1.f + expf(-g[j])) * u[j];
+      } else {
+        hv2::fwht128(g[0], g[1], g[2], g[3], lane);
+        hv2::fwht128(u[0], u[1], u[2], u[3], lane);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const int i = r_block + j * 32 + lane;
+          const float gg = g[j] * hv2::kRs128 * svh_gu[i];
+          const float uu = u[j] * hv2::kRs128 * svh_gu[m + i];
+          v[j] = gg / (1.f + expf(-gg)) * uu * suh_dn[i];
+        }
+        hv2::fwht128(v[0], v[1], v[2], v[3], lane);
       }
-      hv2::fwht128(v[0], v[1], v[2], v[3], lane);
       __half* o = out + (size_t)(slot0 + s) * m + r_block;
 #pragma unroll
-      for (int j = 0; j < 4; ++j) o[j * 32 + lane] = __float2half(v[j] * hv2::kRs128);
+      for (int j = 0; j < 4; ++j) o[j * 32 + lane] = __float2half(v[j] * (kGguf ? 1.f : hv2::kRs128));
     }
   } else {
     const int rr = r_block + wave * 16 + half * 8;

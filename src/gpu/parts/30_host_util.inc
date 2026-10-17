@@ -132,6 +132,14 @@ static int moe_a4_env() {
   return e && *e ? atoi(e) & 3 : 0;
 }
 
+// QWENOX_GG_A4（已废弃，禁止使用，默认关）：GGUF 原生 W4A4，位掩码同 MOE_A4。
+// 废弃结论与证据见 29_kernels_moe_gg_iu4.inc 头部。与 QWENOX_MOE_A4 分开，
+// 避免 service.conf 里的 hgn 开关悄悄改变 GGUF 行为。
+static int gg_a4_env() {
+  const char* e = getenv("QWENOX_GG_A4");
+  return e && *e ? atoi(e) & 3 : 0;
+}
+
 // 镜像 GpuModel 构造函数的分配公式（含相同 env 分支），用于 arena 精确 sizing。
 // 每项 256B 对齐后求和；估少了一律有 dalloc_arena 的 hipMalloc 回退兜底。
 // GGUF routed experts that load_arena will copy into the arena (Windows),
@@ -313,7 +321,7 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
   }
   // QWENOX_MOE_A4 激活量化缓冲（GpuModel d_a4*；构造器另要求 v2 权重，此处
   // 早于 v2_init 只看 env，非 v2 时多估几十 MiB）
-  if (moe_a4_env()) {
+  if (moe_a4_env() || gg_a4_env()) {
     add(BP * g_cfg.d / 2);
     add(BP * (g_cfg.d / 128) * 4);
     add(BP * g_cfg.topk * g_cfg.moe_mid / 2);
