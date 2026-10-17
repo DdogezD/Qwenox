@@ -6182,6 +6182,14 @@ struct GpuModel {
     }
     if (flush_mlp) {
       if (!hcw) gr_write_b(mlp_prefix, P);
+      if (srep && flush_mlp && !hcw && !vg_capturing_) {
+        stm("hc3.prep", [&] { gr_write_prep_b(mlp_prefix, P); });
+        if (gr_bf16)
+          stm("hc3.wr", [&] {
+            k_gr_write_b_hc_bf16<<<(P * 2560 + 255) / 256, 256, 0, g_str>>>(
+                d_w4b, (uint16_t*)d_Rb, d_yb, g_cfg.d, g_cfg.branches, P);
+          });
+      }
     } else if (hcw) {
       hcw_site_ = mlp_prefix;
     }
@@ -6810,6 +6818,7 @@ struct GpuModel {
     if (prog_total > 0) prog_probe(0, P);
     phase("embed+L0", TP);
     if (ple_on) {
+      KP("ple_wait");  // 否则 join 的磁盘等待会落进上一个分段（hc3）
       auto wait_start = std::chrono::steady_clock::now();
       ple_join();
       auto wait_done = std::chrono::steady_clock::now();
@@ -6821,6 +6830,7 @@ struct GpuModel {
       }
       const int buf = ple_fl.buf;
       ple_fl.valid = false;
+      KP("ple_dev");
       enq_ple_device_b(P, base, buf);
       vg_dump_row("vgp", P, base);
     }

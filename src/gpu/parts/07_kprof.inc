@@ -101,10 +101,17 @@ struct KProfRing {
     // 外层区间时间包含内层，各 tag 独立累加。
     int lastb = -1;
     int sub_stk[16], sub_top = 0;
+    static const int kpd = [] {  // QWENOX_KPROF_DUMP=P: dump per-mark spans of the first chunk at that P
+      const char* e = getenv("QWENOX_KPROF_DUMP");
+      return e ? atoi(e) : -1;
+    }();
+    const bool dump = kpd > 0 && P == kpd;
     for (int i = 0; i < n; i++) {
       if (kind[i] == 0) {
         if (lastb >= 0) {
           float ms = span(lastb, i);
+          if (dump)
+            fprintf(stderr, "  kpd[%d] %s %.3f ms\n", lastb, tag[lastb], ms);
           // Windows/TheRock: 个别 event 的时间戳会回跳 ~200 ms（疑似 KMD 提交
           // 批边界处的时钟域差异），每 chunk 约一次。负区间钳为 0 并计入
           // neg_clamp，总量与归属误差据此可估。

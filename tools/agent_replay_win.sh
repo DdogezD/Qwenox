@@ -80,7 +80,11 @@ DEFAULT_RUNS=(
   "r0|8192|"
   "r0|98304|"
 )
-RUNS=(${RUNS:-"${DEFAULT_RUNS[@]}"})
+if [[ -n "${RUNS:-}" ]]; then
+  mapfile -t RUNS <<< "$RUNS"   # newline-separated; extra env may contain spaces
+else
+  RUNS=("${DEFAULT_RUNS[@]}")
+fi
 FAILS=()
 for spec in "${RUNS[@]}"; do
   IFS='|' read -r tag depth extra <<< "$spec"
