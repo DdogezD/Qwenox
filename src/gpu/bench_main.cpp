@@ -456,39 +456,23 @@ struct BenchSummary {
   double decode_accept_avg = 0;
 };
 
+// The per-stage tables above are the detailed record; the summary only
+// restates the headline aggregates so nothing is printed twice.
 static void print_summary(const BenchSummary& summary) {
   printf("\n================ Benchmark Summary ================\n");
   printf("Model       : %s (%s)\n", summary.model_path.c_str(), summary.format.c_str());
   printf("Max context : %d tokens\n", summary.maxctx);
-  printf("\nPrefill (%d sample%s per file)\n", summary.prefill_repeats,
-         summary.prefill_repeats == 1 ? "" : "s");
-  printf("  %-18s %10s %12s\n", "token file", "tokens", "tok/s");
-  for (const auto& row : summary.prefill_rows)
-    printf("  %-18s %10zu %12.1f\n", row.name.c_str(), row.tokens, row.rate);
-  printf("  %-18s %10s %12.1f  (weighted average over %zu files)\n", "TOTAL", "-",
-         summary.prefill_avg, summary.prefill_rows.size());
-  if (summary.increment_ran) {
-    printf("\nIncrement prefill (KV continuation, base %zu tokens, %d sample%s per size)\n",
-           summary.increment_base, summary.increment_repeats,
-           summary.increment_repeats == 1 ? "" : "s");
-    printf("  %-10s %10s %12s %12s\n", "base", "+tokens", "ms", "tok/s");
-    for (const auto& row : summary.increment_rows)
-      printf("  %-10zu %10zu %12.1f %12.1f\n", row.base, row.tokens, row.ms,
-             row.tokens * 1000.0 / row.ms);
-  }
-  if (summary.decode_ran) {
-    printf("\nDecode / TG (greedy, gamma=%d, %d generated tokens, %d sample%s per scenario)\n",
-           summary.decode_gamma, summary.decode_generated, summary.decode_repeats,
-           summary.decode_repeats == 1 ? "" : "s");
-    printf("  %-18s %10s %12s %12s\n", "scenario", "prompt", "tok/s", "MTP accept");
-    for (const auto& row : summary.decode_rows)
-      printf("  %-18s %10zu %12.1f %11.1f%%\n", row.name.c_str(), row.prompt_tokens,
-             row.rate, row.acceptance * 100.0);
-    printf("  %-18s %10s %12.1f %11.1f%%  (weighted average)\n", "TOTAL", "-",
+  printf("Prefill     : %.1f tok/s (weighted, %zu files x %d samples)\n",
+         summary.prefill_avg, summary.prefill_rows.size(), summary.prefill_repeats);
+  if (summary.increment_ran)
+    printf("Increment   : %zu rows (base %zu, %d sample%s per size)\n",
+           summary.increment_rows.size(), summary.increment_base,
+           summary.increment_repeats, summary.increment_repeats == 1 ? "" : "s");
+  if (summary.decode_ran)
+    printf("Decode / TG : %.1f tok/s, MTP accept %.1f%% (weighted)\n",
            summary.decode_avg, summary.decode_accept_avg * 100.0);
-  } else {
-    printf("\nDecode / TG : skipped (no usable MTP weights or tokenizer)\n");
-  }
+  else
+    printf("Decode / TG : skipped (no usable MTP weights or tokenizer)\n");
   printf("===================================================\n");
 }
 
