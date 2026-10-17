@@ -12,7 +12,8 @@
 static uint64_t g_ple_foff = 0;  // file offset of the PLE table in that file
 static bool g_ple_off_ok = false;
 // bytes per PLE row (160 codes): 160 = hgn fp8 (dtype 10), 90 = GGUF IQ4_NL
-// (dtype 11, 5 x 18 B blocks). Staging holds 16 raw rows per token back to back.
+// (dtype 11, 5 x 18 B blocks), 320 = hgn bf16 (dtype 0). Staging holds 16 raw
+// rows per token back to back.
 static unsigned g_ple_rb = 160;
 
 #ifndef _WIN32

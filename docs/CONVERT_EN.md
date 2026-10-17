@@ -105,6 +105,13 @@ reproducible. Overall precision is on par with GGUF's Q4_K.
 | q8g64 | per-64-column affine: `w = code * scale + min` (fp16 scale/min, uint8 codes) | MTP sidecar, overlay o_proj |
 | fp8 | e4m3 + one trailing fp32 global scale (= absmax/448) | PLE ngram table |
 
+The big PLE ngram table also has an optional **lossless bf16 variant**:
+`tools/ple_ngram_bf16.py <HF model dir> -o <out.hgn>` stacks the 128 bf16
+shards byte-for-byte into a single-tensor dtype-0 file (~95.4 GiB, twice the
+fp8 size, no trailing scale; a pure byte copy, no requantization). The engine
+auto-detects the dtype (fp8 = 160 B rows + scale, bf16 = 320 B rows, scale 1);
+just point `NGRAM_FILE` in service.conf at it, everything else unchanged.
+
 ### Error levels and trade-offs
 
 - RTN is lossy by nature: q4cp's relative RMSE is about 8–10%, but LLM

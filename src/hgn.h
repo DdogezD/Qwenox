@@ -13,6 +13,8 @@
 //   dtype 10 FP8 E4M3 (n-gram table): [numel uint8 codes][4B fp32 global
 //            scale at the very end];  w = e4m3(code) * scale
 //            (verified 2026-09-08 vs BF16 original rows via range requests)
+//            (the n-gram table also ships as plain dtype 0 bf16, 320 B rows,
+//            no trailing scale — tools/ple_ngram_bf16.py)
 // Synthetic dtypes (built in memory from GGUF by gguf_map.h, never on disk):
 //   dtype 1  F32 passthrough (norms, conv, A_log, dt_bias)
 //   dtype 8  q8g32 planar: [rows*cols int8 codes][rows*cols/32 fp16 scales];

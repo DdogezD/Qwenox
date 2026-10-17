@@ -637,6 +637,7 @@ struct GpuModel {
   const Tensor* ple_table = nullptr;
   float ple_tscale = 1.f;
   bool ple_iq4 = false;  // table is the GGUF IQ4_NL view (dtype 11, g_ple_rb 90)
+  bool ple_bf16 = false;  // table is raw bf16 (dtype 0, g_ple_rb 320, no scale)
   int ple_ringpos = 0;           // host mirror for direct mode
   int* d_token = nullptr;        // device scalars for graph-replayable kernels
   int* d_pos = nullptr;
@@ -1402,6 +1403,7 @@ struct GpuModel {
             "PLE n-gram table (layers.1.ple.ngram_embedding.weight) not found: hgn v2 keeps it "
             "in a separate file — set NGRAM_FILE (qwenox: pass that .hgn as an overlay)");
       ple_iq4 = ple_table->dtype == 11;
+      ple_bf16 = ple_table->dtype == 0;
       if (ple_iq4) {
         // GGUF IQ4_NL table: 90 B rows, no global scale. The batch-read fd is
         // re-pointed at the shard that holds it (mmapped from offset 0).
@@ -1420,7 +1422,20 @@ struct GpuModel {
                       g_ple_off_ok ? "" : " (batch reader unavailable: mapped reads)");
             }
       } else {
+      if (ple_bf16) {
+        // Raw bf16 table (dtype 0): 320 B rows, values used as-is (no trailing
+        // global scale — the fp8 layout's extra 4 B do not exist here).
+        if (ple_table->ndims != 3 || ple_table->dims[2] != 160 ||
+            ple_table->data_size != ple_table->numel() * 2)
+          throw std::runtime_error("PLE bf16 table: bad shape/size");
+        g_ple_rb = 320;
+        ple_tscale = 1.f;
+      } else if (ple_table->dtype == 10) {
       memcpy(&ple_tscale, ple_table->data + ple_table->numel(), 4);
+      } else {
+        throw std::runtime_error("PLE n-gram table: unsupported dtype " +
+                                 std::to_string(ple_table->dtype));
+      }
       // io_uring / IOCP path: file offset of the PLE table in the file that
       // holds it. open_base opened the base .hgn; a separate n-gram file
       // (NGRAM_FILE, passed as an overlay — hgn v2 ships the table on its
@@ -2404,6 +2419,11 @@ struct GpuModel {
       gguf::dequant_row(gguf::IQ4_NL, p, dst, 160);
       return;
     }
+    if (ple_bf16) {
+      const uint16_t* p16 = (const uint16_t*)p;
+      for (int i = 0; i < 160; i++) dst[i] = hgn::bf16_to_f32(p16[i]);
+      return;
+    }
     for (int i = 0; i < 160; i++) dst[i] = hgn::fp8e4m3_to_f32(p[i]) * ple_tscale;
   }
   // reads the 16 PLE rows for chist position t into dst (pure read of chist;
@@ -2436,9 +2456,9 @@ struct GpuModel {
     // pass 2: read (pages already in flight)
     for (int h = 0; h < 16; h++) ple_deq(addrs[h], dst + h * 160);
   }
-  // raw variant: staging keeps the g_ple_rb row bytes per head (fp8 codes or
-  // IQ4_NL blocks); dequant happens on GPU (k_ple_fp8_dequant /
-  // k_ple_iq4nl_dequant). ~4x less host work per token.
+  // raw variant: staging keeps the g_ple_rb row bytes per head (fp8 codes,
+  // IQ4_NL blocks or bf16 values); dequant happens on GPU (k_ple_fp8_dequant /
+  // k_ple_iq4nl_dequant / k_ple_bf16_dequant). ~4x less host work per token.
   void ple_rows_fp8(int t, uint8_t* dst) {
     auto cat = [&](int back) -> int64_t {
       int j = t - back;
@@ -7211,6 +7231,10 @@ struct GpuModel {
       size_t nb = (size_t)P * 2560 / 32;
       k_ple_iq4nl_dequant<<<(unsigned)((nb + 255) / 256), 256, 0, g_str>>>(
           stg_dev, d_eb, nb);
+    } else if (ple_bf16) {
+      size_t n16 = (size_t)P * 2560 / 16;
+      k_ple_bf16_dequant<<<(unsigned)((n16 + 255) / 256), 256, 0, g_str>>>(
+          stg_dev, d_eb, n16);
     } else {
       size_t n16 = (size_t)P * 2560 / 16;
       k_ple_fp8_dequant<<<(unsigned)((n16 + 255) / 256), 256, 0, g_str>>>(
@@ -7654,6 +7678,10 @@ struct GpuModel {
         size_t nb = (size_t)R * 2560 / 32;
         k_ple_iq4nl_dequant<<<(unsigned)((nb + 255) / 256), 256, 0, g_str>>>(
             stg_dev, d_eb, nb);
+      } else if (ple_bf16) {
+        size_t n16 = (size_t)R * 2560 / 16;
+        k_ple_bf16_dequant<<<(unsigned)((n16 + 255) / 256), 256, 0, g_str>>>(
+            stg_dev, d_eb, n16);
       } else {
         size_t n16 = (size_t)R * 2560 / 16;
         k_ple_fp8_dequant<<<(unsigned)((n16 + 255) / 256), 256, 0, g_str>>>(

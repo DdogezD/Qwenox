@@ -113,6 +113,35 @@ __global__ void k_ple_iq4nl_dequant(const uint8_t* __restrict__ src,
   }
 }
 
+// --- PLE bf16 staging dequant (dtype 0 table): raw bf16 rows (16 rows x 160
+// per token, packed 5120 B/token) -> f32 embeddings. Bit-exact with
+// hgn::bf16_to_f32 (zero-extend << 16); no scale.
+__device__ __forceinline__ float ple_bf16_f32(uint16_t v) {
+  uint32_t u = (uint32_t)v << 16;
+  float f;
+  memcpy(&f, &u, 4);
+  return f;
+}
+__global__ void k_ple_bf16_dequant(const uint8_t* __restrict__ src,
+                                   float* __restrict__ dst,
+                                   size_t n16) {  // n16 = elements/16
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n16) return;
+  uint4 raw0 = ((const uint4*)src)[i * 2];
+  uint4 raw1 = ((const uint4*)src)[i * 2 + 1];
+  const uint16_t* b0 = (const uint16_t*)&raw0;
+  const uint16_t* b1 = (const uint16_t*)&raw1;
+  float4* d4 = (float4*)dst + i * 4;
+  d4[0] = make_float4(ple_bf16_f32(b0[0]), ple_bf16_f32(b0[1]),
+                      ple_bf16_f32(b0[2]), ple_bf16_f32(b0[3]));
+  d4[1] = make_float4(ple_bf16_f32(b0[4]), ple_bf16_f32(b0[5]),
+                      ple_bf16_f32(b0[6]), ple_bf16_f32(b0[7]));
+  d4[2] = make_float4(ple_bf16_f32(b1[0]), ple_bf16_f32(b1[1]),
+                      ple_bf16_f32(b1[2]), ple_bf16_f32(b1[3]));
+  d4[3] = make_float4(ple_bf16_f32(b1[4]), ple_bf16_f32(b1[5]),
+                      ple_bf16_f32(b1[6]), ple_bf16_f32(b1[7]));
+}
+
 // --- argmax over n floats -> writes int id
 __global__ void k_argmax(const float* __restrict__ x, int n, int* __restrict__ out) {
   __shared__ float bv[1024];

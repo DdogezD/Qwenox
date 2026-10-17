@@ -140,6 +140,15 @@ static int gg_a4_env() {
   return e && *e ? atoi(e) & 3 : 0;
 }
 
+// The PLE n-gram table never enters the device arena (read from page cache /
+// disk at runtime): dtype 10 (hgn fp8), 11 (GGUF IQ4_NL) — or dtype 0 when the
+// table ships as raw bf16 under the same name (320 B rows). dtype 4 = the tiny
+// u64 hash config tensors, also host-side only.
+static inline bool is_ple_offarena(const Tensor& t) {
+  return t.dtype == 10 || t.dtype == 11 || t.dtype == 4 ||
+         t.name == "layers.1.ple.ngram_embedding.weight";
+}
+
 // 镜像 GpuModel 构造函数的分配公式（含相同 env 分支），用于 arena 精确 sizing。
 // 每项 256B 对齐后求和；估少了一律有 dalloc_arena 的 hipMalloc 回退兜底。
 // GGUF routed experts that load_arena will copy into the arena (Windows),
@@ -151,7 +160,7 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
   // 权重：Windows 下专家也进 arena（无 hipHostRegister 直读；PLE 表/配置留盘）
   for (auto& kv : ck.tensors()) {
     const Tensor& t = kv.second;
-    if (t.dtype == 10 || t.dtype == 11 || t.dtype == 4) continue;
+    if (is_ple_offarena(t)) continue;
     add(t.data_size);
   }
 #ifdef _WIN32
@@ -682,7 +691,7 @@ static void load_arena(const Checkpoint& ck) {
   size_t total = 0, xbytes = 0;
   for (auto& kv : ck.tensors()) {
     const Tensor& t = kv.second;
-    if (t.dtype == 10 || t.dtype == 11 || t.dtype == 4) continue;  // PLE table / u64 config
+    if (is_ple_offarena(t)) continue;  // PLE table / u64 config
     if (t.dtype == 2) continue;  // hgn v2 f16 sidecars: v2_init uploads them as f32
     if (is_gguf_experts(t.name)) continue;  // served from GGUF
 #ifndef _WIN32
@@ -733,7 +742,7 @@ static void load_arena(const Checkpoint& ck) {
   size_t off = 0;
   for (auto& kv : ck.tensors()) {
     const Tensor& t = kv.second;
-    if (t.dtype == 10 || t.dtype == 11 || t.dtype == 4) continue;
+    if (is_ple_offarena(t)) continue;
     if (t.dtype == 2) continue;
     if (is_gguf_experts(t.name)) continue;
 #ifndef _WIN32

@@ -90,6 +90,13 @@ Q4_K 同级。
 | q8g64 | 每 64 列一组仿射量化:`w = code * scale + min`(fp16 scale/min,uint8 码) | MTP sidecar、overlay o_proj |
 | fp8 | e4m3 + 末尾一个 fp32 全局 scale(= absmax/448) | PLE ngram 表 |
 
+PLE ngram 大表也可选 **bf16 无损版**:`tools/ple_ngram_bf16.py
+<HF 模型目录> -o <输出.hgn>` 把 128 个 bf16 分片原字节拼成单张量
+dtype 0 的独立文件(约 95.4 GiB,fp8 版的两倍,无末尾 scale;纯字节
+拷贝,不重量化)。引擎按 dtype 自动识别(fp8=160 B/行带 scale,
+bf16=320 B/行 scale=1),把 service.conf 的 `NGRAM_FILE` 指过去即可,
+其余文件不变。
+
 ### 误差水平与取舍
 
 - RTN 必然有损:q4cp 的相对 RMSE 约 8–10%,但 LLM 权重对这类噪声

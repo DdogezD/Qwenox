@@ -197,9 +197,15 @@ struct Model {
       const Tensor& vo = L1("ple_embedding.ngram_heads_offsets");
       memcpy(ple.voff, vo.data, 128);
       ple.table = &L1("ngram_embedding.weight");
-      if (ple.table->dtype != 10) throw std::runtime_error("ple table dtype");
-      memcpy(&ple.tscale, ple.table->data + ple.table->numel(), 4);
-      fprintf(stderr, "ple table scale = %.9g\n", ple.tscale);
+      if (ple.table->dtype == 0) {
+        ple.tscale = 1.f;
+        fprintf(stderr, "ple table bf16 (no scale)\n");
+      } else if (ple.table->dtype == 10) {
+        memcpy(&ple.tscale, ple.table->data + ple.table->numel(), 4);
+        fprintf(stderr, "ple table scale = %.9g\n", ple.tscale);
+      } else {
+        throw std::runtime_error("ple table dtype");
+      }
     }
     ple.ring.assign(9 * 10240, 0.f);
   }
@@ -226,8 +232,13 @@ struct Model {
       if (h >= 8) mix ^= cat(2) * ple.mult[2];
       uint64_t row = (uint64_t)(ple.voff[h] + (int64_t)(mix % ple.vsz[h]));
       if (dbg) fprintf(stderr, "  ple t=%d h=%d row=%llu\n", t, h, (unsigned long long)row);
-      const uint8_t* p = ple.table->data + row * 160;
-      for (int i = 0; i < 160; i++) e[h * 160 + i] = hgn::fp8e4m3_to_f32(p[i]) * ple.tscale;
+      if (ple.table->dtype == 0) {
+        const uint16_t* p = (const uint16_t*)(ple.table->data + row * 320);
+        for (int i = 0; i < 160; i++) e[h * 160 + i] = hgn::bf16_to_f32(p[i]);
+      } else {
+        const uint8_t* p = ple.table->data + row * 160;
+        for (int i = 0; i < 160; i++) e[h * 160 + i] = hgn::fp8e4m3_to_f32(p[i]) * ple.tscale;
+      }
     }
     if (dbg) {
       fprintf(stderr, "  ple e head0:");
