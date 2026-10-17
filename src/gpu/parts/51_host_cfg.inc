@@ -2087,24 +2087,33 @@ struct Turnstile {
     std::unique_lock<std::mutex> lk(mu);
     const uint64_t t = next++;
     if (heavy_rem > 0) heavy.emplace_back(t, heavy_rem);
-    cv.wait(lk, [&] {
-      return serving == t ||
-             (tl_park_flag && tl_park_flag->load(std::memory_order_acquire));
-    });
-    if (serving != t) {
-      // 挂起请求：放弃这张票（tombstone 让 release 跳过它，FIFO 不留洞），
-      // 抛给 gen_one 去 capture/挂起。此刻不持有回合。
-      if (t == next - 1)
-        next--;
-      else
-        tomb.insert(t);
-      if (heavy_rem > 0)
-        for (size_t i = 0; i < heavy.size(); i++)
-          if (heavy[i].first == t) {
-            heavy.erase(heavy.begin() + (long)i);
-            break;
-          }
-      throw ParkRequest();
+    for (;;) {
+      cv.wait(lk, [&] {
+        return serving == t ||
+               (tl_park_flag && tl_park_flag->load(std::memory_order_acquire));
+      });
+      if (tl_park_flag && tl_park_flag->load(std::memory_order_acquire)) {
+        // park 标志优先于 ticket 授予：如果 starve 释放 turn 后正好轮到
+        // victim，不能让它先拿到回合再绕过 park。若它已经是 serving ticket，
+        // 由这里推进 serving；否则留下 tombstone 让后续 release 跳过它。
+        if (serving == t) {
+          serving++;
+          while (tomb.erase(serving)) serving++;
+        } else if (t == next - 1) {
+          next--;
+        } else {
+          tomb.insert(t);
+        }
+        if (heavy_rem > 0)
+          for (size_t i = 0; i < heavy.size(); i++)
+            if (heavy[i].first == t) {
+              heavy.erase(heavy.begin() + (long)i);
+              break;
+            }
+        cv.notify_all();
+        throw ParkRequest();
+      }
+      if (serving == t) break;
     }
     if (heavy_rem > 0)
       for (size_t i = 0; i < heavy.size(); i++)
@@ -2425,6 +2434,19 @@ static void borrow_turn(GpuModel& m);
 // one round each (borrow_turn: heavy waiters requeue) and keep the GPU.
 static void yield_hook(GpuModel& m) {
   if (tl_slot < 0) return;
+  // yield_point() is the first safe boundary after rendezvous/borrow work.
+  // The victim may reach it while no other waiter remains on the turnstile;
+  // checking park only inside acquire would then leave the victim owning the
+  // turn forever while starve waits for its capture. Throw here while the
+  // round-top/segment state is consistent; Lease will suppress its release
+  // after the park catch has returned the pages.
+  if (tl_park_flag && tl_park_flag->load(std::memory_order_acquire)) {
+    // yield_point() runs while this worker owns the turn. ParkRequest 的 catch
+    // 会把 Lease.turn 置为 false，因此必须先交还 turn，避免 victim unwind
+    // 后 turn 永久留在已退出的线程里。
+    g_turn.release();
+    throw ParkRequest();
+  }
   const int rem = m.pf_rem();
   if (rem > 0 && prefill_srpt()) {
     const Turnstile::Waiters w = g_turn.waiters();
@@ -2998,6 +3020,8 @@ static bool starve(GpuModel& m) {
   }
   if (v >= 0) {
     Slot& sv = g_slots[(size_t)v];
+    const uint64_t victim_gen = sv.park_gen;
+    const long long victim_req = sv.park_req;
     // 挂起握手：牺牲者处于可挂起阶段（g_slot_parkable）且 kvsnap 开启时，
     // 请它自己把一致状态 capture 到 SSD 再释放页，而不是直接杀掉。牺牲者
     // 此刻必不持有 GPU 回合（本函数由回合持有者在 reserve 失败时调用），
@@ -3025,10 +3049,14 @@ static bool starve(GpuModel& m) {
         g_slot_park[v].store(true, std::memory_order_release);
         g_turn.poke();  // 唤醒它在 acquire 里的等待
       }
-      // 超时只覆盖"牺牲者还没走到安全点"（下一个回合顶/分段边界，有界）。
-      // 一旦它开始 capture（park_busy）就等到底：capture 是纯 D2H，若卡住
-      // 说明 GPU 本身已不可用；半途收回会与进行中的 capture 并发触碰同一
-      // 批页，可能把损坏的快照提交进 kvsnap。
+      // starve 由当前 GPU turn 持有者调用。victim 可能正停在 verify/draft
+      // rendezvous，必须重新取得 turn 才能完成本轮并到达下一个 park 安全点；
+      // 如果这里一直持有 turn，victim 永远无法完成握手，只会稳定超时。
+      // 因此 park 等待期间暂时交还 turn，成功/失败后再由当前请求取回。
+      // 先释放 g_sm；victim 的 ParkRequest 收尾也需要这把锁。
+      lk.unlock();
+      g_turn.release();
+      lk.lock();
       const auto deadline = std::chrono::steady_clock::now() + park_wait();
       for (;;) {
         if (sv.park_gen != park_gen || sv.park_req != park_req) break;
@@ -3039,28 +3067,41 @@ static bool starve(GpuModel& m) {
         g_parkcv.wait_for(lk, std::chrono::milliseconds(100));
       }
       const bool same_park = sv.park_gen == park_gen && sv.park_req == park_req;
+      const bool parked = same_park && sv.parked;
       if (same_park)
         g_slot_park[v].store(false, std::memory_order_release);
-      if (same_park && sv.parked) {
+      if (parked) {
         fprintf(stderr, "%s [kvpage] pool dry: slot %d parked to kvsnap for "
                 "slot %d (gen %llu attempt %u); will resume when the pool has room\n",
                 log_ts(), v, cur, (unsigned long long)park_gen, park_attempt);
         sv.parked = false;  // 一次性信号
-        return true;        // 页已由牺牲者自己还给池子
+      } else {
+        fprintf(stderr, "%s [kvpage] pool dry: park of slot %d %s (gen %llu), "
+                "falling back to abort\n", log_ts(), v,
+                same_park && sv.park_failed ? "could not snapshot" : "timed out",
+                (unsigned long long)park_gen);
+        if (same_park) {
+          sv.park_busy = false;
+          sv.park_failed = false;
+        }
       }
-      fprintf(stderr, "%s [kvpage] pool dry: park of slot %d %s (gen %llu), "
-              "falling back to abort\n", log_ts(), v,
-              same_park && sv.park_failed ? "could not snapshot" : "timed out",
-              (unsigned long long)park_gen);
-      if (same_park) {
-        sv.park_busy = false;
-        sv.park_failed = false;
-      }
+      // g_sm 仍受保护地完成信号处理；随后无锁取回 turn，避免 victim
+      // 在 ParkRequest 收尾时与当前线程形成反向锁依赖。取回后重新绑定当前 slot；
+      // victim 的成功 capture 已经自己释放了它的页。
+      lk.unlock();
+      g_turn.acquire();
+      m.bind(cur);
+      lk.lock();
+      if (parked) return true;
     }
     fprintf(stderr, "%s [kvpage] pool dry: aborting the later request on slot %d "
             "(%d pages) for slot %d\n", log_ts(), v, m.slot_pages(v), cur);
-    m.slot_reset(v, cur);
-    sv.abort = true;
+    if (g_slots[(size_t)v].park_gen == victim_gen &&
+        g_slots[(size_t)v].park_req == victim_req &&
+        g_slots[(size_t)v].busy) {
+      m.slot_reset(v, cur);
+      g_slots[(size_t)v].abort = true;
+    }
     return true;
   }
   throw KvOverflow("KV pool exhausted: concurrent contexts exceed the shared pool");
