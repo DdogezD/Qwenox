@@ -1086,7 +1086,7 @@ enum PanelId : int {
     kBrModel, kBrNgram, kBrOverlay, kBrMtp, kBrVision,
     kBrGguf, kBrGgufMtp, kBrGgufVision,
     kOffOverlay, kOffMtp, kOffVision, kOffGgufMtp, kOffGgufVision,
-    kEdMaxctx, kCbParallel, kEdKvPool, kCkKvPaged, kEdPrefill,
+    kEdMaxctx, kCbMaxctxPreset, kCbParallel, kEdKvPool, kCkKvPaged, kEdPrefill,
     kCkYarn, kEdKvsnap, kEdKvsnapDir, kBrKvsnapDir,
     kEdEHost, kEdEPort, kEdAHost, kEdAPort,
     kEdOut1, kEdOut2, kEdOut3, kEdReport, kEdSummary, kBtnLang,
@@ -1104,8 +1104,8 @@ struct PanelCtl {
     FileRow row_gguf, row_gguf_mtp, row_gguf_vision, row_tok;
     HWND tok_hint = nullptr, ver_note = nullptr;
     HWND moe_a4 = nullptr;  // V2 专属勾选框：prefill 4-bit 加速（MOE_A4）
-    HWND maxctx = nullptr, parallel = nullptr, kv_pool = nullptr, kv_paged = nullptr,
-         prefill = nullptr;
+    HWND maxctx = nullptr, maxctx_preset = nullptr, parallel = nullptr, kv_pool = nullptr,
+         kv_paged = nullptr, prefill = nullptr;
     HWND yarn = nullptr;  // "YaRN 长上下文扩展" 勾选框（ROPE_FACTOR 自动推导，无编辑行）
     HWND kvsnap = nullptr;
     HWND kvsnap_dir = nullptr, kvsnap_dir_br = nullptr;
@@ -1712,6 +1712,24 @@ LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         const UINT id = LOWORD(wp), code = HIWORD(wp);
         // 编辑框输入 / 下拉选择变化 → 即时重检（各页列表独立刷新）
         if (code == EN_CHANGE || code == CBN_SELCHANGE) {
+            // 单请求上限的预设下拉：选中即把数值填进编辑框（条目 0 是占位项）。
+            // 选完回到占位项，这样再次选中同一个预设也能触发 CBN_SELCHANGE。
+            // 模型原生上限 256K（ROPE_ORIGINAL_CTX），超过就必须开 YaRN。
+            if (id == kCbMaxctxPreset && code == CBN_SELCHANGE) {
+                static const long kTokens[] = {65536, 131072, 196608,
+                                               262144, 393216, 524288};
+                const int sel = static_cast<int>(
+                    SendMessageW(g_pc.maxctx_preset, CB_GETCURSEL, 0, 0));
+                if (sel >= 1 && sel <= static_cast<int>(sizeof kTokens / sizeof kTokens[0])) {
+                    const long tokens = kTokens[sel - 1];
+                    long native_ctx = 262144;
+                    pn_int(cfg("ROPE_ORIGINAL_CTX", "262144"), &native_ctx);
+                    if (tokens > native_ctx)
+                        SendMessageW(g_pc.yarn, BM_SETCHECK, BST_CHECKED, 0);
+                    set_edit(g_pc.maxctx, std::to_string(tokens));
+                    SendMessageW(g_pc.maxctx_preset, CB_SETCURSEL, 0, 0);
+                }
+            }
             // 并发总池跟随单请求上限：未手动改过总池框时，上限变了总池框跟着变；
             // 总池框输入非空非 0 → 标记已手动改；输入 0 → 回到跟随并立即回填上限值。
             // g_pool_guard：程序自己 SetWindowText 时不触发这些逻辑。
@@ -1983,6 +2001,15 @@ PanelResult panel_run() {
     g_pc.maxctx = pctl(1, h, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kEdX, y2, 120,
                        22, L"", kEdMaxctx);
     set_edit(g_pc.maxctx, init.max_context);
+    // 快捷选择：只写回上面的编辑框，手输任意值仍然有效
+    g_pc.maxctx_preset = pctl(1, h, L"ComboBox", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
+                              kHintX, y2, 132, 200, L"", kCbMaxctxPreset);
+    SendMessageW(g_pc.maxctx_preset, CB_ADDSTRING, 0,
+                 reinterpret_cast<LPARAM>(TR(L"快捷选择…", L"Presets…")));
+    for (const wchar_t* s : {L"64K (65536)", L"128K (131072)", L"192K (196608)",
+                             L"256K (262144)", L"384K (393216)", L"512K (524288)"})
+        SendMessageW(g_pc.maxctx_preset, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(s));
+    SendMessageW(g_pc.maxctx_preset, CB_SETCURSEL, 0, 0);
     y2 += 26;
     plabel(1, h, kLblX, y2, TR(L"并发路数", L"Parallel streams"));
     g_pc.parallel = pctl(1, h, L"ComboBox", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kEdX,
