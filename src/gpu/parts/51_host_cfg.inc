@@ -894,6 +894,20 @@ static std::shared_ptr<CkEnt> match(const std::vector<int>& prompt, uint64_t see
   return best;
 }
 
+// Tokens of `prompt` in leading full pages that some cached sequence also
+// holds (page-key chain): a page-granular lower bound on how far an earlier
+// sequence shared this prompt. Fork detection after a restart, when no live
+// slot or RAM checkpoint remembers that sequence.
+static size_t shared_tokens(const std::vector<int>& prompt, uint64_t seed) {
+  if (!g_on || prompt.size() < 2) return 0;
+  const int np = (int)((prompt.size() - 1) / KV_PAGE);
+  const std::vector<uint64_t> ch = chain(seed, prompt.data(), np);
+  std::lock_guard<std::mutex> lk(g_mtx);
+  int i = 0;
+  while (i < np && g_ch.count(ch[(size_t)i + 1])) i++;
+  return (size_t)i * KV_PAGE;
+}
+
 static double secs_since(std::chrono::steady_clock::time_point t) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
 }
@@ -2033,6 +2047,10 @@ struct Slot {
   uint64_t last_use = 0;  // LRU among idle slots
   uint64_t owner = 0;     // connection id of the last request (N=1 affinity)
   int reserved = 0;
+  // Set at admission: longest common prefix of the prompt with any idle
+  // slot's live tokens when none continues it (0 for a live continuation).
+  // Feeds the fork checkpoint (see fork_cut).
+  size_t fork_lcp = 0;
 };
 
 static Turnstile g_turn;
@@ -2075,12 +2093,13 @@ static int pick_slot(const std::vector<int>& ids) {
 // idle slot's live tokens are a strict prefix of the prompt, log the closest
 // one and the tokens around its first mismatch. An lcp deep inside an earlier
 // reply means the client re-tokenized history differently from what was
-// generated; a short lcp is just another conversation.
-static void log_prefix_miss(long long req, const std::vector<int>& ids, int chosen) {
+// generated; a short lcp is just another conversation. Returns that lcp
+// (0 for a live continuation or when no idle slot holds tokens).
+static size_t log_prefix_miss(long long req, const std::vector<int>& ids, int chosen) {
   const std::vector<int>& ch = g_slots[(size_t)chosen].hist;
   if (!ch.empty() && ch.size() < ids.size() &&
       std::equal(ch.begin(), ch.end(), ids.begin()))
-    return;  // live continuation
+    return 0;  // live continuation
   int best = -1;
   size_t bl = 0;
   for (int i = 0; i < (int)g_slots.size(); i++) {
@@ -2093,7 +2112,7 @@ static void log_prefix_miss(long long req, const std::vector<int>& ids, int chos
       bl = l;
     }
   }
-  if (best < 0) return;
+  if (best < 0) return 0;
   const std::vector<int>& h = g_slots[(size_t)best].hist;
   std::string why;
   if (bl < h.size() && bl < ids.size()) {
@@ -2114,6 +2133,7 @@ static void log_prefix_miss(long long req, const std::vector<int>& ids, int chos
   fprintf(stderr, "%s req %lld: no live prefix; closest slot %d matches %zu "
           "of %zu live tokens (prompt %zu), %s\n", log_ts(), req, best, bl,
           h.size(), ids.size(), why.c_str());
+  return bl;
 }
 
 // Wait (FIFO) for an idle slot and claim it; -1 if cancelled while queued,
@@ -2177,7 +2197,7 @@ static int slot_admit(GpuModel& m, const std::vector<int>& ids, int max_tokens,
           }
           g_slots[(size_t)s].reserved = target;
         }
-        log_prefix_miss(req, ids, s);
+        g_slots[(size_t)s].fork_lcp = log_prefix_miss(req, ids, s);
         g_wait.pop_front();
         Slot& sl = g_slots[(size_t)s];
         sl.busy = true;
@@ -2216,6 +2236,38 @@ static bool lend_light_only() {
 static bool prefill_srpt() {
   static const bool v = !GpuModel::env_zero("QWENOX_PREFILL_SRPT");
   return v;
+}
+
+// Fork checkpoint (the branch-point state of SGLang's MambaRadixCache). A
+// prompt that an earlier sequence shared up to position F, with no
+// checkpoint at or below F, is recomputed from the last one below -- often
+// from 0: an agent's new session whose system prompt ends with a fresh git
+// commit hash diverges from the previous session ~170 tokens before the
+// first message-boundary cut. The GDN state at F never existed, so this
+// request still pays; checkpointing F now lets every later sequence that
+// forks at the same place resume there. F is the longest common prefix with
+// an idle slot's live tokens, a RAM checkpoint, or the SSD page index (page
+// granular). Exact lcps are rounded down to FORK_ALIGN, keeping at least one
+// token of margin, so a BPE merge that moves the boundary by a token still
+// hits. A fork less than FORK_MIN_GAIN past where this prefill starts is
+// skipped: that is the usual retokenized tail of the previous reply, which
+// the </think> / <tool_call> checkpoints already cover and no later prompt
+// will repeat. Returns the cut, or 0. QWENOX_FORK_CKPT=0 disables.
+static size_t fork_cut(const std::vector<int>& ids, size_t slot_lcp, size_t base,
+                       size_t min_tokens, long long req) {
+  static const bool on = !GpuModel::env_zero("QWENOX_FORK_CKPT");
+  constexpr size_t FORK_ALIGN = 64, FORK_MIN_GAIN = 1024;
+  if (!on) return 0;
+  auto down = [](size_t l) { return l > FORK_ALIGN ? (l - 1) / FORK_ALIGN * FORK_ALIGN : 0; };
+  const size_t from_slot = down(slot_lcp);
+  const size_t from_ram = rckpt::enabled() ? down(rckpt::lcp(ids)) : 0;
+  const size_t from_ssd = kvsnap::shared_tokens(ids, kvsnap::g_fp);
+  const size_t cc = std::max({from_slot, from_ram, from_ssd});
+  if (cc < base + FORK_MIN_GAIN || cc >= ids.size() || cc < min_tokens) return 0;
+  fprintf(stderr, "%s fork: req %lld shares a prefix with an earlier sequence (%s); "
+          "checkpointing at %zu\n", log_ts(), req,
+          cc == from_slot ? "live slot" : cc == from_ram ? "RAM checkpoint" : "SSD pages", cc);
+  return cc;
 }
 
 static void borrow_abort_check();
@@ -3063,11 +3115,18 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // cached file holds yet are written (content-addressed, shared).
     std::vector<size_t> cuts;
     if (!kvs.dir.empty() || rckpt::enabled()) {
+      // Prefill starts here. A full recompute starts at 0 while mcp still
+      // holds the lcp with the stale live tokens; that must not drop the
+      // cuts below it.
+      const size_t base = cont ? mcp : 0;
       for (size_t cc : g.snaps)
-        if (cc > mcp && cc < g.ids.size() && cc >= kvs.min_tokens)
+        if (cc > base && cc < g.ids.size() && cc >= kvs.min_tokens)
           cuts.push_back(cc);
       for (size_t cc : {g.snap2, g.snap})
-        if (cc > mcp && cc < g.ids.size() && cc >= kvs.min_tokens)
+        if (cc > base && cc < g.ids.size() && cc >= kvs.min_tokens)
+          cuts.push_back(cc);
+      if (g.mrope_grids.empty())
+        if (size_t cc = fork_cut(g.ids, sl.fork_lcp, base, kvs.min_tokens, (long long)g.req))
           cuts.push_back(cc);
     }
     std::sort(cuts.begin(), cuts.end());

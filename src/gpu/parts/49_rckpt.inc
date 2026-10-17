@@ -318,6 +318,19 @@ int match(const std::vector<int>& prompt, const std::vector<int64_t>& chist,
   return best;
 }
 
+// Longest common prefix of `prompt` with any checkpoint's tokens: how far an
+// earlier sequence shared this prompt (fork detection, see fork_cut).
+size_t lcp(const std::vector<int>& prompt) {
+  size_t best = 0;
+  for (const Ck& ck : g_list) {
+    const size_t n = std::min(ck.toks.size(), prompt.size());
+    size_t l = 0;
+    while (l < n && ck.toks[l] == prompt[l]) l++;
+    best = std::max(best, l);
+  }
+  return best;
+}
+
 // *mtp_out: the MTP layer is back in lockstep (speculation may continue).
 bool restore(GpuModel& m, int idx, std::vector<int>* toks_out,
              bool* mtp_out) {
