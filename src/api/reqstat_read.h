@@ -41,9 +41,11 @@ std::string stat_dir();
 
 // Visit records with t0 <= ts_ms <= t1 in chain order (rotated files by seq,
 // then the live file). A file whose first and last record ts both fall
-// outside the window is skipped after probing just those two records; within
-// a file every record is filtered individually (ts is only approximately
-// ordered). visit() returning false stops the scan early.
+// outside the window is skipped after probing just those two records. Inside
+// an overlapping file the start is located by binary search (retreating a
+// small margin for local disorder) and the pass stops after a run of records
+// past the window, so a short range does not read a whole large file.
+// visit() returning false stops the scan early.
 // Returns false only when the directory cannot be enumerated; a missing
 // directory simply yields zero records.
 bool scan(uint64_t t0, uint64_t t1,

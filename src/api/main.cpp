@@ -29,6 +29,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -2262,6 +2263,210 @@ void handle_reqstat_summary(const http::Request& q, http::Response* r,
     r->body = json_py::dumps(j, /*spaced=*/false);
 }
 
+// GET /reqstat/usage?from_ms=K&to_ms=M — hourly aggregates over the reqstat
+// chain, cached in-process. Records are stamped when the request completes,
+// so an hour that has already ended is immutable: it is scanned at most once.
+// Hours that have not ended yet are rescanned, and the first/last hours are
+// scanned exactly for the requested window instead of using the cache.
+// Buckets are keyed by UTC hour start (epoch ms); the client re-buckets them
+// into local days, so the server needs no timezone/DST policy.
+struct UsageBucket {
+    uint64_t requests = 0, prompt = 0, cached = 0, gen = 0;
+};
+
+struct UsageCache {
+    std::mutex mu;
+    std::map<uint64_t, UsageBucket> hours;  // hour_start_ms -> counters
+    uint64_t last_now_ms = 0;               // clock-rollback detection
+};
+
+UsageCache g_usage_cache;
+
+void handle_reqstat_usage(const http::Request& q, http::Response* r,
+                          http::Stream*) {
+    constexpr uint64_t kHour = 3600000;
+    constexpr uint64_t kMaxRangeMs = 366ull * 86400000ull;
+    const auto qp = parse_query(q.query);
+    const auto parse_ms = [&](const char* key, uint64_t* out) {
+        const auto it = qp.find(key);
+        if (it == qp.end() || it->second.empty())
+            http::fail(400, std::string(key) + " is required");
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long long v = strtoull(it->second.c_str(), &end, 10);
+        if (!end || *end || errno == ERANGE)
+            http::fail(400, std::string(key) + " must be epoch milliseconds");
+        *out = (uint64_t)v;
+    };
+    uint64_t from = 0, to = 0;
+    parse_ms("from_ms", &from);
+    parse_ms("to_ms", &to);
+    if (from > to) http::fail(400, "from_ms is after to_ms");
+    if (to - from > kMaxRangeMs)
+        http::fail(400, "range too large (max 366 days)");
+
+    const uint64_t now = (uint64_t)std::chrono::duration_cast<
+                             std::chrono::milliseconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+    // Keeps all hour arithmetic away from UINT64_MAX and rejects nonsense
+    // windows. One day of slack tolerates a client clock slightly ahead.
+    if (to > now + 86400000ull)
+        http::fail(400, "to_ms is too far in the future");
+    const uint64_t first_hour = from / kHour * kHour;
+    const uint64_t last_hour = to / kHour * kHour;
+
+    UsageCache& c = g_usage_cache;
+    std::lock_guard<std::mutex> lock(c.mu);
+    if (now < c.last_now_ms) c.hours.clear();  // clock moved backwards
+    c.last_now_ms = std::max(c.last_now_ms, now);
+
+    uint64_t files_scanned = 0, bad_crc = 0;
+    std::string err;
+    const auto scan_into = [&](uint64_t t0, uint64_t t1,
+                               UsageBucket* out) -> bool {
+        reqstat::ScanInfo si;
+        if (!reqstat::scan(
+                t0, t1,
+                [&](const reqstat::QEntry& e) {
+                    out->requests++;
+                    out->prompt += e.n_prompt;
+                    out->cached += e.n_cached;
+                    out->gen += e.n_gen;
+                    return true;
+                },
+                &si, &err)) {
+            r->status = 500;
+            r->body = http::error_json("reqstat scan failed: " + err,
+                                       "server_error", "server_error");
+            return false;
+        }
+        files_scanned += si.files_scanned;
+        bad_crc += si.bad_crc;
+        return true;
+    };
+
+    // Hours fully covered by [from,to] come from the cache; the first and
+    // last hours are partial and are scanned exactly, so totals match the
+    // requested window to the millisecond.
+    const uint64_t first_full =
+        from % kHour == 0 ? first_hour : first_hour + kHour;
+    uint64_t last_full = last_hour;
+    bool has_full = true;
+    if (to % kHour != kHour - 1) {
+        if (last_hour == 0) has_full = false;
+        else last_full = last_hour - kHour;
+    }
+    if (first_full > last_full) has_full = false;
+
+    // Cache misses plus hours that have not ended yet. A short grace period
+    // on the previous hour covers a record timestamped before the boundary
+    // that is still on its way to the writer.
+    constexpr uint64_t kGraceMs = 60000;
+    const uint64_t open_cutoff =
+        now > kHour + kGraceMs ? now - kHour - kGraceMs : 0;
+    bool any_missing = false;
+    uint64_t scan_first = 0, scan_last = 0;
+    if (has_full) {
+        for (uint64_t h = first_full;; h += kHour) {
+            const bool still_open = h >= open_cutoff;
+            if (still_open || c.hours.find(h) == c.hours.end()) {
+                if (!any_missing) {
+                    scan_first = h;
+                    any_missing = true;
+                }
+                scan_last = h;
+            }
+            if (h >= last_full) break;
+        }
+    }
+    if (any_missing) {
+        std::map<uint64_t, UsageBucket> local;
+        for (uint64_t h = scan_first;; h += kHour) {
+            local[h];  // materialize zero buckets across the whole scan range
+            if (h >= scan_last) break;
+        }
+        reqstat::ScanInfo si;
+        const uint64_t scan_t1 = scan_last > ~(uint64_t)0 - (kHour - 1)
+                                     ? ~(uint64_t)0
+                                     : scan_last + kHour - 1;
+        uint64_t cur_hour = ~(uint64_t)0;
+        UsageBucket* cur = nullptr;
+        if (!reqstat::scan(
+                scan_first, scan_t1,
+                [&](const reqstat::QEntry& e) {
+                    const uint64_t h = e.ts_ms / kHour * kHour;
+                    if (h != cur_hour) {  // records are approximately ordered
+                        const auto it = local.find(h);
+                        cur = it == local.end() ? nullptr : &it->second;
+                        cur_hour = h;
+                    }
+                    if (!cur) return true;
+                    cur->requests++;
+                    cur->prompt += e.n_prompt;
+                    cur->cached += e.n_cached;
+                    cur->gen += e.n_gen;
+                    return true;
+                },
+                &si, &err)) {
+            r->status = 500;
+            r->body = http::error_json("reqstat scan failed: " + err,
+                                       "server_error", "server_error");
+            return;
+        }
+        files_scanned += si.files_scanned;
+        bad_crc += si.bad_crc;
+        for (const auto& [h, b] : local) c.hours[h] = b;
+    }
+
+    bool head_partial = from % kHour != 0;
+    bool tail_partial = to % kHour != kHour - 1;
+    const bool same_hour = first_hour == last_hour;
+    UsageBucket edge_first, edge_last, edge_single;
+    const bool single_partial = same_hour && (head_partial || tail_partial);
+    if (single_partial) {
+        if (!scan_into(from, to, &edge_single)) return;
+        head_partial = tail_partial = false;
+    } else {
+        if (head_partial &&
+            !scan_into(from, first_hour + kHour - 1, &edge_first))
+            return;
+        if (tail_partial && !scan_into(last_hour, to, &edge_last)) return;
+    }
+
+    json arr = json::array();
+    for (uint64_t h = first_hour;; h += kHour) {
+        UsageBucket b;
+        if (single_partial && h == first_hour) b = edge_single;
+        else if (head_partial && h == first_hour) b = edge_first;
+        else if (tail_partial && h == last_hour) b = edge_last;
+        else {
+            const auto it = c.hours.find(h);
+            if (it != c.hours.end()) b = it->second;
+        }
+        json o;
+        o["ts_ms"] = h;
+        o["requests"] = b.requests;
+        o["input_tokens"] = b.prompt;
+        o["cached_tokens"] = b.cached;
+        o["output_tokens"] = b.gen;
+        arr.push_back(o);
+        if (h >= last_hour) break;
+    }
+    // Evict only after the response snapshot: an old range must not be
+    // dropped from the cache before it has been serialized.
+    while (c.hours.size() > 100000) c.hours.erase(c.hours.begin());  // ~11y
+    json j;
+    j["from_ms"] = from;
+    j["to_ms"] = to;
+    j["buckets"] = arr;
+    j["cache_hours"] = (uint64_t)c.hours.size();
+    j["files_scanned"] = files_scanned;
+    j["bad_crc"] = bad_crc;
+    r->set("Cache-Control", "no-store");
+    r->body = json_py::dumps(j, /*spaced=*/false);
+}
+
 // One record as JSON — shared by /reqstat/tail and /reqstat/page.
 json reqstat_record_json(const reqstat::QEntry& e) {
     json o;
@@ -2422,7 +2627,7 @@ void handle_health(const http::Request&, http::Response* r, http::Stream*) {
     j["tokenizer"] = g_tok_ready;  // false = 词表缺失，推理端点 503
     j["endpoints"] = json::array(
         {"/v1/chat/completions", "/v1/completions", "/v1/models", "/v1/responses",
-         "/v1/messages", "/v1/messages/count_tokens", "/dashboard", "/reqstat/summary", "/reqstat/tail", "/reqstat/page"});
+         "/v1/messages", "/v1/messages/count_tokens", "/dashboard", "/reqstat/summary", "/reqstat/usage", "/reqstat/tail", "/reqstat/page"});
     j["context"] = g_cfg.context;
     if (g_cfg.rope.factor > 1.0) {
         j["rope_scaling"] = {{"type", "yarn"},
@@ -4626,6 +4831,7 @@ int main(int argc, char** argv) {
     srv.on("GET", "/power", handle_power);
     srv.on("GET", "/viz", handle_viz);
     srv.on("GET", "/reqstat/summary", handle_reqstat_summary);
+    srv.on("GET", "/reqstat/usage", handle_reqstat_usage);
     srv.on("GET", "/reqstat/tail", handle_reqstat_tail);
     srv.on("GET", "/reqstat/page", handle_reqstat_page);
     srv.on("GET", "/admin/overrides", handle_overrides_get);

@@ -132,6 +132,27 @@ std::vector<ChainFile> chain_files(const std::string& dir, ScanInfo* info,
   return files;
 }
 
+// First record whose ts is >= t0. ts is only approximately ordered (record()
+// stamps before taking its append lock), so callers retreat a margin and let
+// the linear pass do the final filtering — same trade-off as
+// tools/reqstat_dump.py.
+uint64_t lower_bound_ts(FILE* f, uint64_t count, uint64_t t0) {
+  uint64_t lo = 0, hi = count;
+  while (lo < hi) {
+    const uint64_t mid = lo + (hi - lo) / 2;
+    uint64_t ts = 0;
+    if (!record_ts(f, mid, &ts)) {
+      lo = mid + 1;
+      continue;
+    }
+    if (ts < t0)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  return lo;
+}
+
 // Stream records [index, index+count) of one file (pass count ~0ULL for
 // "to EOF"); entries outside [t0, t1] are filtered, cb false stops early.
 void read_records(const std::string& path, uint64_t index, uint64_t count,
@@ -145,6 +166,7 @@ void read_records(const std::string& path, uint64_t index, uint64_t count,
     return;
   }
   uint8_t buf[1024 * kRecordSize];
+  uint32_t ahead = 0;  // consecutive records past t1; tolerated disorder
   while (count > 0) {
     const size_t want = (size_t)std::min<uint64_t>(count, 1024);
     const size_t got = fread(buf, kRecordSize, want, f);
@@ -154,7 +176,15 @@ void read_records(const std::string& path, uint64_t index, uint64_t count,
         if (info) info->bad_crc++;
         continue;
       }
-      if (e.ts_ms < t0 || e.ts_ms > t1) continue;
+      if (e.ts_ms > t1) {
+        if (++ahead >= 1024) {
+          fclose(f);
+          return;
+        }
+        continue;
+      }
+      ahead = 0;
+      if (e.ts_ms < t0) continue;
       if (info) info->records++;
       if (!cb(e)) {
         fclose(f);
@@ -192,10 +222,15 @@ bool scan(uint64_t t0, uint64_t t1,
     if (!f) continue;
     uint64_t first = 0, last = 0;
     const bool probe = record_ts(f, 0, &first) && record_ts(f, count - 1, &last);
+    uint64_t start = 0;
+    if (probe && first < t0) {
+      start = lower_bound_ts(f, count, t0);
+      start = start > 64 ? start - 64 : 0;  // linear close-up margin
+    }
     fclose(f);
     if (probe && (last < t0 || first > t1)) continue;  // whole file outside
     if (info) info->files_scanned++;
-    read_records(cf.path, 0, ~(uint64_t)0, t0, t1, visit, info);
+    read_records(cf.path, start, ~(uint64_t)0, t0, t1, visit, info);
   }
   return true;
 }

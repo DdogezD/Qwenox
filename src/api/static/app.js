@@ -5,8 +5,8 @@
  *   语言存 localStorage，首次按浏览器语言自动选择，侧栏 EN/中文 按钮切换。
  * - 数据源：/health /memory /power（功耗 + 温度）/admin/overrides /reqstat/page /reqstat/tail。
  *   请求页无筛选条件时走 /reqstat/page 服务端分页（可翻阅全部历史）；
- *   设了筛选条件回退到 tail 最近 1000 条内存过滤。用量页仍按 tail 聚合，
- *   按天聚合端点落地后再切换（见 usage-note）。
+ *   设了筛选条件回退到 tail 最近 1000 条内存过滤。用量页走 /reqstat/usage
+ *   的小时聚合（后端进程内缓存，已结束的小时只扫描一次），前端再按本地日汇总。
  * - 界面风格（卡带 / 打孔机）存 localStorage，<html data-style> 切换皮肤，见"界面风格"一节。
  */
 
@@ -62,7 +62,7 @@ const I18N = {
     "usage.prompt_tokens": "prompt tokens", "usage.output_tokens": "output tokens",
     "usage.total_tokens": "合计 tokens",
     "usage.empty": "范围内没有请求记录",
-    "usage.note": "v1 数据来自 /reqstat/tail 最近 1000 条记录，更早的历史需要后端按天聚合端点后接入。",
+    "usage.note": "数据来自 /reqstat/usage 的全历史小时聚合（后端进程内缓存，已结束的小时只扫描一次），按本地日期汇总显示。",
     "req.from": "起", "req.to": "止", "req.size": "每页", "req.clear": "清除筛选",
     "req.time": "时间", "req.cache": "缓存", "req.accept": "接受率",
     "req.avg": "均值",
@@ -175,7 +175,7 @@ const I18N = {
     "usage.prompt_tokens": "prompt tokens", "usage.output_tokens": "output tokens",
     "usage.total_tokens": "total tokens",
     "usage.empty": "no requests in range",
-    "usage.note": "v1: newest 1000 records via /reqstat/tail; older history needs a backend per-day aggregation endpoint.",
+    "usage.note": "Full-history hourly aggregates via /reqstat/usage (in-process cache; ended hours are scanned once), grouped into local days.",
     "req.from": "From", "req.to": "To", "req.size": "Per page", "req.clear": "Clear filters",
     "req.time": "Time", "req.cache": "Cache", "req.accept": "Acceptance",
     "req.avg": "avg",
@@ -278,7 +278,7 @@ document.getElementById("lang-btn").addEventListener("click", () => {
   applyLang();
   // 动态文案（徽章/表格外新增文本/时间戳）随当前页面重渲染，不重新发请求
   if (currentPage === "overview") { refreshHealth(); refreshMemory(); refreshPower(); }
-  else if (currentPage === "usage") { if (reqCache.records.length) renderUsage(); }
+  else if (currentPage === "usage") { if (usageCache.buckets.length) renderUsage(); }
   else if (currentPage === "requests") renderRequests();
   else if (currentPage === "sample") syncSampleLang();
   else if (currentPage === "engine") renderEngineAll();
@@ -934,30 +934,44 @@ function enterSample() {
 let usageAgg = [];  // [{day, requests, prompt, cached, gen}]，图表重绘用
 let usageGeom = null;  // 最近一次绘制的绘图区几何，鼠标悬浮命中用
 let usageTipDay = null;  // 当前提示框对应的日期对象，避免每次 mousemove 重建 DOM
+const usageCache = { days: 0, buckets: [], fetchedAt: 0 };
+
+async function loadUsage(force) {
+  const days = Number(document.getElementById("usage-range").value);
+  if (!force && usageCache.days === days && usageCache.buckets.length &&
+      Date.now() - usageCache.fetchedAt < 30000) return;
+  const to = Date.now();
+  const from = to - days * 86400000;
+  const j = await getJSON("/reqstat/usage?from_ms=" + from + "&to_ms=" + to);
+  usageCache.days = days;
+  usageCache.buckets = j.buckets || [];
+  usageCache.fetchedAt = Date.now();
+}
 
 async function enterUsage() {
   try {
-    await loadReqstat(false);
+    await loadUsage(false);
     renderUsage();
   } catch (e) { stampErr(document.getElementById("usage-stamp"), e); }
 }
 document.getElementById("usage-refresh").addEventListener("click", async () => {
-  try { await loadReqstat(true); renderUsage(); } catch (e) { stampErr(document.getElementById("usage-stamp"), e); }
+  try { await loadUsage(true); renderUsage(); } catch (e) { stampErr(document.getElementById("usage-stamp"), e); }
 });
-document.getElementById("usage-range").addEventListener("change", renderUsage);
+document.getElementById("usage-range").addEventListener("change", async () => {
+  try { await loadUsage(false); renderUsage(); } catch (e) { stampErr(document.getElementById("usage-stamp"), e); }
+});
 
 function renderUsage() {
-  const days = Number(document.getElementById("usage-range").value);
-  const t0 = Date.now() - days * 86400000;
   const byDay = new Map();
   const tot = { requests: 0, prompt: 0, cached: 0, gen: 0 };
-  for (const r of reqCache.records) {
-    if (r.ts_ms < t0) continue;
-    const d = fmtDay(r.ts_ms);
+  for (const b of usageCache.buckets) {
+    const d = fmtDay(b.ts_ms);
     if (!byDay.has(d)) byDay.set(d, { day: d, requests: 0, prompt: 0, cached: 0, gen: 0 });
     const g = byDay.get(d);
-    g.requests++; g.prompt += r.prompt_tokens; g.cached += r.cached_tokens; g.gen += r.output_tokens;
-    tot.requests++; tot.prompt += r.prompt_tokens; tot.cached += r.cached_tokens; tot.gen += r.output_tokens;
+    g.requests += b.requests; g.prompt += b.input_tokens;
+    g.cached += b.cached_tokens; g.gen += b.output_tokens;
+    tot.requests += b.requests; tot.prompt += b.input_tokens;
+    tot.cached += b.cached_tokens; tot.gen += b.output_tokens;
   }
   usageAgg = [...byDay.values()].sort((a, b) => a.day < b.day ? -1 : 1);
 
