@@ -2562,7 +2562,7 @@ static std::condition_variable g_scv;
 static std::condition_variable g_parkcv;  // 挂起握手（starve ↔ 牺牲者，见 ParkRequest）
 static std::vector<Slot> g_slots;
 static std::list<uint64_t> g_wait;  // admission tickets, FIFO (resume included)
-static uint64_t g_ticket = 0, g_seq = 0, g_use = 0;
+static uint64_t g_ticket = 0, g_use = 0;
 static std::atomic<uint64_t> g_conn_id{0};
 static thread_local int tl_slot = -1;  // slot of the GPU-owning worker
 static int g_reserve_decode = 4096;
@@ -2640,6 +2640,12 @@ static size_t log_prefix_miss(long long req, const std::vector<int>& ids, int ch
   return bl;
 }
 
+// 调用者持有 g_sm；恢复请求沿用首次准入的 ticket，不被后来者插队。
+static void queue_admission(uint64_t ticket) {
+  const auto it = std::lower_bound(g_wait.begin(), g_wait.end(), ticket);
+  if (it == g_wait.end() || *it != ticket) g_wait.insert(it, ticket);
+}
+
 // Wait (FIFO) for an idle slot and claim it; -1 if cancelled while queued,
 // -2 if the shared KV pool cannot fit the request alongside the reservations
 // of the requests already running. Resume requests use the same FIFO queue:
@@ -2650,12 +2656,11 @@ static int slot_admit(GpuModel& m, const std::vector<int>& ids, int max_tokens,
                       unsigned prior_park_attempts = 0) {
   std::unique_lock<std::mutex> lk(g_sm);
   const bool retain = resume && retained_ticket;
-  const uint64_t t = retain && *retained_ticket != UINT64_MAX
+  const uint64_t t = retained_ticket && *retained_ticket != UINT64_MAX
                           ? *retained_ticket
                           : g_ticket++;
-  if (retain && *retained_ticket == UINT64_MAX) *retained_ticket = t;
-  const bool queued = std::find(g_wait.begin(), g_wait.end(), t) != g_wait.end();
-  if (!queued) g_wait.push_back(t);
+  if (retained_ticket) *retained_ticket = t;
+  queue_admission(t);
   for (;;) {
     if (cancel) {
       g_wait.remove(t);
@@ -2666,6 +2671,12 @@ static int slot_admit(GpuModel& m, const std::vector<int>& ids, int max_tokens,
       lk.unlock();
       g_turn.acquire();
       lk.lock();
+      if (g_wait.empty() || g_wait.front() != t) {
+        lk.unlock();
+        g_turn.release();
+        lk.lock();
+        continue;
+      }
       if (cancel) {
         g_wait.pop_front();
         g_scv.notify_all();
@@ -2726,11 +2737,10 @@ static int slot_admit(GpuModel& m, const std::vector<int>& ids, int max_tokens,
         sl.parked = sl.park_failed = sl.park_busy = false;
         sl.park_gen++;
         sl.park_req = req;
-        sl.park_attempts = resuming_park ? prior_attempts : 0;
+        sl.park_attempts = retain ? prior_attempts : 0;
         g_slot_park[s].store(false, std::memory_order_release);
         g_slot_parkable[s].store(false, std::memory_order_release);
-        sl.seq = ++g_seq;
-        if (retain) *retained_ticket = UINT64_MAX;
+        sl.seq = t;
         g_scv.notify_all();
         return s;
       }
@@ -3511,6 +3521,7 @@ struct GenResume {
   // chunk level with the request; the ngram table itself is rebuilt from chist.
   GpuModel::NgGate ng_gate;
   std::unique_ptr<GpuModel::GammaCtl> sample_gamma;
+  std::unique_ptr<GpuModel::OccGamma> sample_occ;
   int ng_cs = 0;
   bool ng_cs_fixed = false, ng_legacy = false;
   bool chain_state_ready = false;
@@ -3548,8 +3559,7 @@ static bool gen_one_pass(GpuModel& m, Conn& c, const GenReq& g,
   int s;
   for (;;) {
     s = slot_admit(m, ids, max_left, cancel, (long long)g.req,
-                   !rs.parked.empty(), rs.parked.empty() ? nullptr : &rs.resume_ticket,
-                   rs.park_attempts);
+                   !rs.parked.empty(), &rs.resume_ticket, rs.park_attempts);
     if (s != -2 || rs.parked.empty()) break;
     // 恢复被容量拒绝：正在跑的请求还占着池子。牺牲者是替先来的请求让路才
     // 挂起的，不能就此失败——等正在跑的请求结束（slot_leave 唤醒 g_scv）再
@@ -3856,6 +3866,9 @@ static bool gen_one_pass(GpuModel& m, Conn& c, const GenReq& g,
     if (g.sample && !rs.sample_gamma)
       rs.sample_gamma = std::make_unique<GpuModel::GammaCtl>(
           std::max(0, spec_gamma), true);
+    if (g.sample && !rs.sample_occ)
+      rs.sample_occ = std::make_unique<GpuModel::OccGamma>(
+          true, m.nslots, false, g.seeded);
     if (!sg_env) {  // 让 auto 默认在 serve 日志里可观测（每模式只打一次）
       static bool said[2] = {false, false};
       if (!said[g.sample]) {
@@ -4242,12 +4255,13 @@ static bool gen_one_pass(GpuModel& m, Conn& c, const GenReq& g,
       if (!dead && !eos.count(cur)) {
         for (;;) {
           pause_tok = -1;
+          const int remaining = g.max_tokens - ngen;
           if (g.sample)
-            m.spec_loop_chain_sample(cur, g.max_tokens - 1, spec_gamma, smp,
+            m.spec_loop_chain_sample(cur, remaining, spec_gamma, smp,
                                      chain_mtp, emit_ng_smp, g.seeded,
-                                     rs.sample_gamma.get());
-          else if (chain) m.spec_loop_chain(cur, g.max_tokens - 1, spec_gamma, emit_ng);
-          else m.spec_loop_ngram(cur, g.max_tokens - 1, m.ngram.n_max, emit_ng);
+                                     rs.sample_gamma.get(), rs.sample_occ.get());
+          else if (chain) m.spec_loop_chain(cur, remaining, spec_gamma, emit_ng);
+          else m.spec_loop_ngram(cur, remaining, m.ngram.n_max, emit_ng);
           spec_r += m.last_spec_rounds;
           spec_c += m.last_spec_commit;
           spec_p += m.last_spec_proposed;
@@ -4520,15 +4534,6 @@ static bool gen_one_pass(GpuModel& m, Conn& c, const GenReq& g,
     m.cut_r_ = 0;
     m.cut_busy = false;
     m.mtp_tap_capture = m.spec_snap = m.ngram_verify_active = false;
-    // The ngram table is rebuilt from the captured chist on resume, but the
-    // adaptive gate and chunk controller are request state rather than KV.
-    if (g.drafter == 3 || g.drafter == 4) {
-      rs.ng_gate = m.ng_gate;
-      rs.ng_cs = m.ng_cs;
-      rs.ng_cs_fixed = m.ng_cs_fixed;
-      rs.ng_legacy = m.ng_legacy;
-      rs.chain_state_ready = true;
-    }
     // 与 starve 的超时收回互斥：只有 park 标志还在才动手 capture（否则页
     // 可能已经被 starve 的硬中断回收了）。park_busy 让 starve 在 capture
     // 期间放宽超时。
@@ -4554,6 +4559,14 @@ static bool gen_one_pass(GpuModel& m, Conn& c, const GenReq& g,
     if (busy_marked) {
       const int was_bound = m.bound_;
       m.bind(s);
+      // n-gram 表由 chist 重建，自适应控制器必须从本请求的槽位保存。
+      if (g.drafter == 3 || g.drafter == 4) {
+        rs.ng_gate = m.ng_gate;
+        rs.ng_cs = m.ng_cs;
+        rs.ng_cs_fixed = m.ng_cs_fixed;
+        rs.ng_legacy = m.ng_legacy;
+        rs.chain_state_ready = true;
+      }
       fprintf(stderr, "%s serve: req %lld park capture on slot %d (was bound "
               "%d): pos %d chist %zu phase %d mtp_pos %d kv_nl %d nqsa %d\n",
               log_ts(), (long long)g.req, s, was_bound, m.pos,
@@ -4603,7 +4616,6 @@ static bool gen_one_pass(GpuModel& m, Conn& c, const GenReq& g,
       }
       if (captured) {
         if (park_phase == 2) {
-          rs.park_attempts++;
           rs.parked = std::move(toks);
           rs.parked.push_back(rs.last_sent);  // pending token：恢复时走 1-token
                                               // prefill 重建 logits
@@ -4616,7 +4628,9 @@ static bool gen_one_pass(GpuModel& m, Conn& c, const GenReq& g,
         mtp_live = false;
         {
           std::lock_guard<std::mutex> lk(g_sm);
+          queue_admission(rs.resume_ticket);
           Slot& parked_slot = g_slots[(size_t)s];
+          rs.park_attempts = parked_slot.park_attempts;
           parked_slot.park_busy = false;
           parked_slot.parked = true;  // starve 等的就是它
           fprintf(stderr, "%s serve: req %lld park state parked slot %d gen %llu "

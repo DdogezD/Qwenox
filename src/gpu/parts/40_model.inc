@@ -10902,7 +10902,7 @@ struct GpuModel {
   std::vector<int> spec_loop_chain_sample(
       int cur, int gen, int gamma, Sampler& sampler, bool mtp_ok,
       const std::function<bool(int, float)>& emit = nullptr, bool seeded = false,
-      GammaCtl* saved_gamma = nullptr) {
+      GammaCtl* saved_gamma = nullptr, OccGamma* saved_occ = nullptr) {
     last_spec_rounds = last_spec_commit = last_spec_rollbacks =
         last_spec_proposed = 0;
     live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
@@ -10946,7 +10946,9 @@ struct GpuModel {
     // excuse themselves. QWENOX_DR_SAMPLE=0 keeps the serial per-slot burst.
     static const bool dr_sample = !env_zero("QWENOX_DR_SAMPLE");
     const bool dr_on = dr_sample && mtp_ok && dr_round_enter_fn && dr_worker_ok();
-    OccGamma occ(true, nslots, dr_on, seeded);
+    OccGamma local_occ(true, nslots, dr_on, seeded);
+    OccGamma& occ = saved_occ ? *saved_occ : local_occ;
+    occ.draft_batched = dr_on;
     struct DrLoopS {
       GpuModel& m;
       bool on;
