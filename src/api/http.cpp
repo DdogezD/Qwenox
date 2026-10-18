@@ -51,7 +51,7 @@ ssize_t platform_send(sock_t fd, const void* p, size_t n) {
 ssize_t platform_recv(sock_t fd, void* p, size_t n) { return ::recv(fd, p, n, 0); }
 #endif
 
-constexpr size_t kMaxRequestBytes = 64u * 1024u * 1024u;  // 64 MB: base64 images
+constexpr size_t kMaxRequestBytes = 128u * 1024u * 1024u;  // 128 MB: base64 images
 constexpr size_t kMaxHeaderBytes = 64u * 1024u;
 constexpr size_t kMaxBufferedBytes = kMaxRequestBytes + kMaxHeaderBytes;
 constexpr int kSocketTimeoutSec = 30;
@@ -65,6 +65,7 @@ const char* status_text(int code) {
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
         case 413: return "Payload Too Large";
+        case 429: return "Too Many Requests";
         case 500: return "Internal Server Error";
         case 502: return "Bad Gateway";
         case 503: return "Service Unavailable";

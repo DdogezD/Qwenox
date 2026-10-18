@@ -4541,6 +4541,35 @@ bool probe_engine() {
     return ok;
 }
 
+// One request per second, process-wide, for the endpoints that drive the
+// engine. Static assets and the console's read-only endpoints (/health,
+// /memory, /power, /reqstat/*) are exempt: they never touch the engine, and
+// the dashboard polls some of them continuously.
+bool acquire_engine_slot() {
+    static std::mutex mu;
+    static std::chrono::steady_clock::time_point next{};
+    std::lock_guard<std::mutex> lock(mu);
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next) return false;
+    next = now + std::chrono::seconds(1);
+    return true;
+}
+
+http::Server::Handler limit_1rps(http::Server::Handler h) {
+    return [h = std::move(h)](const http::Request& q, http::Response* r,
+                              http::Stream* s) {
+        if (!acquire_engine_slot()) {
+            r->set("Retry-After", "1");
+            r->status = 429;
+            r->body = http::error_json(
+                "rate limit exceeded: at most 1 request per second",
+                "rate_limit_error", "rate_limit_exceeded");
+            return;
+        }
+        h(q, r, s);
+    };
+}
+
 }  // namespace
 
 // exe 所在目录：service.conf 自动探测的兜底基准（build/ 里的 exe → 上一级项目根）。
@@ -4842,11 +4871,11 @@ int main(int argc, char** argv) {
     srv.on("GET", "/admin/engine/status", handle_engine_status);
     srv.on("POST", "/admin/engine/start", handle_engine_start);
     srv.on("POST", "/admin/engine/stop", handle_engine_stop);
-    srv.on("POST", "/v1/completions", handle_completions);
-    srv.on("POST", "/v1/chat/completions", handle_chat);
-    srv.on("POST", "/v1/responses", handle_responses);
-    srv.on("POST", "/v1/messages", handle_messages);
-    srv.on("POST", "/v1/messages/count_tokens", handle_messages_count);
+    srv.on("POST", "/v1/completions", limit_1rps(handle_completions));
+    srv.on("POST", "/v1/chat/completions", limit_1rps(handle_chat));
+    srv.on("POST", "/v1/responses", limit_1rps(handle_responses));
+    srv.on("POST", "/v1/messages", limit_1rps(handle_messages));
+    srv.on("POST", "/v1/messages/count_tokens", limit_1rps(handle_messages_count));
 
 #ifdef _WIN32
     if (g_tray_mode) {
