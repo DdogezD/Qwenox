@@ -65,7 +65,6 @@ const char* status_text(int code) {
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
         case 413: return "Payload Too Large";
-        case 429: return "Too Many Requests";
         case 500: return "Internal Server Error";
         case 502: return "Bad Gateway";
         case 503: return "Service Unavailable";
