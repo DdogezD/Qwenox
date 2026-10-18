@@ -16,6 +16,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "sockt.h"
@@ -79,12 +80,19 @@ class Server {
   public:
     // The third argument is the SSE sink; ignore it for ordinary responses.
     using Handler = std::function<void(const Request&, Response*, Stream*)>;
+    // Called once per request after the response has been written (or the
+    // connection died). `response` is the response body, or the full SSE byte
+    // stream when `sse` is true. The logger must not throw.
+    using RequestLogger = std::function<void(const Request&, int status,
+                                             const std::string& response, bool sse,
+                                             bool delivered, double duration_ms)>;
 
     ~Server();
 
     bool listen(const std::string& host_port, std::string* err);
     void on(const std::string& method, const std::string& path, Handler h);
     void set_not_found(Handler h);
+    void set_request_logger(RequestLogger h) { logger_ = std::move(h); }
     void run();  // blocks until stop()
 
     void stop() { running_ = false; }
@@ -104,6 +112,7 @@ class Server {
     };
     std::vector<Route> routes_;
     Handler not_found_;
+    RequestLogger logger_;
     sock_t lfd_ = -1;
     int port_ = 0;
     std::atomic<bool> running_{false};

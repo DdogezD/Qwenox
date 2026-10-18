@@ -18,6 +18,7 @@ typedef int socklen_t;
 #include <cctype>
 #include <cerrno>
 #include <charconv>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -107,6 +108,7 @@ class SseStream : public Stream {
 
     bool send_raw(const std::string& bytes) override {
         if (closed_) return false;
+        if (capture_) captured_ += bytes;
         if (!started_ && !write_head()) return false;
         if (bytes.empty()) return true;
         char hdr[32];
@@ -124,6 +126,8 @@ class SseStream : public Stream {
 
     bool disconnected() const override { return closed_ || peer_gone(); }
     bool started() const override { return started_; }
+    void set_capture(bool v) { capture_ = v; }
+    const std::string& captured() const { return captured_; }
 
     std::string header(const std::string& name) const override {
         auto it = headers_.find(to_lower(name));
@@ -206,6 +210,8 @@ class SseStream : public Stream {
     bool closed_ = false;
     bool started_ = false;
     bool keep_alive_ = true;
+    bool capture_ = false;
+    std::string captured_;
     std::map<std::string, std::string> headers_;
     const std::vector<std::pair<std::string, std::string>>* extra_ = nullptr;
 };
@@ -513,6 +519,7 @@ void Server::serve_connection(sock_t fd, const std::string& remote) {
             break;
         }
         req.remote = remote;
+        const auto request_t0 = std::chrono::steady_clock::now();
 
         const Route* hit = nullptr;
         bool method_exists = false;
@@ -528,6 +535,7 @@ void Server::serve_connection(sock_t fd, const std::string& remote) {
 
         Response res;
         SseStream st(fd);
+        st.set_capture(static_cast<bool>(logger_));
         st.set_headers(req.headers);
         st.set_response_headers(&res.headers);
         st.set_keep_alive(req.keep_alive());
@@ -568,6 +576,20 @@ void Server::serve_connection(sock_t fd, const std::string& remote) {
         } catch (const std::exception& e) {
             ok = finish_with_error(500, std::string("internal error: ") + e.what(),
                                    "server_error", "server_error");
+        }
+        if (logger_) {
+            const bool sse = res.sse && st.started();
+            const int status = sse ? 200 : res.status;
+            const std::string& body = sse ? st.captured() : res.body;
+            const double duration_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - request_t0)
+                    .count();
+            try {
+                logger_(req, status, body, sse, ok, duration_ms);
+            } catch (...) {
+                // Logging is best-effort: never take the connection down.
+            }
         }
         if (!ok || !req.keep_alive()) break;
     }

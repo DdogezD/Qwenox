@@ -58,6 +58,7 @@
 #include "http.h"
 #include "json_py.h"
 #include "power.h"
+#include "reqlog.h"
 #include "reqstat.h"
 #include "reqstat_read.h"
 #include "snap_cuts.h"
@@ -4804,6 +4805,26 @@ int main(int argc, char** argv) {
             }
         }
     }
+    // 请求日志：REQLOG / REQLOG_DIR / REQLOG_LEVEL 只从 service.conf 读
+    // （QWENOX_REQLOG* 环境变量优先，便于独立运行/测试）。刻意不加入
+    // svcconf::kManagedKeys：设置面板和网页不显示、也不能改，只能手改配置。
+    // 与大多数 conf 项一样，改动在下次启动 API 时生效。
+    {
+        auto eff = [](const char* env_key, const char* conf_key, const char* dflt) {
+            if (const char* e = std::getenv(env_key); e != nullptr && *e != '\0')
+                return std::string(e);
+            return svcconf::cfg(g_svc_conf, conf_key, dflt);
+        };
+        const std::string on = eff("QWENOX_REQLOG", "REQLOG", "0");
+        const std::string dir = eff("QWENOX_REQLOG_DIR", "REQLOG_DIR", "logs/reqlog");
+        long level = 6;
+        if (!svcconf::parse_int(eff("QWENOX_REQLOG_LEVEL", "REQLOG_LEVEL", "6"), &level) ||
+            level < 1 || level > 10) {
+            fprintf(stderr, "qwenox-api: REQLOG_LEVEL must be 1..10, using 6\n");
+            level = 6;
+        }
+        reqlog::configure(on != "0", dir, static_cast<int>(level));
+    }
 #ifdef _WIN32
     // 托盘模式没有控制台：stdout/stderr 重定向到 logs\api-win-<时间戳>.log。
     // 放在 conf 探测之后：CWD 已是项目根，日志落在根的 logs\ 下。
@@ -4879,6 +4900,29 @@ int main(int argc, char** argv) {
     if (!probe_engine()) std::thread(reprobe_engine_loop).detach();
 
     http::Server srv;
+    if (reqlog::enabled()) {
+        srv.set_request_logger([](const http::Request& q, int status,
+                                  const std::string& response, bool sse,
+                                  bool delivered, double duration_ms) {
+            if (!reqlog::should_log(q.method, q.path)) return;
+            reqlog::Record r;
+            r.method = q.method;
+            r.path = q.path;
+            r.query = q.query;
+            r.remote = q.remote;
+            r.version = q.version;
+            r.headers = q.headers;
+            r.status = status;
+            r.sse = sse;
+            r.delivered = delivered;
+            r.duration_ms = duration_ms;
+            r.request_body = q.body;
+            r.response_body = response;
+            reqlog::write(r);
+        });
+        fprintf(stderr, "qwenox-api: request log: %s (zip level %d)\n",
+                reqlog::directory().c_str(), reqlog::level());
+    }
     if (!srv.listen(g_cfg.listen, &err)) {
         fprintf(stderr, "qwenox-api: listen: %s\n", err.c_str());
         return gexit(1);

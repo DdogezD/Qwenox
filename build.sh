@@ -280,8 +280,8 @@ build_bench() {
     -lrocblas -lhipblaslt "${NPU_LINK[@]}" "${BUNDLE_RPATH[@]}"
 }
 
-API_FLAGS=(-O2 -std=c++17 "${VER_FLAGS[@]}" -Isrc/api -Ithird_party -Wall -Wextra -Wpedantic
-           -Werror "${BUNDLE_RPATH[@]}")
+API_FLAGS=(-O2 -std=c++17 "${VER_FLAGS[@]}" -Isrc/api -Ithird_party -Ithird_party/miniz
+           -Wall -Wextra -Wpedantic -Werror "${BUNDLE_RPATH[@]}")
 # 静态页嵌入:编译生成器并重新生成 src/api/static_gen.inc。生成器输出是确定性的,
 # 内容未变不会重写文件;static_gen.inc 是生成物,不入库(.gitignore),此处按需重新生成。
 gen_static_inc() {
@@ -296,11 +296,21 @@ gen_static_inc() {
 # (否则 main.cpp 会与 CLI 的 main 冲突)。
 build_api() {
   gen_static_inc || return 1
+  # miniz 是 C：单独按 C 编译，避免 g++/clang++ 按 C++ 语义处理 .c。
+  local objdir=build/.api-obj
+  mkdir -p "$objdir"
+  local m
+  for m in miniz miniz_tdef miniz_tinfl miniz_zip; do
+    "$CXX" -O2 -x c -Ithird_party/miniz -c "third_party/miniz/$m.c" \
+      -o "$objdir/$m.o" || return 1
+  done
   compile build/qwenox-api 8 120 "$CXX" "${API_FLAGS[@]}" \
     src/api/http.cpp src/api/engine_client.cpp src/api/tokenizer.cpp \
     src/api/chat_template.cpp src/api/json_py.cpp src/api/toolparse.cpp \
     src/api/vision.cpp src/api/reqstat.cpp src/api/reqstat_read.cpp \
     src/api/power.cpp src/api/engine_sup.cpp src/api/snap_cuts.cpp \
+    src/api/reqlog.cpp "$objdir"/miniz.o "$objdir"/miniz_tdef.o \
+    "$objdir"/miniz_tinfl.o "$objdir"/miniz_zip.o \
     src/api/main.cpp -lpng -ljpeg -lwebp -lpthread || return 1
   compile build/tok_cli 8 120 "$CXX" "${API_FLAGS[@]}" \
     src/api/tokenizer.cpp src/api/tok_cli.cpp || return 1
