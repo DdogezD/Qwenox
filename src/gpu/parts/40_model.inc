@@ -10587,7 +10587,7 @@ struct GpuModel {
   std::vector<int> spec_loop_chain_sample(
       int cur, int gen, int gamma, Sampler& sampler, bool mtp_ok,
       const std::function<bool(int, float)>& emit = nullptr, bool seeded = false,
-      GammaCtl* saved_gamma = nullptr) {
+      GammaCtl* saved_gamma = nullptr, OccGamma* saved_occ = nullptr) {
     last_spec_rounds = last_spec_commit = last_spec_rollbacks =
         last_spec_proposed = 0;
     live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
@@ -10624,7 +10624,8 @@ struct GpuModel {
     // QWENOX_VR_SAMPLE=0 keeps sampled requests out of the rendezvous.
     static const bool vr_sample = !env_zero("QWENOX_VR_SAMPLE");
     const bool vr_on = vr_sample && mtp_ok && vseg_pool_fn != nullptr;
-    OccGamma occ(true, nslots, false, seeded);  // sampled drafts: serial per slot
+    OccGamma local_occ(true, nslots, false, seeded);
+    OccGamma& occ = saved_occ ? *saved_occ : local_occ;
     struct VrLoopS {
       GpuModel& m;
       bool on;
