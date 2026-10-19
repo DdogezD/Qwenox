@@ -7,7 +7,7 @@
  *   请求页无筛选条件时走 /reqstat/page 服务端分页（可翻阅全部历史）；
  *   设了筛选条件回退到 tail 最近 1000 条内存过滤。用量页走 /reqstat/usage
  *   的小时聚合（后端进程内缓存，已结束的小时只扫描一次），前端再按本地日汇总。
- * - 界面风格（卡带 / 打孔机）存 localStorage，<html data-style> 切换皮肤，见"界面风格"一节。
+ * - 界面风格（卡带 / 打孔机 / 构成主义）存 localStorage，<html data-style> 切换皮肤，见"界面风格"一节。
  */
 
 // ---------------- 多语言 ----------------
@@ -16,7 +16,7 @@ const I18N = {
   zh: {
     "app.title": "Qwen-Flash-Server 控制台",
     "hint.theme": "切换明暗主题",
-    "hint.style": "切换界面风格（卡带 / 打孔机）",
+    "hint.style": "切换界面风格（卡带 / 打孔机 / 构成主义）",
     "nav.overview": "总览", "nav.usage": "用量", "nav.requests": "请求",
     "common.loading": "加载中…",
     "common.refresh": "刷新", "common.all": "全部", "common.read_failed": "读取失败",
@@ -129,7 +129,7 @@ const I18N = {
   en: {
     "app.title": "Qwen-Flash-Server console",
     "hint.theme": "toggle light/dark theme",
-    "hint.style": "switch UI style (cassette / punch card)",
+    "hint.style": "switch UI style (cassette / punch card / constructivist)",
     "nav.overview": "Overview", "nav.usage": "Usage", "nav.requests": "Requests",
     "common.loading": "Loading…",
     "common.refresh": "Refresh", "common.all": "All", "common.read_failed": "read failed",
@@ -309,14 +309,16 @@ document.getElementById("theme-btn").addEventListener("click", () => {
 // 每种风格一份 skin-<名>.css，规则全部挂在 <html data-style="<名>"> 下，页面预加载全部皮肤，
 // 切换只改属性。旋钮按 STYLES 顺序轮换，data-pos 决定指针角度。
 // 新增风格：STYLES 加一项；index.html 加 link 与首帧脚本白名单；各皮肤的旋钮 CSS 加档位。
-const STYLES = ["cassette", "punch"];
+const STYLES = ["cassette", "punch", "constructivist"];
+// 显示累计请求数的风格（打孔机读卡计数器 / 构成主义海报大数字）
+const COUNT_STYLES = ["punch", "constructivist"];
 
 function applyStyle(s) {
   if (!STYLES.includes(s)) s = STYLES[0];
   document.documentElement.dataset.style = s;
   document.getElementById("style-btn").dataset.pos = s;
   try { localStorage.setItem("qwenox-style", s); } catch (e) { /* 隐私模式 */ }
-  if (s === "punch") readerCountRefresh();
+  if (COUNT_STYLES.includes(s)) readerCountRefresh();
 }
 function initStyle() {
   let saved = null;
@@ -394,16 +396,16 @@ function buildPunchDeco() {
   svg.innerHTML = body;
 }
 
-// 读卡机计数器 = 累计请求数（/reqstat/page 的 total）。只在打孔机风格下取：
+// 读卡机计数器 / 构成主义海报数字 = 累计请求数（/reqstat/page 的 total）。只在这两种风格下取：
 // 一次推理结束（ENG 灯离开 busy）时刷新，平时最多 30 秒一次。
 const readerCount = { at: 0, lastDot: "" };
 async function readerCountRefresh() {
-  if (document.documentElement.dataset.style !== "punch") return;
+  if (!COUNT_STYLES.includes(document.documentElement.dataset.style)) return;
   readerCount.at = Date.now();
   try {
     const j = await getJSON("/reqstat/page?offset=0&limit=1");
-    document.getElementById("reader-count").textContent =
-      String(Math.min(j.total || 0, 999999)).padStart(6, "0");
+    const txt = String(Math.min(j.total || 0, 999999)).padStart(6, "0");
+    for (const id of ["reader-count", "proun-count"]) document.getElementById(id).textContent = txt;
   } catch (e) { /* 计数器只是装饰，失败保持原值 */ }
 }
 function readerCountTick(dotCls) {

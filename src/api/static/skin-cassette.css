@@ -6,8 +6,8 @@
  * 字体只用系统自带（静态页打包进二进制，不嵌字体文件）。
  *
  * 多风格约定：每条规则都以 [data-style="cassette"] 开头（<html> 上的属性，app.js 切换），
- * 与 skin-punch.css 互不干扰；两份皮肤各自完整（含布局与响应式），改布局时两边同步。
- * @keyframes 是全局的，本文件的动画名不带前缀，skin-punch.css 的一律 pc- 开头，避免重名覆盖。
+ * 与 skin-punch.css / skin-constructivist.css 互不干扰；三份皮肤各自完整（含布局与响应式），改布局时三份同步。
+ * @keyframes 是全局的，本文件的动画名不带前缀，skin-punch.css 的一律 pc- 开头、skin-constructivist.css 的 cs- 开头，避免重名覆盖。
  * 本文件由原 style.css 机械加作用域得到（规则顺序与声明逐字不变），外观与改造前一致。 */
 
 [data-style="cassette"] {
@@ -935,7 +935,7 @@
 
 /* ================= 多风格接入（以下规则只作用于新增元素） ================= */
 /* 其它风格的装饰件不显示 */
-[data-style="cassette"] .deco-punch { display: none !important; }
+[data-style="cassette"] .deco-punch, [data-style="cassette"] .deco-constructivist { display: none !important; }
 
 /* 风格旋钮：米色胶木旋钮，指针指向当前风格；上方小字为各档位 */
 [data-style="cassette"] .style-knob {
@@ -956,7 +956,8 @@
 }
 [data-style="cassette"] .sk-scale span { opacity: .55; }
 [data-style="cassette"] .style-knob[data-pos="cassette"] .sk-a,
-[data-style="cassette"] .style-knob[data-pos="punch"] .sk-b { opacity: 1; color: #e8862c; }
+[data-style="cassette"] .style-knob[data-pos="punch"] .sk-b,
+[data-style="cassette"] .style-knob[data-pos="constructivist"] .sk-c { opacity: 1; color: #e8862c; }
 [data-style="cassette"] .sk-dial {
   position: relative;
   width: 38px; height: 38px;
@@ -975,8 +976,9 @@
   border-radius: 1px;
   background: var(--key-ink);
 }
-[data-style="cassette"] .style-knob[data-pos="cassette"] .sk-dial { transform: rotate(-38deg); }
-[data-style="cassette"] .style-knob[data-pos="punch"] .sk-dial { transform: rotate(38deg); }
+[data-style="cassette"] .style-knob[data-pos="cassette"] .sk-dial { transform: rotate(-45deg); }
+[data-style="cassette"] .style-knob[data-pos="punch"] .sk-dial { transform: rotate(0deg); }
+[data-style="cassette"] .style-knob[data-pos="constructivist"] .sk-dial { transform: rotate(45deg); }
 [data-style="cassette"] .style-knob:hover .sk-dial { filter: brightness(1.04); }
 @media (max-height: 800px) {
   [data-style="cassette"] .sk-dial { width: 34px; height: 34px; }

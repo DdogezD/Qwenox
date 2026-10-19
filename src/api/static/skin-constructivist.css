@@ -1,0 +1,751 @@
+/* qwenox-api 控制台皮肤：构成主义（data-style="constructivist"）。
+ * 意象：20 年代苏联构成主义海报与书籍版式——新闻纸底、红黑两色、窄体粗黑字、斜切块面。
+ * 结构与另两份皮肤相同：.crt = 一张印刷页（.main 滚动），.sidebar = 利西茨基式海报构图
+ * （红楔刺入白圆，推理中红楔往复推进、小方块旋转，引擎未启动时褪成灰；下方大号数字 = 累计请求数），
+ * .console = 黑色操作条（斜切导航块 / 几何形指示灯 / 风格旋钮 / 开关），.plate = 红色铭牌 + 渐细黑线。
+ * 构成主义专用装饰件带 .deco-constructivist；红色只用在：当前页、主操作、推理中、告警与过热。
+ *
+ * 多风格约定：每条规则都以 [data-style="constructivist"] 开头；三份皮肤各自完整（含布局与响应式），
+ * 改布局时三份同步。@keyframes 全局可见，本文件动画名一律 cs- 开头。
+ * 字体只用系统自带：Bahnschrift（Windows，标题用其窄体）/ DIN / 微软雅黑 / 苹方。 */
+[data-style="constructivist"] {
+  /* ---- 纸与油墨 ---- */
+  --ground: #d6ccb6;          /* 页面外的卡纸底 */
+  --sheet: #eee7d6;           /* 新闻纸 */
+  --card-bg: #f6f1e4;
+  --field: #fffaf0;           /* 输入框底 */
+  --ink: #1c1a17;
+  --ink-mid: #5f594e;
+  --rule: rgba(28, 26, 23, .18);
+  --hatch: rgba(28, 26, 23, .24);
+  --red: #cf2a1d;
+  --red-ink: #f6f1e4;         /* 红底上的字 */
+  --red-faint: rgba(207, 42, 29, .14);
+  --ochre: #d99a14;
+  --ochre-ink: #8a5d00;       /* 纸上的赭黄字（够对比度） */
+  --highlight: rgba(217, 154, 20, .26);
+
+  /* ---- 操作条 / 海报 ---- */
+  --slab: #1c1a17;
+  --slab-ink: #eee7d6;
+  --slab-sub: #8d8678;
+  --key: #eee7d6;
+  --key-hover: #d9cfba;
+  --key-ink: #1c1a17;
+  --lamp-off: #48443d;
+  --pr-light: #eee7d6;
+  --pr-dark: #1c1a17;
+  --pr-mute: #8d8678;
+
+  /* app.js 画图 / 通用读取的变量 */
+  --text: #1c1a17;
+  --text-muted: #5f594e;
+  --border: rgba(28, 26, 23, .22);
+  --bg-raised: #eee7d6;
+  --chart-prompt: #1c1a17;
+  --chart-gen: #cf2a1d;
+  --chart-font-family: "Bahnschrift", "DIN Alternate", "Segoe UI", sans-serif;
+
+  --f-disp: "Bahnschrift Condensed", "Bahnschrift", "DIN Condensed", "Avenir Next Condensed", "Arial Narrow", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+  --f-body: "Bahnschrift", "DIN Alternate", "Segoe UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+  color-scheme: light;
+}
+/* 暗色 = 黑底海报：油墨与纸对调，红色提亮一点 */
+[data-style="constructivist"][data-theme="dark"] {
+  --ground: #0e0d0c;
+  --sheet: #1b1a18;
+  --card-bg: #24221f;
+  --field: #15140f;
+  --ink: #ebe3d1;
+  --ink-mid: #a0988a;
+  --rule: rgba(235, 227, 209, .15);
+  --hatch: rgba(235, 227, 209, .2);
+  --red: #e23b2a;
+  --red-ink: #f6f1e4;
+  --red-faint: rgba(226, 59, 42, .18);
+  --ochre: #e8b02c;
+  --ochre-ink: #e8b02c;
+  --highlight: rgba(232, 176, 44, .2);
+
+  --slab: #2a2824;
+  --slab-ink: #ebe3d1;
+  --slab-sub: #8a8376;
+  --key: #ebe3d1;
+  --key-hover: #cfc6b2;
+  --key-ink: #1b1a18;
+  --lamp-off: #45413a;
+  --pr-light: #d8cfbb;
+  --pr-dark: #080807;
+  --pr-mute: #6b655a;
+
+  --text: #ebe3d1;
+  --text-muted: #a0988a;
+  --border: rgba(235, 227, 209, .18);
+  --bg-raised: #1b1a18;
+  --chart-prompt: #ebe3d1;
+  --chart-gen: #e23b2a;
+  color-scheme: dark;
+}
+
+[data-style="constructivist"] * { box-sizing: border-box; }
+[data-style="constructivist"], [data-style="constructivist"] body { height: 100%; }
+[data-style="constructivist"] body {
+  margin: 0;
+  /* 卡纸底：极淡的网点 */
+  background:
+    radial-gradient(var(--rule) .7px, transparent 1px) 0 0 / 5px 5px,
+    var(--ground);
+  color: var(--ink);
+  font: 14px/1.5 var(--f-body);
+  -webkit-font-smoothing: antialiased;
+}
+[data-style="constructivist"] :focus-visible { outline: 3px solid var(--ochre); outline-offset: 2px; }
+[data-style="constructivist"] ::selection { background: var(--highlight); color: inherit; }
+
+[data-style="constructivist"] .chassis {
+  height: 100vh;
+  height: 100dvh;
+  min-height: 500px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) clamp(200px, 19vw, 280px);
+  grid-template-rows: minmax(0, 1fr) auto auto;
+  grid-template-areas:
+    "crt     deck"
+    "console console"
+    "plate   plate";
+  gap: 18px 22px;
+  padding: 20px 24px 14px;
+}
+
+/* ================= 印刷页（原 .crt） ================= */
+[data-style="constructivist"] .crt {
+  grid-area: crt;
+  position: relative;
+  min-height: 0;
+  display: flex;
+  background: var(--sheet);
+  box-shadow: 0 0 0 3px var(--ink);
+}
+[data-style="constructivist"] .crt-glass { position: relative; flex: 1; min-width: 0; overflow: hidden; }
+[data-style="constructivist"] .main {
+  --pad: 36px;
+  position: absolute;
+  inset: 0;
+  overflow-y: auto;
+  padding: 0 var(--pad) 36px;
+  color: var(--ink);
+  font: 14px/1.55 var(--f-body);
+  font-variant-numeric: tabular-nums;
+  scrollbar-width: thin;
+  scrollbar-color: var(--ink) transparent;
+}
+[data-style="constructivist"] .main::-webkit-scrollbar { width: 8px; }
+[data-style="constructivist"] .main::-webkit-scrollbar-thumb { background: var(--ink); }
+
+/* 页头：红色斜切标题块从纸边伸进来，下面一道粗黑线。切页时红块从左边推出来 */
+[data-style="constructivist"] .page-head {
+  display: flex;
+  align-items: center;
+  gap: 10px 18px;
+  flex-wrap: wrap;
+  padding: 28px 0 0;
+  margin-bottom: 24px;
+}
+[data-style="constructivist"] .page-head h1 {
+  position: relative;
+  z-index: 0;
+  margin: 0 0 0 calc(-1 * var(--pad));
+  padding: 7px 34px 7px var(--pad);
+  font: 700 31px/1.1 var(--f-disp);
+  font-stretch: 75%;
+  letter-spacing: .01em;
+  color: var(--red-ink);
+}
+[data-style="constructivist"] .page-head h1::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: var(--red);
+  clip-path: polygon(0 0, 100% 0, calc(100% - 18px) 100%, 0 100%);
+  animation: cs-wedge-in .42s cubic-bezier(.2, .8, .2, 1) both;
+}
+@keyframes cs-wedge-in {
+  from { clip-path: polygon(0 0, 0 0, 0 100%, 0 100%); }
+}
+[data-style="constructivist"] .page-head::after {
+  content: "";
+  flex: 1 0 100%;
+  height: 5px;
+  background: var(--ink);
+}
+[data-style="constructivist"] .head-tools { display: flex; align-items: center; gap: 10px 14px; flex-wrap: wrap; }
+
+[data-style="constructivist"] .page.fill { display: flex; flex-direction: column; height: 100%; min-height: 340px; }
+[data-style="constructivist"] .page.fill .page-head { flex: none; }
+[data-style="constructivist"] .fill-card { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+[data-style="constructivist"] .fill-card > * { flex: none; }
+[data-style="constructivist"] .fill-card > .table-wrap, [data-style="constructivist"] .fill-card > .chart-box { flex: 1; min-height: 120px; }
+[data-style="constructivist"] .card-foot {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px 20px; flex-wrap: wrap; margin-top: 12px;
+}
+[data-style="constructivist"] .card-foot .note {
+  flex: 1 1 200px; min-width: 0; margin: 0;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; cursor: help;
+}
+
+[data-style="constructivist"] .hidden { display: none !important; }
+[data-style="constructivist"] .muted { color: var(--ink-mid); }
+[data-style="constructivist"] .small { font-size: 12px; }
+[data-style="constructivist"] .note { font-size: 12px; max-width: 100ch; }
+
+/* ================= 卡片：顶上一道粗黑条，标题用窄体 ================= */
+[data-style="constructivist"] .grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  align-items: start;
+  gap: 24px;
+}
+[data-style="constructivist"] .card {
+  position: relative;
+  padding: 14px 20px 18px;
+  background: var(--card-bg);
+  border: 1.5px solid var(--ink);
+  border-top-width: 8px;
+}
+/* 用量 / 请求的大卡直接印在页面上 */
+[data-style="constructivist"] .card.fill-card { padding: 0; background: transparent; border: 0; }
+[data-style="constructivist"] .card + .card { margin-top: 24px; }
+[data-style="constructivist"] .grid > .card + .card { margin-top: 0; }
+[data-style="constructivist"] .card h2 {
+  display: flex; align-items: baseline; gap: 10px;
+  margin: 0 0 10px;
+  font: 700 18px/1.2 var(--f-disp);
+  font-stretch: 75%;
+  letter-spacing: .02em;
+}
+[data-style="constructivist"] .card h2 .muted { font: 400 12px var(--f-body); }
+
+/* 键值行：左标签、右数值，行间细线 */
+[data-style="constructivist"] .kv { margin: 0; display: flex; flex-direction: column; }
+[data-style="constructivist"] .kv-row {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 14px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--rule);
+}
+[data-style="constructivist"] .kv-row:last-child { border-bottom: 0; }
+[data-style="constructivist"] .kv dt { flex: none; color: var(--ink-mid); }
+[data-style="constructivist"] .kv dd { margin: 0; min-width: 0; text-align: right; font-weight: 600; overflow-wrap: anywhere; }
+/* 功耗读数是海报上的大数字 */
+[data-style="constructivist"] #ov-power dd { font: 700 22px/1.1 var(--f-disp); font-stretch: 75%; }
+
+/* 状态块：正常 = 黑底，忙/启动 = 红底，异常 = 红框斜线，其它（未启动）= 灰框 */
+[data-style="constructivist"] .pill {
+  display: inline-block;
+  padding: 0 8px;
+  border: 1.5px solid var(--ink-mid);
+  color: var(--ink-mid);
+  font: 700 12px/1.55 var(--f-body);
+  letter-spacing: .03em;
+  white-space: nowrap;
+}
+[data-style="constructivist"] .pill.ok   { background: var(--ink); border-color: var(--ink); color: var(--sheet); }
+[data-style="constructivist"] .pill.busy { background: var(--red); border-color: var(--red); color: var(--red-ink); }
+[data-style="constructivist"] .pill.err  {
+  border-color: var(--red); color: var(--red);
+  background: repeating-linear-gradient(-45deg, var(--red-faint) 0 3px, transparent 3px 6px);
+}
+
+/* 显存 / 温度条：斜线底槽 + 黑色实条，条尾斜切 */
+[data-style="constructivist"] .bars { display: flex; flex-direction: column; gap: 12px; margin-bottom: 12px; }
+[data-style="constructivist"] .bar-row { display: grid; grid-template-columns: 1fr auto; gap: 5px 10px; align-items: center; }
+[data-style="constructivist"] .bar-label { grid-area: 1 / 1; color: var(--ink-mid); }
+[data-style="constructivist"] .bar-value { grid-area: 1 / 2; text-align: right; font-weight: 600; }
+[data-style="constructivist"] .bar-track {
+  grid-area: 2 / 1 / 3 / 3;
+  height: 14px;
+  background: repeating-linear-gradient(-45deg, var(--hatch) 0 1px, transparent 1px 6px);
+  box-shadow: inset 0 0 0 1.5px var(--ink);
+}
+[data-style="constructivist"] .bar-fill {
+  height: 100%;
+  min-width: 10px;
+  background: var(--ink);
+  clip-path: polygon(0 0, 100% 0, calc(100% - 8px) 100%, 0 100%);
+  transition: width .4s cubic-bezier(.2, .8, .2, 1);
+}
+[data-style="constructivist"] .temp-row.warm .bar-fill { background: var(--ochre); }
+[data-style="constructivist"] .temp-row.hot .bar-fill  { background: var(--red); }
+[data-style="constructivist"] .temp-row.warm .bar-value { color: var(--ochre-ink); font-weight: 700; }
+[data-style="constructivist"] .temp-row.hot .bar-value  { color: var(--red); font-weight: 700; }
+
+/* ---- 控件 ---- */
+[data-style="constructivist"] .btn {
+  height: 32px;
+  padding: 0 14px;
+  border: 2px solid var(--ink);
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink);
+  font: 700 13px var(--f-body);
+  cursor: pointer;
+}
+[data-style="constructivist"] .btn:hover:not(:disabled) { background: var(--ink); color: var(--sheet); }
+[data-style="constructivist"] .btn.primary { background: var(--red); border-color: var(--red); color: var(--red-ink); }
+[data-style="constructivist"] .btn.primary:hover:not(:disabled) { background: var(--ink); border-color: var(--ink); color: var(--sheet); }
+[data-style="constructivist"] .btn:active:not(:disabled) { transform: translate(1px, 1px); }
+[data-style="constructivist"] .btn:disabled { opacity: .35; cursor: default; }
+
+[data-style="constructivist"] select, [data-style="constructivist"] input[type=date], [data-style="constructivist"] input[type=number], [data-style="constructivist"] input[type=password], [data-style="constructivist"] input[type=text] {
+  height: 32px;
+  padding: 0 8px;
+  border: 0;
+  border-bottom: 2px solid var(--ink);
+  border-radius: 0;
+  background: var(--field);
+  color: var(--ink);
+  font: 14px var(--f-body);
+}
+[data-style="constructivist"] select { cursor: pointer; }
+[data-style="constructivist"] select option { background: var(--field); color: var(--ink); }
+[data-style="constructivist"] input[type=number] { width: 110px; }
+[data-style="constructivist"] input::placeholder { color: var(--ink-mid); opacity: .8; }
+[data-style="constructivist"] input:disabled, [data-style="constructivist"] select:disabled { opacity: .35; }
+
+[data-style="constructivist"] .filters {
+  display: flex; align-items: center; gap: 10px 18px; flex-wrap: wrap;
+  margin-bottom: 12px; color: var(--ink-mid);
+}
+[data-style="constructivist"] .filters label { display: flex; align-items: center; gap: 8px; }
+
+/* ---- 表格：黑底表头，细线分行 ---- */
+[data-style="constructivist"] .table-wrap { overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--ink) transparent; }
+[data-style="constructivist"] .fill-card > .table-wrap { overflow: auto; }
+[data-style="constructivist"] .table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+[data-style="constructivist"] .table th, [data-style="constructivist"] .table td { padding: 5px 12px; text-align: left; white-space: nowrap; }
+[data-style="constructivist"] .table th {
+  position: sticky; top: 0; z-index: 2;
+  padding-top: 7px; padding-bottom: 7px;
+  background: var(--ink);
+  color: var(--sheet);
+  font-weight: 700; font-size: 12px; letter-spacing: .02em;
+}
+[data-style="constructivist"] .table td { background: var(--sheet); border-bottom: 1px solid var(--rule); }
+[data-style="constructivist"] .table td.r, [data-style="constructivist"] .table th.r { text-align: right; }
+[data-style="constructivist"] .table th .th-avg { font-weight: 400; opacity: .7; }
+[data-style="constructivist"] .table tbody tr:hover td { background-image: linear-gradient(var(--highlight), var(--highlight)); }
+
+[data-style="constructivist"] #req-table th:first-child, [data-style="constructivist"] #req-table td:first-child {
+  position: sticky; left: 0;
+  box-shadow: inset -2px 0 0 var(--ink);
+}
+[data-style="constructivist"] #req-table th:first-child { z-index: 3; }
+[data-style="constructivist"] #req-table td.fin-length { color: var(--red); font-weight: 700; }
+
+[data-style="constructivist"] .pager { padding-top: 10px; border-top: 2px solid var(--ink); }
+[data-style="constructivist"] .pager-ctl { display: flex; align-items: center; gap: 14px; margin-left: auto; white-space: nowrap; }
+
+/* ---- 采样页 ---- */
+[data-style="constructivist"] .ovr-hint { margin: 0 0 14px; line-height: 1.7; }
+[data-style="constructivist"] #ovr-table td { vertical-align: middle; }
+[data-style="constructivist"] #ovr-table td.ovr-note { white-space: normal; min-width: 240px; color: var(--ink-mid); font-size: 13px; }
+[data-style="constructivist"] .ovr-param { color: var(--ink-mid); }
+[data-style="constructivist"] #ovr-table tr.mode-default .ovr-param { color: var(--ink); font-weight: 700; }
+[data-style="constructivist"] #ovr-table tr.mode-force .ovr-param { color: var(--red); font-weight: 700; }
+[data-style="constructivist"] #ovr-table tr.mode-force .ovr-param::before {
+  content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 7px; background: var(--red);
+}
+/* 卡片里的表：表头不用黑底 */
+[data-style="constructivist"] .card:not(.fill-card) .table tbody tr td { background-color: transparent; }
+[data-style="constructivist"] .card:not(.fill-card) .table th {
+  position: static; background: transparent; color: var(--ink);
+  border-bottom: 2px solid var(--ink);
+}
+[data-style="constructivist"] .ovr-actions { margin-top: 16px; }
+[data-style="constructivist"] .form-err {
+  margin: 14px 0 0; padding: 6px 12px;
+  border-left: 4px solid var(--red); background: var(--red-faint); color: var(--red);
+}
+
+/* ---- 引擎页 ---- */
+[data-style="constructivist"] .eng-actions { margin-top: 16px; }
+[data-style="constructivist"] .cfg-hint { margin: 0 0 14px; line-height: 1.7; }
+[data-style="constructivist"] .cfg-group-title {
+  display: flex; align-items: center; gap: 12px;
+  margin: 22px 0 8px;
+  font: 700 16px var(--f-disp);
+  font-stretch: 75%;
+  letter-spacing: .02em;
+}
+[data-style="constructivist"] .cfg-group-title::after { content: ""; flex: 1; height: 2px; background: var(--ink); }
+[data-style="constructivist"] .cfg-rows { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px 20px; }
+[data-style="constructivist"] .cfg-row { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+[data-style="constructivist"] .cfg-row label { font-size: 12px; color: var(--ink-mid); display: flex; align-items: center; gap: 8px; }
+[data-style="constructivist"] .cfg-row input, [data-style="constructivist"] .cfg-row select { width: 100%; }
+[data-style="constructivist"] .cfg-env-badge { font: 700 10px/1.5 var(--f-body); padding: 0 5px; background: var(--ochre); color: #1c1a17; }
+[data-style="constructivist"] .cfg-actions { margin-top: 18px; }
+[data-style="constructivist"] .cfg-ver-row { max-width: 460px; margin-bottom: 6px; }
+[data-style="constructivist"] .cfg-file-row { display: flex; gap: 6px; }
+[data-style="constructivist"] .cfg-file-row input { flex: 1; min-width: 0; }
+[data-style="constructivist"] .cfg-browse { flex: none; }
+
+/* ---- 用量页：合计是大号窄体数字 ---- */
+[data-style="constructivist"] .totals {
+  display: flex; gap: 12px 48px; flex-wrap: wrap;
+  padding-bottom: 14px; margin-bottom: 14px;
+  border-bottom: 2px solid var(--ink);
+}
+[data-style="constructivist"] .total-item { display: flex; flex-direction: column; gap: 2px; }
+[data-style="constructivist"] .total-item b { font: 700 40px/1 var(--f-disp); font-stretch: 75%; }
+[data-style="constructivist"] .total-item span { color: var(--ink-mid); font-size: 12px; }
+[data-style="constructivist"] .chart-box { position: relative; }
+[data-style="constructivist"] #usage-chart { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
+[data-style="constructivist"] .legend { font-size: 12px; color: var(--ink-mid); white-space: nowrap; }
+[data-style="constructivist"] #usage-note { text-align: right; }
+[data-style="constructivist"] .lg { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; }
+[data-style="constructivist"] .lg-prompt { background: var(--chart-prompt); }
+[data-style="constructivist"] .lg-gen { background: var(--chart-gen); margin-left: 18px; }
+[data-style="constructivist"] .chart-tip {
+  position: absolute;
+  z-index: 3;
+  pointer-events: none;
+  min-width: 156px;
+  padding: 7px 10px;
+  border: 2px solid var(--ink);
+  background: var(--sheet);
+  color: var(--ink);
+  font: 12px/1.55 var(--f-body);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+[data-style="constructivist"] .chart-tip .tip-day {
+  margin-bottom: 4px; padding-bottom: 4px;
+  border-bottom: 2px solid var(--ink);
+  font-weight: 700;
+}
+[data-style="constructivist"] .chart-tip .tip-row { display: flex; justify-content: space-between; gap: 16px; }
+[data-style="constructivist"] .chart-tip .tip-row span { color: var(--ink-mid); }
+[data-style="constructivist"] .chart-tip .tip-row b { font-weight: 700; }
+
+/* ================= 右侧：海报构图（原走带模块） ================= */
+[data-style="constructivist"] .sidebar {
+  grid-area: deck;
+  align-self: start;
+  min-height: 0;
+  padding: 0 0 16px;
+  background: var(--pr-dark);
+  color: var(--pr-light);
+  box-shadow: 0 0 0 3px var(--ink);
+}
+[data-style="constructivist"] .brand { display: flex; flex-direction: column; }
+[data-style="constructivist"] .proun { display: block; width: 100%; height: auto; }
+[data-style="constructivist"] .proun .pr-light { fill: var(--pr-light); }
+[data-style="constructivist"] .proun .pr-dark  { fill: var(--pr-dark); }
+[data-style="constructivist"] .proun .pr-red   { fill: var(--red); transition: fill .3s; }
+[data-style="constructivist"] .proun .pr-line  { stroke: var(--pr-light); stroke-width: 3; }
+[data-style="constructivist"] .proun .pr-spin  { transform-box: fill-box; transform-origin: center; }
+/* 推理中：红楔往复推进，小方块旋转；启动中：红楔闪；未启动 / 断开：红色褪成灰 */
+[data-style="constructivist"] body:has(#busy-dot.busy) .pr-wedge { animation: cs-thrust .7s cubic-bezier(.3, 0, .2, 1) infinite; }
+[data-style="constructivist"] body:has(#busy-dot.busy) .pr-spin  { animation: cs-spin 2.4s linear infinite; }
+[data-style="constructivist"] body:has(#busy-dot.starting) .pr-wedge { animation: cs-flash .9s steps(2) infinite; }
+[data-style="constructivist"] body:has(#busy-dot.stopped, #busy-dot.down) .proun .pr-red { fill: var(--pr-mute); }
+@keyframes cs-thrust {
+  0%, 100% { transform: translateX(-16px); }
+  55%      { transform: translateX(0); }
+}
+@keyframes cs-spin { to { transform: rotate(360deg); } }
+@keyframes cs-flash { 50% { opacity: .35; } }
+
+/* 累计请求数：海报下方的大号数字 */
+[data-style="constructivist"] .pr-count-row {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  padding: 10px 16px 0;
+}
+[data-style="constructivist"] .pr-count {
+  font: 700 40px/1 var(--f-disp);
+  font-stretch: 75%;
+  font-variant-numeric: tabular-nums;
+  color: var(--red);
+}
+[data-style="constructivist"] .pr-count-label { font: 700 11px/1.2 var(--f-body); color: var(--pr-mute); text-align: right; }
+[data-style="constructivist"] .deck-label { display: flex; flex-direction: column; gap: 4px; padding: 12px 16px 0; }
+[data-style="constructivist"] .brand-name {
+  font: 700 19px/1.15 var(--f-disp);
+  font-stretch: 75%;
+  letter-spacing: .02em;
+  overflow-wrap: anywhere;
+}
+[data-style="constructivist"] .deck-sub { font: 12px/1.3 var(--f-body); color: var(--pr-mute); }
+
+/* ================= 底部操作条：黑色长条，左端斜切 ================= */
+[data-style="constructivist"] .console {
+  grid-area: console;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 14px 32px;
+  padding: 12px 22px 12px 38px;
+  background: var(--slab);
+  color: var(--slab-ink);
+  clip-path: polygon(20px 0, 100% 0, 100% 100%, 0 100%);
+}
+[data-style="constructivist"] .console :focus-visible { outline-color: var(--ochre); }
+[data-style="constructivist"] .nav { display: flex; gap: 4px; }
+
+/* 导航 = 平行四边形色块，当前页红色。形状画在 ::before 上，字保持正立 */
+[data-style="constructivist"] .nav-btn {
+  position: relative;
+  isolation: isolate;
+  height: 44px;
+  min-width: 78px;
+  padding: 0 20px;
+  border: 0;
+  background: none;
+  color: var(--key-ink);
+  font: 700 16px/1 var(--f-disp);
+  font-stretch: 75%;
+  letter-spacing: .02em;
+  white-space: nowrap;
+  cursor: pointer;
+}
+[data-style="constructivist"] .nav-btn::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: var(--key);
+  clip-path: polygon(9px 0, 100% 0, calc(100% - 9px) 100%, 0 100%);
+  transition: background .12s;
+}
+[data-style="constructivist"] .nav-btn:hover::before { background: var(--key-hover); }
+[data-style="constructivist"] .nav-btn:active { transform: translateY(1px); }
+[data-style="constructivist"] .nav-btn.active { color: var(--red-ink); }
+[data-style="constructivist"] .nav-btn.active::before { background: var(--red); }
+
+/* 指示灯：PWR 圆 / LINK 方 / ENG 三角 / WARN 菱形。灭 = 暗灰，正常 = 纸色，推理中 = 红闪，告警 = 红 */
+[data-style="constructivist"] .leds { display: flex; gap: 20px; }
+[data-style="constructivist"] .led {
+  display: flex; flex-direction: column; align-items: center; gap: 7px;
+  font: 700 10px/1 var(--f-body); letter-spacing: .12em;
+  color: var(--slab-sub);
+}
+[data-style="constructivist"] .lamp, [data-style="constructivist"] .brand-dot {
+  display: block;
+  width: 18px; height: 18px;
+  background: var(--lamp-off);
+}
+[data-style="constructivist"] .lamp-pwr { border-radius: 50%; }
+[data-style="constructivist"] .brand-dot { clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+[data-style="constructivist"] .lamp-warn { clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%); }
+[data-style="constructivist"] .lamp-pwr,
+[data-style="constructivist"] body:has(#busy-dot.idle, #busy-dot.busy, #busy-dot.stopped, #busy-dot.starting, #busy-dot.exited) .lamp-link,
+[data-style="constructivist"] body:has(#busy-dot.idle, #busy-dot.busy, #busy-dot.stopped, #busy-dot.starting) .lamp-warn,
+[data-style="constructivist"] .brand-dot.idle { background: var(--slab-ink); }
+[data-style="constructivist"] .brand-dot.busy, [data-style="constructivist"] .brand-dot.starting {
+  background: var(--red);
+  animation: cs-flash .9s steps(2) infinite;
+}
+[data-style="constructivist"] .brand-dot.exited,
+[data-style="constructivist"] body:has(#busy-dot.down, #busy-dot.exited) .lamp-warn { background: var(--red); }
+
+[data-style="constructivist"] .sidebar-foot { display: flex; align-items: center; gap: 24px; margin-left: auto; }
+
+/* 开关：方框里一个方块，打开时滑到右边变红 */
+[data-style="constructivist"] .hw-switch {
+  display: flex; flex-direction: column; align-items: center; gap: 7px;
+  padding: 0; border: 0; background: none;
+  color: var(--slab-ink);
+  font: 700 12px/1 var(--f-body);
+  cursor: pointer;
+}
+[data-style="constructivist"] .hw-switch-slot {
+  position: relative;
+  width: 40px; height: 20px;
+  box-shadow: inset 0 0 0 2px var(--slab-ink);
+}
+[data-style="constructivist"] .hw-switch-knob {
+  position: absolute;
+  left: 4px; top: 4px;
+  width: 12px; height: 12px;
+  background: var(--slab-ink);
+  transition: transform .12s, background .12s;
+}
+[data-style="constructivist"] .hw-switch.on .hw-switch-knob { transform: translateX(20px); background: var(--red); }
+
+/* 风格旋钮：纸色圆盘 + 红色指针，三个档位 */
+[data-style="constructivist"] .style-knob {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding: 0; border: 0; background: none;
+  color: var(--slab-ink);
+  cursor: pointer;
+}
+[data-style="constructivist"] .sk-scale {
+  display: flex; gap: 12px;
+  font: 700 9px/1 var(--f-body); letter-spacing: .1em;
+  color: var(--slab-sub);
+}
+[data-style="constructivist"] .style-knob[data-pos="cassette"] .sk-a,
+[data-style="constructivist"] .style-knob[data-pos="punch"] .sk-b,
+[data-style="constructivist"] .style-knob[data-pos="constructivist"] .sk-c { color: var(--slab-ink); }
+[data-style="constructivist"] .sk-dial {
+  position: relative;
+  width: 36px; height: 36px;
+  border-radius: 50%;
+  background: var(--slab-ink);
+  transition: transform .25s cubic-bezier(.5, 1.6, .5, 1);
+}
+[data-style="constructivist"] .sk-pointer {
+  position: absolute;
+  left: 50%; top: 3px;
+  width: 4px; height: 15px;
+  margin-left: -2px;
+  background: var(--red);
+}
+[data-style="constructivist"] .style-knob[data-pos="cassette"] .sk-dial { transform: rotate(-45deg); }
+[data-style="constructivist"] .style-knob[data-pos="punch"] .sk-dial { transform: rotate(0deg); }
+[data-style="constructivist"] .style-knob[data-pos="constructivist"] .sk-dial { transform: rotate(45deg); }
+
+/* ================= 铭牌：红色斜切块 + 渐细黑线 ================= */
+[data-style="constructivist"] .plate { grid-area: plate; display: flex; align-items: center; }
+[data-style="constructivist"] .plate-tag {
+  padding: 5px 28px 5px 14px;
+  background: var(--red);
+  color: var(--red-ink);
+  font: 700 15px/1 var(--f-disp);
+  font-stretch: 75%;
+  letter-spacing: .08em;
+  clip-path: polygon(0 0, 100% 0, calc(100% - 12px) 100%, 0 100%);
+}
+[data-style="constructivist"] .plate-rule {
+  flex: 0 1 56%;
+  height: 7px;
+  margin-left: -6px;
+  background: var(--ink);
+  clip-path: polygon(0 0, 100% 46%, 100% 54%, 0 100%);
+}
+
+/* ================= 其它 ================= */
+[data-style="constructivist"] .deco-cassette, [data-style="constructivist"] .deco-punch { display: none !important; }
+[data-style="constructivist"] #ovr-key, [data-style="constructivist"] #cfg-key { width: 260px; }
+[data-style="constructivist"] .cfg-ver-row select { width: 100%; }
+
+/* 文件选择弹窗：黑框白纸，顶上一道红条 */
+[data-style="constructivist"] .fpick-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 30px;
+  background: rgba(28, 26, 23, .5);
+}
+[data-style="constructivist"] .fpick {
+  display: flex;
+  flex-direction: column;
+  width: min(560px, 100%);
+  max-height: 100%;
+  padding: 14px 16px 10px;
+  border: 3px solid var(--ink);
+  border-top: 10px solid var(--red);
+  background: var(--card-bg);
+  color: var(--ink);
+  font: 13px/1.5 var(--f-body);
+}
+[data-style="constructivist"] .fpick-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+[data-style="constructivist"] .fpick-title {
+  flex: 1; min-width: 0;
+  font: 700 17px/1.2 var(--f-disp); font-stretch: 75%;
+  overflow-wrap: anywhere;
+}
+[data-style="constructivist"] .fpick-list {
+  min-height: 120px;
+  overflow-y: auto;
+  border-top: 2px solid var(--ink);
+  border-bottom: 2px solid var(--ink);
+  background: var(--sheet);
+  scrollbar-width: thin;
+  scrollbar-color: var(--ink) transparent;
+}
+[data-style="constructivist"] .fpick-item {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  width: 100%;
+  padding: 6px 10px;
+  border: 0;
+  border-bottom: 1px solid var(--rule);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+[data-style="constructivist"] .fpick-item:last-child { border-bottom: 0; }
+[data-style="constructivist"] .fpick-item:hover { background: var(--highlight); }
+[data-style="constructivist"] .fpick-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+[data-style="constructivist"] .fpick-meta { flex: none; color: var(--ink-mid); font-size: 12px; white-space: nowrap; }
+[data-style="constructivist"] .fpick-empty { padding: 18px 10px; }
+[data-style="constructivist"] .fpick-foot { margin: 8px 0 0; overflow-wrap: anywhere; }
+
+/* ================= 小分辨率（与另两份皮肤同三档） ================= */
+@media (max-width: 1280px) {
+  [data-style="constructivist"] .main { --pad: 26px; padding-bottom: 26px; }
+  [data-style="constructivist"] .page-head { padding-top: 22px; margin-bottom: 20px; }
+  [data-style="constructivist"] .table th, [data-style="constructivist"] .table td { padding-left: 9px; padding-right: 9px; }
+  [data-style="constructivist"] .console { gap: 14px 24px; }
+  [data-style="constructivist"] .pr-count { font-size: 34px; }
+}
+@media (max-height: 800px) {
+  [data-style="constructivist"] .chassis { gap: 12px 16px; padding: 12px 16px 10px; }
+  [data-style="constructivist"] .plate { display: none; }
+  [data-style="constructivist"] .page-head { padding-top: 16px; margin-bottom: 16px; }
+  [data-style="constructivist"] .page-head h1 { font-size: 26px; padding-top: 5px; padding-bottom: 5px; }
+  [data-style="constructivist"] .card { padding: 10px 16px 12px; }
+  [data-style="constructivist"] .grid { gap: 18px; }
+  [data-style="constructivist"] .kv-row { padding: 3px 0; }
+  [data-style="constructivist"] .totals { padding-bottom: 8px; margin-bottom: 8px; }
+  [data-style="constructivist"] .total-item b { font-size: 32px; }
+  [data-style="constructivist"] .console { padding: 9px 18px 9px 32px; }
+  [data-style="constructivist"] .nav-btn { height: 38px; }
+  [data-style="constructivist"] .sk-dial { width: 32px; height: 32px; }
+  [data-style="constructivist"] .sk-pointer { height: 13px; }
+}
+@media (max-width: 980px) {
+  [data-style="constructivist"] .chassis {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-areas: "console" "crt";
+    padding: 10px; gap: 12px;
+  }
+  [data-style="constructivist"] .sidebar, [data-style="constructivist"] .plate { display: none; }
+  [data-style="constructivist"] .main { --pad: 20px; padding-bottom: 18px; }
+  [data-style="constructivist"] .console { gap: 12px 22px; padding: 12px 12px 12px 26px; }
+  [data-style="constructivist"] .nav { flex: 1 0 100%; }
+  [data-style="constructivist"] .nav-btn { flex: 1; min-width: 0; padding: 0 8px; }
+  [data-style="constructivist"] .grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 600px) {
+  [data-style="constructivist"] .main { --pad: 12px; padding-bottom: 12px; font-size: 13px; }
+  [data-style="constructivist"] .page-head h1 { font-size: 22px; padding-right: 26px; }
+  [data-style="constructivist"] #req-pageinfo { font-size: 11px; }
+  [data-style="constructivist"] .pager-ctl .btn { padding: 0 6px; }
+  [data-style="constructivist"] .card { padding: 10px 12px 12px; }
+  [data-style="constructivist"] .table th, [data-style="constructivist"] .table td { padding: 4px 7px; }
+  [data-style="constructivist"] .pager-ctl { flex: 1 0 100%; justify-content: space-between; gap: 6px; margin-left: 0; }
+  [data-style="constructivist"] .console { padding-left: 20px; clip-path: polygon(12px 0, 100% 0, 100% 100%, 0 100%); }
+  [data-style="constructivist"] .nav { flex-wrap: wrap; gap: 4px 2px; }
+  [data-style="constructivist"] .nav-btn { flex: 1 0 auto; height: 36px; padding: 0 12px; font-size: 14px; }
+  [data-style="constructivist"] .leds { gap: 14px; }
+  [data-style="constructivist"] .sidebar-foot { gap: 16px; }
+  [data-style="constructivist"] .sk-scale { display: none; }
+}
+/* 右侧海报是推理状态指示，减少动画时照常动；其余过渡与切页动画关掉 */
+@media (prefers-reduced-motion: reduce) {
+  [data-style="constructivist"] .page-head h1::before { animation: none; }
+  [data-style="constructivist"] .brand-dot.busy { animation: none; }
+  [data-style="constructivist"] .nav-btn::before, [data-style="constructivist"] .hw-switch-knob, [data-style="constructivist"] .sk-dial, [data-style="constructivist"] .bar-fill { transition: none; }
+}

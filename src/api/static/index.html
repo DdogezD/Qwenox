@@ -4,23 +4,25 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title data-i18n="app.title">Qwen-Flash-Server 控制台</title>
-<!-- 界面风格：每份皮肤的规则都挂在 <html data-style="..."> 下，两份都预加载，切换只改属性（不闪屏）。
+<!-- 界面风格：每份皮肤的规则都挂在 <html data-style="..."> 下，全部预加载，切换只改属性（不闪屏）。
      新增风格 = 新 skin-*.css + 这里一行 link + app.js STYLES 一项 + 下面脚本白名单一项。 -->
 <link rel="stylesheet" href="/skin-cassette.css">
 <link rel="stylesheet" href="/skin-punch.css">
+<link rel="stylesheet" href="/skin-constructivist.css">
 <script>
   // 首帧前定好风格与明暗，避免先按默认皮肤画一帧再跳；按钮状态由 app.js initStyle/initTheme 同步
   (function () {
     var d = document.documentElement, s = null, t = null;
     try { s = localStorage.getItem("qwenox-style"); t = localStorage.getItem("qwenox-theme"); } catch (e) { /* 隐私模式 */ }
-    if (s === "cassette" || s === "punch") d.dataset.style = s;
+    if (s === "cassette" || s === "punch" || s === "constructivist") d.dataset.style = s;
     d.dataset.theme = t || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
   })();
 </script>
 </head>
 <body>
 <!-- 整页是一台机器：左屏（全部页面内容）、右侧模块、底部按键/指示灯条、铭牌。
-     卡带风格 = CRT 绿屏 + 走带模块；打孔机风格 = 连续打印纸 + 读卡机/寄存器灯板。
+     卡带风格 = CRT 绿屏 + 走带模块；打孔机风格 = 连续打印纸 + 读卡机/寄存器灯板；
+     构成主义风格 = 红黑新闻纸印刷页 + 海报构图（红楔刺入白圆）。
      app.js 只按 id / class 取元素，外壳结构纯展示；某一风格专用的装饰件带 .deco-<风格名>，其它风格下隐藏。
      .card 上的 data-seq 是打孔机风格卡片右端序号区打的 8 个字符（app.js 生成孔位）。 -->
 <div class="chassis">
@@ -215,7 +217,8 @@
 </div>
 
 <!-- 右侧模块（纯指示，不可点）。卡带：推理中磁带轮转动，▶ / ■ 键随忙闲自动按下。
-     打孔机：推理中读卡机一张张吸卡、寄存器灯乱闪，空闲灯停在固定图案，未启动全灭；计数器 = 累计请求数（/reqstat/page total）。 -->
+     打孔机：推理中读卡机一张张吸卡、寄存器灯乱闪，空闲灯停在固定图案，未启动全灭；计数器 = 累计请求数（/reqstat/page total）。
+     构成主义：推理中红楔往复推进、小方块旋转，启动中红楔闪，未启动 / 断开时红色褪成灰；大号数字同为累计请求数。 -->
 <aside class="sidebar">
   <div class="brand">
     <div class="reel-window deco-cassette" aria-hidden="true">
@@ -236,10 +239,25 @@
       <div class="lamps" id="lamps"></div>
       <span class="engr">REGISTER</span>
     </div>
+    <svg class="proun deco-constructivist" viewBox="0 0 240 200" aria-hidden="true">
+      <rect class="pr-light" width="240" height="200"/>
+      <polygon class="pr-dark" points="120,0 240,0 240,200 70,200"/>
+      <circle class="pr-light" cx="160" cy="94" r="52"/>
+      <rect class="pr-dark" x="34" y="22" width="12" height="12"/>
+      <rect class="pr-dark" x="20" y="164" width="52" height="8" transform="rotate(-18 46 168)"/>
+      <line class="pr-line" x1="132" y1="178" x2="230" y2="146"/>
+      <g class="pr-wedge"><polygon class="pr-red" points="12,58 150,94 12,130"/></g>
+      <rect class="pr-red pr-spin" x="194" y="20" width="20" height="20" transform="rotate(15 204 30)"/>
+    </svg>
+    <div class="pr-count-row deco-constructivist" aria-hidden="true">
+      <span class="pr-count" id="proun-count">000000</span>
+      <span class="pr-count-label">requests</span>
+    </div>
     <div class="deck-label">
       <span class="brand-name">Qwen-Flash-Server</span>
       <span class="deck-sub deco-cassette" aria-hidden="true">qwenox-api / gfx1151</span>
       <span class="deck-sub deco-punch" aria-hidden="true">SYSTEM/1151</span>
+      <span class="deck-sub deco-constructivist" aria-hidden="true">qwenox / gfx1151</span>
     </div>
   </div>
 </aside>
@@ -263,7 +281,7 @@
   </div>
   <div class="sidebar-foot">
     <button class="style-knob" id="style-btn" data-pos="cassette" data-i18n-title="hint.style" title="切换界面风格">
-      <span class="sk-scale"><span class="sk-a">CASSETTE</span><span class="sk-b">PUNCH</span></span>
+      <span class="sk-scale"><span class="sk-a">CASSETTE</span><span class="sk-b">PUNCH</span><span class="sk-c">CONSTRUCT</span></span>
       <span class="sk-dial"><span class="sk-pointer"></span></span>
     </button>
     <button class="hw-switch" id="lang-btn">
@@ -281,6 +299,7 @@
   <span class="plate-tag">GFX-1151</span>
   <span class="plate-stripes deco-cassette"></span>
   <svg class="plate-tape deco-punch" id="plate-tape"></svg>
+  <span class="plate-rule deco-constructivist"></span>
 </div>
 
 </div>
