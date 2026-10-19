@@ -99,7 +99,12 @@ def flows(tk):
 def run_flow(tk, flow, res, conn=None):
     c = conn or Conn()
     ids = None
+    # CONC_NO_MTP=1 (weights without an MTP head, e.g. a GGUF without the sidecar):
+    # MTP-drafted requests (drafter 1) run on the ngram drafter (3) instead.
+    no_mtp = os.environ.get('CONC_NO_MTP') == '1'
     for key, p, n, d, sfx in flow:
+        if no_mtp and d == 1:
+            d = 3
         if isinstance(p, str):  # conversation turn: previous prompt + output + question
             prev = res[prev_key]
             p = ids + prev['tokens'] + tk.encode(

@@ -2286,12 +2286,10 @@ struct GpuModel {
       a4_dn_ok = moe_gg_iu4_down(g.tdn, g.down, d_a4h, d_a4hs, tiles, ntiles, max_tiles,
                                  (__half*)pairs, d, mid, qt_for(g.tdn), 9.0f, g_str);
     }
-    // P2: GGUF LUT down writes f16 pairs (half the reduce traffic). Default
-    // off until the GGUF KLD gate passes; QWENOX_GG_PAIRS_F16=1 enables.
-    static const bool gg_pairs_f16_env = [] {
-      const char* s = getenv("QWENOX_GG_PAIRS_F16");
-      return s && s[0] != '0';
-    }();
+    // P2: GGUF LUT down writes f16 pairs (half the reduce traffic; reduce
+    // widens exactly and accumulates in f32). Default on (Swift IQ3 KLD
+    // .173408 vs f32 .173862); QWENOX_GG_PAIRS_F16=0 keeps f32 pairs.
+    static const bool gg_pairs_f16_env = !env_zero("QWENOX_GG_PAIRS_F16");
     const bool pairs_f16 = gg_pairs_f16_env && !a4_dn_ok && ggx_is_lut(g.tdn);
     if (!a4_dn_ok &&
         !moe_ggx_down(g.tdn, g.down, hid, tiles, ntiles, max_tiles, pairs, d, mid, g_str,

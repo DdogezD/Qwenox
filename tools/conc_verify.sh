@@ -4,7 +4,8 @@
 #   OLD_BIN=build/qwenox.old bash tools/conc_verify.sh      # 另外对拍一个旧二进制的单路结果
 #   NEW_BIN=build/qwenox.conc OLD_BIN=build/qwenox-engine bash tools/conc_verify.sh
 #   STAGES="ovf" CONC_ENV="QWENOX_KV_ZERO=1" bash tools/conc_verify.sh   # 调试：只跑某几段 / 附加引擎环境
-# 需要先停掉生产服务。生产环境变量取自 start_hgn.sh --check；kvsnap 关闭，ngram verify
+# 需要先停掉生产服务。生产环境变量取自 $LAUNCHER --check（默认 start_hgn.sh；GGUF 用
+#   LAUNCHER=start_gguf.sh，近平局分叉见 docs/CONCURRENCY.md，严格对拍加 CONC_ENV=QWENOX_OCC_FORCE=4）；kvsnap 关闭，ngram verify
 # 分块固定为 16（自适应分块跨请求共享，会让结果依赖执行顺序）。
 #   1. [OLD_BIN 单路] 与 新二进制单路：同一组请求串行跑，逐 token + spec 统计一致
 #   2. 新二进制 4 路：同一组请求由 4 个客户端线程各开连接并发发送（对话流不被挤掉槽位），
@@ -24,7 +25,8 @@ export PROBE_BINARY="$NEW_BIN"
 probe_precheck || exit 1
 [[ -z "$OLD_BIN" || -x "$OLD_BIN" ]] || { echo "找不到 OLD_BIN=$OLD_BIN"; exit 1; }
 for f in start_hgn.sh start_gguf.sh tools/serve_common.sh service.conf; do grep -q $'\r' "$f" && sed -i 's/\r$//' "$f"; done
-chk="$(bash start_hgn.sh --check 2>&1)" || { echo "$chk"; echo "start_hgn.sh --check 失败"; exit 1; }
+LAUNCHER="${LAUNCHER:-start_hgn.sh}"
+chk="$(bash "$LAUNCHER" --check 2>&1)" || { echo "$chk"; echo "$LAUNCHER --check 失败"; exit 1; }
 mapfile -t PENV < <(sed -n 's/^ENV //p' <<<"$chk")
 CMDLINE="$(sed -n 's/^CMD //p' <<<"$chk")"
 eval "BASE=($CMDLINE)"
