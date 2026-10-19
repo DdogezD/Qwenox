@@ -14,6 +14,11 @@ serve_init "$@"
 for f in "$GGUF_FILE" "$GGUF_MTP_FILE" "$GGUF_VISION_FILE"; do
   [[ -z "$f" || "$f" == *.gguf ]] || fail "$LAUNCHER 只接受 .gguf 权重：$f（hgn 请用 bash start_hgn.sh）"
 done
+# 可选的 i4r 专家补丁是 .hgn overlay，不是主权重。
+[[ -z "$GGUF_I4R_PATCH" || "$GGUF_I4R_PATCH" == *.hgn ]] || \
+  fail "GGUF_I4R_PATCH 必须是 .hgn：$GGUF_I4R_PATCH"
+[[ -z "$GGUF_I4R_PATCH" ]] || \
+  need 'i4r 专家补丁' "$GGUF_I4R_PATCH" '不加速可设 GGUF_I4R_PATCH=""'
 # 多分片：GGUF_FILE 是第 1 个分片 *-00001-of-0000N.gguf，其余分片必须在同一目录。
 if [[ "$GGUF_FILE" =~ ^(.*-)00001-of-([0-9]{5})\.gguf$ ]]; then
   prefix=${BASH_REMATCH[1]}
@@ -26,13 +31,25 @@ else
 fi
 [[ -z "$GGUF_MTP_FILE" ]] || need 'MTP 草稿 sidecar' "$GGUF_MTP_FILE" '不用 MTP 投机可设 GGUF_MTP_FILE=""'
 [[ -z "$GGUF_VISION_FILE" ]] || need '视觉塔 mmproj' "$GGUF_VISION_FILE" '纯文本可设 GGUF_VISION_FILE=""'
-MISSING_HINT='GGUF 权重下载 Unsloth 的 Qwen3.8-Flash-Next UD-Q4_K_XL（全部分片 + mtp-*.gguf + mmproj），放进 models/（见 GGUF.md）；手上是 .hgn 请用 bash start_hgn.sh。'
+MISSING_HINT='GGUF 权重下载 Unsloth 的 Qwen3.8-Flash-Next UD-Q4_K_XL（全部分片 + mtp-*.gguf + mmproj），放进 models/（见 GGUF.md）；可选 GGUF_I4R_PATCH 指向 tools/gguf_i4r_patch.py 生成的 .hgn；手上是 .hgn 请用 bash start_hgn.sh。'
 
 # 引擎看到 *.gguf 基座即为纯 GGUF 启动（自动 QWENOX_GGUF + QWENOX_GGUF_DENSE=1）；
 # MTP sidecar 总是显式传入（空串 = 不用），不让引擎去分片目录里猜。
 export QWENOX_GGUF_MTP="$GGUF_MTP_FILE"
 FORMAT=GGUF
 MAIN_MODEL=$GGUF_FILE
-MODEL_ARGS=("$GGUF_FILE")
+if [[ -n "$GGUF_I4R_PATCH" ]]; then
+  # 补丁作为第二个位置参数（overlay）；专家不再从 GGUF 读，dense 仍从 GGUF 读。
+  MODEL_ARGS=("$GGUF_FILE" "$GGUF_I4R_PATCH")
+  export QWENOX_GGUF_EXPERTS=0
+  [[ "${MOE_A4:-0}" == 0 ]] && \
+    echo "警告：GGUF_I4R_PATCH 已启用但 MOE_A4=0；只换 i4r 不量化激活，短 prompt 可能变慢" >&2
+  (( MEMORY_CAP_GB >= 100 )) || \
+    echo "警告：i4r 补丁专家约 58 GiB，MEMORY_CAP_GB=$MEMORY_CAP_GB 可能不足（建议 >=100）" >&2
+  echo "i4r 专家补丁：$GGUF_I4R_PATCH（QWENOX_GGUF_EXPERTS=0，MOE_A4=${MOE_A4:-0}）"
+else
+  MODEL_ARGS=("$GGUF_FILE")
+  unset QWENOX_GGUF_EXPERTS
+fi
 VISION=$GGUF_VISION_FILE
 serve_run

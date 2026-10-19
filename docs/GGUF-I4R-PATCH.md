@@ -54,6 +54,42 @@ qwenox "$GGUF" "$PATCH" --tokens ... --gen 1
   2 = down；3 = 两者。A4 只作用于 prefill。
 - 补丁必须覆盖全部 48 层且 gate/up + down 都提供；当前不支持按层混合。
 
+## 启动器配置（start_gguf.sh）
+
+在 `service.conf` 的 GGUF 段加：
+
+```bash
+GGUF_I4R_PATCH="$MODEL_DIR/qwen38-swift-i4r-expert-patch.hgn"
+MOE_A4=3                 # 2 = 质量/速度折中，3 = 最大 prefill
+MEMORY_CAP_GB=100        # 补丁专家 58 GiB pinned；默认 86 可能不够
+MIN_AVAILABLE_GB=110     # 按机器实际内存调整
+```
+
+启用补丁时建议同时设 `GGUF_MTP_FILE=""`：补丁不含 `mtp.*`；要用 MTP
+投机，需要把 v2 hgn 的 31 个 `mtp.*` 张量一起加进补丁。
+
+`start_gguf.sh` 会自动：
+
+- 校验补丁是 `.hgn` 且文件存在（空 = 不用补丁）；
+- 把补丁作为第二个位置参数传给引擎：
+  `MODEL_ARGS=("$GGUF_FILE" "$GGUF_I4R_PATCH")`；
+- `export QWENOX_GGUF_EXPERTS=0`；
+- `MOE_A4` 非 0 时由 `serve_common.sh` 导出 `QWENOX_MOE_A4`；
+- 补丁已启用但 `MOE_A4=0` 或 `MEMORY_CAP_GB<100` 时打印警告。
+
+`bash start_gguf.sh --check` 应看到：
+
+```text
+i4r 专家补丁：.../qwen38-swift-i4r-expert-patch.hgn（QWENOX_GGUF_EXPERTS=0，MOE_A4=3）
+ENV QWENOX_GGUF_EXPERTS=0
+ENV QWENOX_MOE_A4=3
+CMD .../qwenox-engine ...-00001-of-00002.gguf ...-i4r-expert-patch.hgn --serve ...
+```
+
+实测启动日志（`MAX_CONTEXT=262144`、4 路、补丁）：`registered mmap 58.01`,
+`process RSS 63.98 GiB`, `gpu-accessible committed 82.10 GiB`；`MEMORY_CAP_GB=110`
+可以正常启动，默认 86 不建议。
+
 ## 实测（gfx1151，单流，真实 qsa-oracle token）
 
 | prompt | 纯 GGUF | A4=2 | A4=3 | A4=3 提升 |
