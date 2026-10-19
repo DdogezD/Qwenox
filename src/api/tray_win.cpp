@@ -132,16 +132,15 @@ enum MenuId : UINT {
 
 std::wstring state_text() {
     if (g_eng.state == "running")
-        return g_eng.external ? TR(L"Qwenox · 运行中（外部）",
-                                   L"Qwenox · running (external)")
-                              : TR(L"Qwenox · 运行中", L"Qwenox · running");
+        return g_eng.external ? TR(L"运行中（外部）", L"running (external)")
+                              : TR(L"运行中", L"running");
     if (g_eng.state == "starting")
-        return TR(L"Qwenox · 启动中…", L"Qwenox · starting…");
+        return TR(L"启动中…", L"starting…");
     const std::wstring busy =
         g_eng.port_foreign ? TR(L"（引擎端口被占用）", L" (engine port in use)") : L"";
     if (g_eng.state == "exited")
-        return TR(L"Qwenox · 已退出", L"Qwenox · exited") + busy;
-    return TR(L"Qwenox · 已停止", L"Qwenox · stopped") + busy;
+        return TR(L"已退出", L"exited") + busy;
+    return TR(L"已停止", L"stopped") + busy;
 }
 
 // ---- PerfSnap：引擎行协议 SNAP 动词的 tooltip 文本（移植自 launch_win.cpp）----
@@ -182,7 +181,7 @@ std::wstring perf_text(const std::string& line) {
 }
 
 void tray_update_tip() {
-    std::wstring tip = state_text();
+    std::wstring tip = L"Qwenox · " + state_text();
     if (g_eng.state == "running" && !g_perf.empty()) tip += L"\n" + g_perf;
     g_nid.uFlags = NIF_TIP;
     lstrcpynW(g_nid.szTip, tip.c_str(), ARRAYSIZE(g_nid.szTip));
@@ -274,7 +273,7 @@ void tray_add() {
     static HICON big_icon = app_icon(GetSystemMetrics(SM_CXICON));  // 通知气泡用
     g_nid.hIcon = small_icon ? small_icon : LoadIconA(nullptr, IDI_APPLICATION);
     g_nid.hBalloonIcon = big_icon;
-    const std::wstring tip = state_text();
+    const std::wstring tip = L"Qwenox · " + state_text();
     lstrcpynW(g_nid.szTip, tip.c_str(), ARRAYSIZE(g_nid.szTip));
     if (Shell_NotifyIconW(NIM_ADD, &g_nid)) {
         InterlockedExchange(&g_tray_added, 1);
@@ -477,8 +476,8 @@ void on_menu(UINT id) {
 void show_menu() {
     HMENU m = CreatePopupMenu();
     if (!m) return;
-    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"Qwenox v" QWENOX_VERSION);  // C++11：宽+窄字面量拼接为宽
-    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, state_text().c_str());
+    const std::wstring title = L"Qwenox v" QWENOX_VERSION L" · " + state_text();
+    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, title.c_str());
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, kIdConsole, TR(L"打开控制台", L"Open console"));
     AppendMenuW(m, MF_STRING, kIdCopyUrl, TR(L"复制 API 地址", L"Copy API URL"));
