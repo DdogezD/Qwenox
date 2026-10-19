@@ -3,7 +3,7 @@
 // moe_ggx_up / moe_ggx_down as the engine calls them) on real GGUF expert weights.
 //
 //   moe_gguf_test FIRST_SHARD.gguf [--layer L] [--P N] [--iters N]
-//                 [--check-experts N] [--seed S] [--tol X]
+//                 [--check-experts N] [--seed S] [--tol X] [--mt 1]
 //
 // Routing is random top-10 (distinct experts per token, mildly skewed).
 // Correctness: every output element is written (outputs are pre-filled with
@@ -48,7 +48,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   std::string path = argv[1];
-  int layer = 0, P = 2048, iters = 10, check_e = 8, topk = 10;
+  int layer = 0, P = 2048, iters = 10, check_e = 8, topk = 10, mt = 0;
   unsigned seed = 1;
   double tol = 1e-2;
   for (int i = 2; i + 1 < argc; i += 2) {
@@ -59,6 +59,7 @@ int main(int argc, char** argv) {
     else if (a == "--check-experts") check_e = atoi(argv[i + 1]);
     else if (a == "--seed") seed = (unsigned)atoi(argv[i + 1]);
     else if (a == "--tol") tol = atof(argv[i + 1]);
+    else if (a == "--mt") mt = atoi(argv[i + 1]);
     else { fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
   }
   gguf::File f(path);
@@ -118,10 +119,12 @@ int main(int argc, char** argv) {
       }
   }
   std::vector<MoeTile> tiles;
+  const int cap = mt ? 128 : 64;  // --mt 1: same-expert 64-slot tiles merged
   for (int e = 0; e < E; e++)
-    for (int r = eoff[e]; r < eoff[e + 1]; r += 64) tiles.push_back({e, r, std::min(64, eoff[e + 1] - r)});
+    for (int r = eoff[e]; r < eoff[e + 1]; r += cap)
+      tiles.push_back({e, r, std::min(cap, eoff[e + 1] - r)});
   const int ntiles = (int)tiles.size();
-  const int max_tiles = (npairs + 63) / 64 + E;  // engine's grid bound
+  const int max_tiles = (npairs + cap - 1) / cap + E;  // engine's grid bound
 
   // x: F16 [P][D]
   std::normal_distribution<float> nd(0.f, 1.f);
@@ -146,13 +149,13 @@ int main(int argc, char** argv) {
   CK(hipMemset(d_pairs, 0xFF, (size_t)npairs * D * 4));    // NaN
 
   auto run_up = [&]() {
-    if (!moe_ggx_up(tg.type, dg, du, d_x, d_tok, d_tiles, d_nt, max_tiles, d_hid, MID, D, 0)) {
+    if (!moe_ggx_up(tg.type, dg, du, d_x, d_tok, d_tiles, d_nt, max_tiles, d_hid, MID, D, 0, mt)) {
       fprintf(stderr, "moe_gg_up: unsupported type %s\n", gguf::type_name(tg.type));
       exit(2);
     }
   };
   auto run_dn = [&]() {
-    if (!moe_ggx_down(td.type, dd, d_hid, d_tiles, d_nt, max_tiles, d_pairs, D, MID, 0)) {
+    if (!moe_ggx_down(td.type, dd, d_hid, d_tiles, d_nt, max_tiles, d_pairs, D, MID, 0, mt)) {
       fprintf(stderr, "moe_gg_down: unsupported type %s\n", gguf::type_name(td.type));
       exit(2);
     }

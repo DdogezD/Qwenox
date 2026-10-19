@@ -2195,6 +2195,7 @@ struct GpuModel {
     MoeTile* tiles;
     __half *x16, *hid;
     int max_tiles;
+    bool mt_tiles = false;
     if (P == 1) {
       k_moe_gg_route1<<<1, 64, 0, g_str>>>(topids, topw, 1, k, 16, d_gg_tok, d_gg_pw,
                                            d_gg_pid, d_gg_tiles, d_gg_nt);
@@ -2204,10 +2205,31 @@ struct GpuModel {
     } else {
       if (P > maxbatch_cap) throw std::runtime_error("moe_gguf: P exceeds the batch buffers");
       moe_routing.run(topids, topw, d_tokidx, d_pweight, d_eoff, d_pairids, P, k, E);
-      k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E, 64);
+      // mt (§11.5 contract, hgn v2 / q4cp parity): merge the 64-slot tiles of
+      // one expert into 128-slot super-tiles so each weight K stage is decoded
+      // once for both halves. Only when both expert GEMMs are LUT (k_moe_gg
+      // is 64-slot) and the average slots per expert justify it; per-(slot,
+      // row) K order is unchanged -> bit-identical. QWENOX_GG_MT=0 reverts.
+      static const bool gg_mt_env = [] {
+        const char* s = getenv("QWENOX_GG_MT");
+        return !(s && *s == '0');
+      }();
+      const bool mt = gg_mt_env && P > 1 && ggx_is_lut(g.tgu) && ggx_is_lut(g.tdn) &&
+                      (int64_t)P * k >= 80 * E;
+      k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E, mt ? 128 : 64);
       tokidx = d_tokidx, pairids = d_pairids, ntiles = d_moentiles, pw = d_pweight;
       tiles = d_moetiles, x16 = (__half*)d_xbf16b, hid = (__half*)d_hidb, pairs = d_guvb;
-      max_tiles = (P * k + 63) / 64 + E;
+      max_tiles = mt ? (P * k + 127) / 128 + E : (P * k + 63) / 64 + E;
+      if (mt) {
+        static bool logged = false;
+        if (!logged) {
+          logged = true;
+          fprintf(stderr, "gguf moe prefill: LUT mt BN=128 (QWENOX_GG_MT=0 disables)\n");
+        }
+      }
+      // The deprecated W4A4 path (QWENOX_GG_A4) needs 64-slot tiles: when mt
+      // is on it is skipped (a4_*_ok below); QWENOX_GG_MT=0 brings it back.
+      mt_tiles = mt;
     }
     const size_t n4 = (size_t)P * d / 4;
     k_f32_to_f16_v4<<<(unsigned)((n4 + 255) / 256), 256, 0, g_str>>>(x, x16, n4);
@@ -2221,9 +2243,10 @@ struct GpuModel {
       if (t == moegg::kIq4xs) return d_gg_qt + 1 * 8192;
       return d_gg_qt + 2 * 8192;
     };
-    bool a4_up_ok = (a4m & 1) && d_a4x &&
+    bool a4_up_ok = !mt_tiles && (a4m & 1) && d_a4x &&
                     (g.tgu == moegg::kIq3s || g.tgu == moegg::kIq4xs || g.tgu == moegg::kIq4nl);
-    bool a4_dn_ok = (a4m & 2) && d_a4h && (g.tdn == moegg::kIq4nl || g.tdn == moegg::kIq4xs);
+    bool a4_dn_ok = !mt_tiles && (a4m & 2) && d_a4h &&
+                    (g.tdn == moegg::kIq4nl || g.tdn == moegg::kIq4xs);
     if (a4_up_ok) {
       k_quant_a4<<<(unsigned)(((size_t)P * (d / 128) + 7) / 8), 256, 0, g_str>>>(x16, P, d,
                                                                                 d_a4x, d_a4xs);
@@ -2232,7 +2255,7 @@ struct GpuModel {
     }
     if (!a4_up_ok &&
         !moe_ggx_up(g.tgu, g.gate, g.up, x16, tokidx, tiles, ntiles, max_tiles, hid, mid, d,
-                    g_str))
+                    g_str, mt_tiles))
       throw std::runtime_error("moe_gguf: unsupported expert type");
     if (a4_dn_ok) {
       k_quant_a4<<<(unsigned)(((size_t)P * k * (mid / 128) + 7) / 8), 256, 0, g_str>>>(
@@ -2241,7 +2264,8 @@ struct GpuModel {
                                  (__half*)pairs, d, mid, qt_for(g.tdn), 9.0f, g_str);
     }
     if (!a4_dn_ok &&
-        !moe_ggx_down(g.tdn, g.down, hid, tiles, ntiles, max_tiles, pairs, d, mid, g_str))
+        !moe_ggx_down(g.tdn, g.down, hid, tiles, ntiles, max_tiles, pairs, d, mid, g_str,
+                      mt_tiles))
       throw std::runtime_error("moe_gguf: unsupported expert type");
     if (a4_up_ok || a4_dn_ok) {
       static bool logged = false;

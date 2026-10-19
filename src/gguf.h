@@ -30,13 +30,17 @@
 #include "gpu/os_win32.h"
 #endif
 #include "gguf_iq3s_grid.h"
+#include "gguf_iq3xxs_iq2s_grid.h"
 
 namespace gguf {
 
 enum Type : uint32_t {
   F32 = 0, F16 = 1, Q4_0 = 2, Q4_1 = 3, Q5_0 = 6, Q5_1 = 7, Q8_0 = 8, Q8_1 = 9,
   Q2_K = 10, Q3_K = 11, Q4_K = 12, Q5_K = 13, Q6_K = 14, Q8_K = 15,
-  IQ4_NL = 20, IQ3_S = 21, IQ4_XS = 23, I8 = 24, I16 = 25, I32 = 26, I64 = 27, F64 = 28, BF16 = 30,
+  IQ2_XXS = 16, IQ2_XS = 17, IQ3_XXS = 18, IQ1_S = 19,
+  IQ4_NL = 20, IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23, I8 = 24, I16 = 25, I32 = 26, I64 = 27,
+  F64 = 28, IQ1_M = 29, BF16 = 30, MXFP4 = 39,
+  Q2_0 = 42,
 };
 
 // (elements per block, bytes per block); {0,0} = unsupported.
@@ -61,6 +65,9 @@ inline void block_info(uint32_t t, uint32_t& be, uint32_t& bb) {
     case Q6_K: be = 256; bb = 210; return;
     case IQ4_XS: be = 256; bb = 136; return;
     case IQ3_S: be = 256; bb = 110; return;
+    case IQ3_XXS: be = 256; bb = 98; return;
+    case IQ2_S: be = 256; bb = 82; return;
+    case Q2_0: be = 64; bb = 18; return;
     default: be = 0; bb = 0; return;
   }
 }
@@ -73,6 +80,10 @@ inline const char* type_name(uint32_t t) {
     case Q3_K: return "Q3_K"; case Q4_K: return "Q4_K"; case Q5_K: return "Q5_K";
     case Q6_K: return "Q6_K"; case IQ4_NL: return "IQ4_NL"; case IQ4_XS: return "IQ4_XS";
     case IQ3_S: return "IQ3_S";
+    case IQ2_XXS: return "IQ2_XXS"; case IQ2_XS: return "IQ2_XS"; case IQ3_XXS: return "IQ3_XXS";
+    case IQ1_S: return "IQ1_S"; case IQ2_S: return "IQ2_S"; case IQ1_M: return "IQ1_M";
+    case MXFP4: return "MXFP4";
+    case Q2_0: return "Q2_0";
     case I32: return "I32"; case I64: return "I64";
     default: return "?";
   }
@@ -82,7 +93,8 @@ inline const char* type_name(uint32_t t) {
 inline uint64_t row_bytes(uint32_t t, uint64_t k) {
   uint32_t be, bb;
   block_info(t, be, bb);
-  if (!be || k % be) throw std::runtime_error("gguf: row size not block-aligned");
+  if (!be) throw std::runtime_error(std::string("gguf: unsupported type ") + type_name(t));
+  if (k % be) throw std::runtime_error("gguf: row size not block-aligned");
   return k / be * bb;
 }
 
@@ -349,9 +361,20 @@ class File {
       Tensor& t = ts[i];
       uint32_t be, bb;
       block_info(t.type, be, bb);
-      if (!be) throw std::runtime_error("gguf: unsupported type for " + t.name);
-      t.nbytes = t.numel() / be * bb;
       t.file_off = base + offs[i];
+      // Unknown block types are kept as zero-size views so mixed files can be
+      // opened and their supported tensors used; row_bytes/dequant_row still
+      // reject them with the type-specific error when something touches them.
+      if (!be) {
+        if (t.file_off > m.len) throw std::runtime_error("gguf: tensor past EOF: " + t.name);
+        t.nbytes = 0;
+        t.data = m.base + t.file_off;
+        if (index_.count(t.name)) throw std::runtime_error("gguf: duplicate " + t.name);
+        order_.push_back(t.name);
+        index_.emplace(t.name, std::move(t));
+        continue;
+      }
+      t.nbytes = t.numel() / be * bb;
       if (t.file_off + t.nbytes > m.len)
         throw std::runtime_error("gguf: tensor past EOF: " + t.name);
       t.data = m.base + t.file_off;
@@ -433,6 +456,17 @@ inline void dequant_row(uint32_t t, const uint8_t* src, float* y, uint64_t k) {
     }
     return;
   }
+  if (t == Q2_0) {  // 18 B / 64: d, qs[16] (4 x 2-bit); q=0..3 -> (-1,0,1,2)*d
+    for (uint64_t b = 0; b < k / 64; b++, src += 18) {
+      uint16_t dh; memcpy(&dh, src, 2);
+      const float d = h2f(dh);
+      for (int j = 0; j < 64; j++) {
+        const int q = (src[2 + j / 4] >> (2 * (j % 4))) & 3;
+        y[b * 64 + j] = (float)(q - 1) * d;
+      }
+    }
+    return;
+  }
   if (t == IQ4_XS) {  // 136 B / 256: d, scales_h, scales_l[4], qs[128]
     static const int8_t kv[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
                                   1, 13, 25, 38, 53, 69, 89, 113};
@@ -475,6 +509,57 @@ inline void dequant_row(uint32_t t, const uint8_t* src, float* y, uint64_t k) {
             yy[ib * 32 + l * 8 + j] = db * m1 * ((s >> j) & 1 ? -1.f : 1.f);
             yy[ib * 32 + l * 8 + j + 4] = db * m2 * ((s >> (j + 4)) & 1 ? -1.f : 1.f);
           }
+        }
+      }
+    }
+    return;
+  }
+  if (t == IQ3_XXS) {  // 98 B / 256: d, qs[64], scales_and_signs[32]
+    static const uint32_t grid[256] = GGUF_IQ3XXS_GRID_INIT;
+    static const uint8_t signs_tab[128] = GGUF_KSIGNS_IQ2XS_INIT;
+    for (uint64_t b = 0; b < k / 256; b++, src += 98) {
+      uint16_t dh; memcpy(&dh, src, 2);
+      const float d = h2f(dh);
+      const uint8_t* qs = src + 2;
+      const uint8_t* ss = src + 66;
+      float* yy = y + b * 256;
+      for (int ib = 0; ib < 8; ib++) {  // 32 elements: 8 grid words + 4 sign bytes
+        uint32_t aux; memcpy(&aux, ss + 4 * ib, 4);
+        const float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+        for (int l = 0; l < 4; l++) {
+          const uint8_t signs = signs_tab[(aux >> (7 * l)) & 127];
+          const uint32_t g1 = grid[qs[8 * ib + 2 * l + 0]];
+          const uint32_t g2 = grid[qs[8 * ib + 2 * l + 1]];
+          for (int j = 0; j < 4; j++) {
+            const float m1 = (float)((g1 >> (8 * j)) & 0xFF), m2 = (float)((g2 >> (8 * j)) & 0xFF);
+            yy[ib * 32 + l * 8 + j] = db * m1 * ((signs >> j) & 1 ? -1.f : 1.f);
+            yy[ib * 32 + l * 8 + j + 4] = db * m2 * ((signs >> (j + 4)) & 1 ? -1.f : 1.f);
+          }
+        }
+      }
+    }
+    return;
+  }
+  if (t == IQ2_S) {  // 82 B / 256: d, qs[64], qh[8], scales[8]
+    static const uint64_t grid[1024] = GGUF_IQ2S_GRID_INIT;
+    for (uint64_t b = 0; b < k / 256; b++, src += 82) {
+      uint16_t dh; memcpy(&dh, src, 2);
+      const float d = h2f(dh);
+      const uint8_t* qs = src + 2;
+      const uint8_t* qh = src + 66;
+      const uint8_t* sc = src + 74;
+      const uint8_t* signs = qs + 32;
+      float* yy = y + b * 256;
+      for (int ib = 0; ib < 8; ib++) {
+        const float db0 = d * (0.5f + (float)(sc[ib] & 0xF)) * 0.25f;
+        const float db1 = d * (0.5f + (float)(sc[ib] >> 4)) * 0.25f;
+        for (int l = 0; l < 4; l++) {
+          const uint64_t g = grid[qs[4 * ib + l] | ((qh[ib] << (8 - 2 * l)) & 0x300)];
+          const uint8_t s = signs[4 * ib + l];
+          const float dl = l < 2 ? db0 : db1;
+          for (int j = 0; j < 8; j++)
+            yy[ib * 32 + l * 8 + j] = dl * (float)((g >> (8 * j)) & 0xFF) *
+                                      ((s >> j) & 1 ? -1.f : 1.f);
         }
       }
     }
