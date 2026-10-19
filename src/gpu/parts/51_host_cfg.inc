@@ -273,15 +273,6 @@ static void flush_log() {  // call with g_mtx NOT held
   fputs(tl_log.c_str(), stderr);
   tl_log.clear();
 }
-static void rm_file(const std::string& name) {
-  std::error_code ec;
-  std::filesystem::remove(path_of(name), ec);
-  // Windows: a sharing violation (antivirus scan, indexer, an open handle)
-  // leaves the file on disk although the index already dropped its bytes
-  if (ec)
-    logf_locked("kvsnap: cannot delete %s (error %d); the file stays on disk\n",
-                name.c_str(), ec.value());
-}
 static bool wr_all(int fd, const char* p, size_t n) {
   while (n) {
     ssize_t w = os_write(fd, p, std::min(n, (size_t)1 << 30));
@@ -366,15 +357,6 @@ static bool read_file(const std::string& path, HBuf& b, size_t want, size_t max 
   os_close(fd);
   return ok;
 }
-static bool read_prefix(const std::string& path, void* dst, size_t n, uint64_t* fsz) {
-  int fd = os_open_rd(path.c_str());
-  if (fd < 0) return false;
-  const int64_t s = os_fsize(fd);
-  const bool ok = s >= (int64_t)n && rd_all(fd, (char*)dst, n);
-  os_close(fd);
-  *fsz = (uint64_t)std::max<int64_t>(s, 0);
-  return ok;
-}
 
 // ---- in-memory index ---------------------------------------------------------
 // Pages and MTP sections are shared by every checkpoint whose prefix covers
@@ -401,12 +383,44 @@ static std::unordered_map<uint64_t, Blk> g_ch, g_mt;
 static std::vector<std::shared_ptr<CkEnt>> g_ck;
 static uint64_t g_total = 0;  // bytes of published files
 
+// ---- janitor: file deletes and LRU mtime bumps, off the lock ------------------
+// Each is a round trip on a share (2-8 ms), and evicting one checkpoint can
+// drop hundreds of pages: done under g_mtx that froze the GPU thread at its
+// next match/enqueue/Turn. The index only queues the operation (the index
+// itself changes at once); one background thread performs it. File names
+// are content-addressed and can come back (a page evicted, then saved
+// again): a queued delete is skipped when the name is in the index again by
+// the time it runs, and a writer about to publish a name waits while that
+// name is being deleted.
+struct JOp {
+  std::string name;
+  bool del;  // false: bump the mtime (LRU order across restarts)
+};
+static std::deque<JOp> g_jq;
+static std::string g_jcur;    // name being deleted right now
+static bool g_jbusy = false;  // the janitor holds an operation
+static void del_locked(const std::string& name) {
+  g_jq.push_back({name, true});
+  g_cv.notify_all();
+}
+// The index holds this name (published or pending): its file is wanted.
+static bool live_locked(const std::string& n) {
+  if (n.size() == 22 && n[1] == '_' && (n[0] == 'c' || n[0] == 'm')) {
+    const uint64_t k = strtoull(n.substr(2, 16).c_str(), nullptr, 16);
+    return (n[0] == 'c' ? g_ch : g_mt).count(k) > 0;
+  }
+  if (n[0] == 'k')
+    for (const auto& e : g_ck)
+      if (e->name == n) return true;
+  return false;
+}
+
 static void unref_locked(std::unordered_map<uint64_t, Blk>& mp, uint64_t key, bool mtp) {
   auto it = mp.find(key);
   if (it == mp.end() || --it->second.refs > 0) return;
   if (it->second.st == ST_PEND) return;  // the writer deletes it on publish
   if (it->second.st == ST_PUB) {
-    rm_file(mtp ? mt_name(key) : ch_name(key));
+    del_locked(mtp ? mt_name(key) : ch_name(key));
     g_total -= it->second.bytes;
   }
   mp.erase(it);
@@ -417,7 +431,7 @@ static void drop_ck_locked(std::shared_ptr<CkEnt> e, bool del_file) {
   g_ck.erase(it);
   if (e->pub) {
     g_total -= e->bytes;
-    if (del_file) rm_file(e->name);
+    if (del_file) del_locked(e->name);
   }
   for (uint64_t k : e->chunks) unref_locked(g_ch, k, false);
   for (uint64_t k : e->mtps)
@@ -436,9 +450,59 @@ static void evict_locked(const CkEnt* keep) {
 }
 static void touch_locked(const std::shared_ptr<CkEnt>& e) {
   e->t = now_t();
-  std::error_code ec;  // the file mtime carries the LRU order across restarts
-  std::filesystem::last_write_time(path_of(e->name),
-                                   std::filesystem::file_time_type::clock::now(), ec);
+  g_jq.push_back({e->name, false});  // the file mtime carries it across restarts
+  g_cv.notify_all();
+}
+
+static void janitor() {
+  int nd = 0;  // deletes of the current burst (logged when the queue drains)
+  double ds = 0;
+  for (;;) {
+    JOp op;
+    {
+      std::unique_lock<std::mutex> lk(g_mtx);
+      g_cv.wait(lk, [] { return !g_jq.empty(); });
+      op = std::move(g_jq.front());
+      g_jq.pop_front();
+      if (op.del == live_locked(op.name)) {  // re-created since / already gone
+        lk.unlock();
+        g_cv.notify_all();
+        continue;
+      }
+      g_jbusy = true;
+      if (op.del) g_jcur = op.name;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    std::error_code ec;
+    if (op.del)
+      std::filesystem::remove(path_of(op.name), ec);
+    else
+      std::filesystem::last_write_time(path_of(op.name),
+                                       std::filesystem::file_time_type::clock::now(), ec);
+    bool drained;
+    {
+      std::lock_guard<std::mutex> lk(g_mtx);
+      g_jbusy = false;
+      g_jcur.clear();
+      drained = g_jq.empty();
+    }
+    g_cv.notify_all();
+    if (!op.del) continue;
+    nd++;
+    ds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    // Windows: a sharing violation (antivirus scan, indexer, an open handle)
+    // leaves the file on disk although the index already dropped its bytes
+    if (ec)
+      fprintf(stderr, "kvsnap: cannot delete %s (error %d); the file stays on disk\n",
+              op.name.c_str(), ec.value());
+    if (drained) {
+      if (nd >= 16 || ds >= 0.5)
+        fprintf(stderr, "%s kvsnap: deleted %d files in %.2fs (background)\n", log_ts(), nd,
+                ds);
+      nd = 0;
+      ds = 0;
+    }
+  }
 }
 
 // ---- background writers ------------------------------------------------------
@@ -496,6 +560,10 @@ static void writer() {
     } else {
       name = it.kind ? mt_name(it.key) : ch_name(it.key);
     }
+    {  // an earlier copy of this name is being deleted: publish after it
+      std::unique_lock<std::mutex> lk(g_mtx);
+      g_cv.wait(lk, [&] { return g_jcur != name; });
+    }
     const size_t hb = it.kind == 2 ? sizeof(CkHdr) : sizeof(ChHdr);
     const uint64_t sum = sum64(p + hb, len - hb);
     memcpy(p + (it.kind == 2 ? offsetof(CkHdr, sum) : offsetof(ChHdr, sum)), &sum, 8);
@@ -515,7 +583,7 @@ static void writer() {
         auto& mp = it.kind ? g_mt : g_ch;
         auto f = mp.find(it.key);
         if (f == mp.end() || f->second.refs == 0) {
-          if (ok) rm_file(name);  // every referencing checkpoint is gone
+          if (ok) del_locked(name);  // every referencing checkpoint is gone
           if (f != mp.end()) mp.erase(f);
         } else if (ok) {
           f->second.st = ST_PUB;
@@ -564,7 +632,9 @@ static void writer() {
     buf_put(std::move(it.buf));
   }
 }
-static void enqueue(Item&& it) {
+// Returns the seconds the caller (the GPU thread) waited for queue space.
+static double enqueue(Item&& it) {
+  const auto t0 = std::chrono::steady_clock::now();
   std::unique_lock<std::mutex> lk(g_mtx);
   // bounded: the GPU thread waits for the disk rather than hoard host memory
   g_cv.wait(lk, [&] { return g_q_bytes == 0 || g_q_bytes + it.buf.n <= g_qcap; });
@@ -572,6 +642,7 @@ static void enqueue(Item&& it) {
   g_q.push_back(std::move(it));
   lk.unlock();
   g_cv.notify_all();
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
 // Requests in flight: a turn commits after its reply went out, so KVSYNC
@@ -591,11 +662,13 @@ struct Turn {
   }
 };
 
-// KVSYNC: wait for in-flight turns and the writer to drain;
+// KVSYNC: wait for in-flight turns, the writer and the janitor to drain;
 // "K <ckpts> <pages> <mtp> <bytes>".
 static std::string sync_line() {
   std::unique_lock<std::mutex> lk(g_mtx);
-  g_cv.wait(lk, [] { return g_q.empty() && !g_wbusy && !g_turns; });
+  g_cv.wait(lk, [] {
+    return g_q.empty() && !g_wbusy && !g_turns && g_jq.empty() && !g_jbusy;
+  });
   size_t nck = 0;
   for (auto& e : g_ck) nck += e->pub;
   char b[128];
@@ -749,7 +822,24 @@ static void commit_seed(GpuModel& m, const std::vector<int>& hist,
     pend.clear();
     return;
   }
+  // The writer is still a full queue behind (a slow share, back-to-back
+  // turns): drop this turn's saves instead of stalling the GPU thread in
+  // enqueue -- the cache is an accelerator, the next request must not wait.
+  uint64_t behind = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    if (g_q_bytes >= g_qcap) behind = g_q_bytes;
+  }
+  if (behind) {
+    fprintf(stderr, "%s kvsnap: writer behind (%.0f MB queued): not saving %zu state%s of "
+            "%zu tokens\n", log_ts(), behind / 1048576.0, pend.size(),
+            pend.size() == 1 ? "" : "s", hist.size());
+    for (auto& pd : pend) buf_put(std::move(pd.buf));
+    pend.clear();
+    return;
+  }
   const auto t0 = std::chrono::steady_clock::now();
+  double qwait = 0;  // GPU thread blocked on a full queue
   const Geo G = geo(m);
   std::sort(pend.begin(), pend.end(),
             [](const Pending& a, const Pending& b) { return a.ck->n < b.ck->n; });
@@ -825,7 +915,7 @@ static void commit_seed(GpuModel& m, const std::vector<int>& hist,
       }
       (pass ? nmt : nch)[(size_t)o]++;
       nb[(size_t)o] += it.buf.n;
-      enqueue(std::move(it));
+      qwait += enqueue(std::move(it));
     }
   const double pages_s =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -840,10 +930,13 @@ static void commit_seed(GpuModel& m, const std::vector<int>& hist,
     it.new_ch = nch[keep[k]];
     it.new_mt = nmt[keep[k]];
     it.new_b = nb[keep[k]];
-    enqueue(std::move(it));
+    qwait += enqueue(std::move(it));
   }
   for (auto& pd : pend) buf_put(std::move(pd.buf));  // deduped images
   pend.clear();
+  if (qwait >= 0.05)
+    fprintf(stderr, "%s kvsnap: GPU thread waited %.2fs for the writer (queue cap %.0f MB)\n",
+            log_ts(), qwait, g_qcap / 1048576.0);
 }
 
 // A vision request's state before its first image is keyed as text
@@ -1222,21 +1315,36 @@ static bool own_name(const std::string& fn) {
          (!fn.rfind("m_", 0) && ends_with(fn, ".kvm")) ||
          (!fn.rfind("k_", 0) && ends_with(fn, ".kck"));
 }
+// Index entry of a checkpoint: one open; a 64 KiB first read holds the
+// header and the page-key/tail lists of any common length.
 static std::shared_ptr<CkEnt> load_ck(const std::string& fn) {
+  const int fd = os_open_rd(path_of(fn).c_str());
+  if (fd < 0) return nullptr;
+  struct Fd {
+    int fd;
+    ~Fd() { os_close(fd); }
+  } guard{fd};
+  const int64_t fsz = os_fsize(fd);
+  if (fsz < (int64_t)sizeof(CkHdr)) return nullptr;
+  std::vector<char> v((size_t)std::min<int64_t>(fsz, (int64_t)64 << 10));
+  if (!rd_all(fd, v.data(), v.size())) return nullptr;
   CkHdr h;
-  uint64_t fsz = 0;
-  if (!read_prefix(path_of(fn), &h, sizeof h, &fsz) || !ck_sane(h) ||
-      fsz != sizeof h + ck_body_b(h) || fn != ck_name(h.n, h.id))
+  memcpy(&h, v.data(), sizeof h);
+  if (!ck_sane(h) || (uint64_t)fsz != sizeof h + ck_body_b(h) || fn != ck_name(h.n, h.id))
     return nullptr;
   const size_t nt = (size_t)h.n - (size_t)h.nc * KV_PAGE;
-  std::vector<char> v(sizeof h + (size_t)h.nc * 16 + nt * 4);
-  if (!read_prefix(path_of(fn), v.data(), v.size(), &fsz)) return nullptr;
+  const size_t need = sizeof h + (size_t)h.nc * 16 + nt * 4;
+  if (need > v.size()) {
+    const size_t have = v.size();
+    v.resize(need);
+    if (!rd_all(fd, v.data() + have, need - have)) return nullptr;
+  }
   auto e = std::make_shared<CkEnt>();
   e->name = fn;
   e->seed = h.seed;
   e->base = h.base;
   e->id = h.id;
-  e->bytes = fsz;
+  e->bytes = (uint64_t)fsz;
   e->n = h.n;
   e->nc = h.nc;
   e->nl = h.nl;
@@ -1252,10 +1360,16 @@ static std::shared_ptr<CkEnt> load_ck(const std::string& fn) {
 }
 
 // Index the cache directory (serve::run, before the first request). Torn
-// temporaries, pre-A4 snapshot directories, unreadable files and checkpoints
-// missing a trunk page are removed; unreferenced pages too.
+// temporaries, pre-A4 snapshot directories, unreadable checkpoints and
+// checkpoints missing a trunk page are removed; unreferenced pages too.
+// Cost is per file on a share, so pages are indexed from the directory
+// listing alone (name -> key, listed size): their header and checksum are
+// verified when a restore reads them, and a bad one then drops the
+// checkpoints built on it. Checkpoints are read (header + key lists) by
+// several threads. Bulk deletes go to the janitor.
 static void init(GpuModel& m, Cfg& cfg) {
   namespace fs = std::filesystem;
+  const auto ti = std::chrono::steady_clock::now();
   std::error_code ec;
   fs::create_directories(cfg.dir, ec);
   if (!fs::is_directory(cfg.dir, ec)) {
@@ -1272,53 +1386,70 @@ static void init(GpuModel& m, Cfg& cfg) {
   g_direct = cfg.direct;
   g_fp = fingerprint(m);
   g_vis_id = g_vision_file.empty() ? 0 : file_id(g_vision_file);
-  std::vector<std::shared_ptr<CkEnt>> cks;
+  struct Ck {
+    std::string fn;
+    int64_t t;
+    std::shared_ptr<CkEnt> e;
+  };
+  std::vector<Ck> cks;
   size_t legacy = 0, bad = 0;
-  std::vector<fs::path> ents;
-  for (auto& de : fs::directory_iterator(cfg.dir, ec)) ents.push_back(de.path());
-  for (const auto& pth : ents) {
+  // directory_entry carries the listing's size/mtime on Windows (no stat)
+  for (fs::directory_iterator it(cfg.dir, ec), end; !ec && it != end; it.increment(ec)) {
+    const fs::directory_entry& de = *it;
     std::error_code e2;
-    const std::string fn = pth.filename().string();
+    const std::string fn = de.path().filename().string();
     if (!fn.rfind("tmp_", 0)) {
-      if (own_name(fn.substr(4)) && fs::is_regular_file(pth, e2)) fs::remove(pth, e2);
-    } else if (!fn.rfind("s_", 0) && fs::is_directory(pth, e2) &&
-               fs::is_regular_file(pth / "meta", e2)) {
-      fs::remove_all(pth, e2);  // KVS1-3 whole-state snapshots
+      if (own_name(fn.substr(4)) && de.is_regular_file(e2)) fs::remove(de.path(), e2);
+    } else if (!fn.rfind("s_", 0) && de.is_directory(e2) &&
+               fs::is_regular_file(de.path() / "meta", e2)) {
+      fs::remove_all(de.path(), e2);  // KVS1-3 whole-state snapshots
       legacy++;
     } else if ((!fn.rfind("c_", 0) && ends_with(fn, ".kvc")) ||
                (!fn.rfind("m_", 0) && ends_with(fn, ".kvm"))) {
       const bool mt = fn[0] == 'm';
-      ChHdr h;
-      uint64_t fsz = 0;
-      if (!read_prefix(pth.string(), &h, sizeof h, &fsz) ||
-          memcmp(h.magic, mt ? MAG_M : MAG_C, 8) || h.nl <= 0 || h.nl > 64 ||
-          (h.kvb != 2 && h.kvb != 4) ||
-          fsz != sizeof h + (size_t)h.nl * page_layer_b(h.kvb, h.has_ik) ||
-          fn != (mt ? mt_name(h.key) : ch_name(h.key))) {
-        fs::remove(pth, e2);
+      const uint64_t key =
+          fn.size() == 22 ? strtoull(fn.substr(2, 16).c_str(), nullptr, 16) : 0;
+      const uint64_t fsz = de.file_size(e2);
+      if (e2 || fsz <= sizeof(ChHdr) || fn != (mt ? mt_name(key) : ch_name(key))) {
+        fs::remove(de.path(), e2);
         bad++;
         continue;
       }
-      Blk& b = (mt ? g_mt : g_ch)[h.key];
+      Blk& b = (mt ? g_mt : g_ch)[key];
       b.bytes = fsz;
       b.st = ST_PUB;
     } else if (!fn.rfind("k_", 0) && ends_with(fn, ".kck")) {
-      auto e = load_ck(fn);
-      if (!e) {
-        fs::remove(pth, e2);
-        bad++;
-        continue;
-      }
-      e->t = (int64_t)fs::last_write_time(pth, e2).time_since_epoch().count();
-      cks.push_back(e);
+      const int64_t t = (int64_t)de.last_write_time(e2).time_since_epoch().count();
+      cks.push_back({fn, t, nullptr});
     }
   }
+  const double list_s = secs_since(ti);
+  const auto tc = std::chrono::steady_clock::now();
+  {
+    std::atomic<size_t> next{0};
+    const size_t nth = std::min<size_t>(cks.size(), remote ? 16 : 4);
+    std::vector<std::thread> th;
+    for (size_t i = 0; i < nth; i++)
+      th.emplace_back([&] {
+        for (size_t j; (j = next++) < cks.size();) cks[j].e = load_ck(cks[j].fn);
+      });
+    for (auto& t : th) t.join();
+  }
+  const double ck_s = secs_since(tc);
   std::unique_lock<std::mutex> lk(g_mtx);
-  for (auto& e : cks) {
+  for (auto& c : cks) {
+    if (!c.e) {
+      std::error_code e2;
+      fs::remove(path_of(c.fn), e2);
+      bad++;
+      continue;
+    }
+    const auto& e = c.e;
+    e->t = c.t;
     bool whole = true;
     for (uint64_t k : e->chunks) whole = whole && g_ch.count(k);
     if (!whole) {
-      rm_file(e->name);
+      del_locked(e->name);
       bad++;
       continue;
     }
@@ -1335,7 +1466,7 @@ static void init(GpuModel& m, Cfg& cfg) {
   for (auto* mp : {&g_ch, &g_mt})
     for (auto it = mp->begin(); it != mp->end();) {
       if (it->second.refs == 0) {
-        rm_file(mp == &g_mt ? mt_name(it->first) : ch_name(it->first));
+        del_locked(mp == &g_mt ? mt_name(it->first) : ch_name(it->first));
         it = mp->erase(it);
         orphans++;
       } else {
@@ -1350,14 +1481,16 @@ static void init(GpuModel& m, Cfg& cfg) {
     fprintf(stderr, "kvsnap: removed %zu pre-A4 snapshot director%s (old format)\n",
             legacy, legacy == 1 ? "y" : "ies");
   if (bad || orphans)
-    fprintf(stderr, "kvsnap: removed %zu unusable and %zu unreferenced files\n", bad,
+    fprintf(stderr, "kvsnap: removing %zu unusable and %zu unreferenced files\n", bad,
             orphans);
   fprintf(stderr, "kvsnap: index %zu checkpoints, %zu pages, %zu mtp sections, %.2f GB "
-          "(cap %.1f GB, queue %.0f MB, %s, %d readers, %d writers)\n",
+          "(cap %.1f GB, queue %.0f MB, %s, %d readers, %d writers; scanned in %.2fs: "
+          "listing %.2fs, %zu checkpoint headers %.2fs)\n",
           g_ck.size(), g_ch.size(), g_mt.size(), g_total / 1073741824.0,
           g_cap / 1073741824.0, g_qcap / 1048576.0, remote ? "network" : "local",
-          g_readers, g_writers);
+          g_readers, g_writers, secs_since(ti), list_s, cks.size(), ck_s);
   g_on = true;
+  std::thread(janitor).detach();
   for (int i = 0; i < g_writers; i++) std::thread(writer).detach();
 }
 

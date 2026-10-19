@@ -36,7 +36,11 @@
 // hands everything to one background writer (bounded queue,
 // QWENOX_KVSNAP_QUEUE_MB, default 1024): tmp_<name> + fdatasync + rename, pages
 // before the checkpoints naming them, so a crash never publishes a torn or
-// dangling file. KVSYNC waits for the writer (tests).
+// dangling file. A turn that ends while the queue is still full saves
+// nothing (logged) rather than stall the GPU thread. File deletes and LRU
+// mtime bumps run on a janitor thread, never under the index lock (each is
+// a round trip on a share). KVSYNC waits for the writer and the janitor
+// (tests).
 // IO: direct (O_DIRECT / FILE_FLAG_NO_BUFFERING; buffers 4 KiB aligned, the
 // write is padded and the file cut back to its size): cache files never sit
 // in the OS file cache, which on this APU competes with device memory and
@@ -57,6 +61,8 @@
 // 4096 tokens) are not saved. QWENOX_KVSNAP=0 disables. Startup indexes the
 // directory, removing temporaries, pre-A4 s_* snapshot directories, and
 // orphaned/damaged files -- only names of these formats, so other files in
-// the directory are left alone. All errors are non-fatal: the cache is an
+// the directory are left alone. Pages are indexed from the listing alone
+// (name, size; their contents are verified when restored), checkpoints by
+// reading their header on several threads. All errors are non-fatal: the cache is an
 // accelerator, never a correctness dependency.
 namespace kvsnap {
