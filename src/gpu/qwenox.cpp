@@ -162,6 +162,7 @@
 #include "parts/24_kernels_moe_lt.inc"
 #include "parts/25_kernels_gdn.inc"
 #include "parts/26_kernels_moe_gguf.inc"
+#include "parts/26_kernels_dense_gguf.inc"
 #include "parts/27_kernels_moe_lut.inc"
 #include "parts/29_kernels_moe_gg_iu4.inc"
 #include "parts/28_kernels_hgn_v2.inc"

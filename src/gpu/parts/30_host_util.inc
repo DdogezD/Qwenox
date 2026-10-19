@@ -313,7 +313,8 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
       std::vector<size_t> per(g_cfg.layers, 0);
       for (auto& kv : ck.tensors()) {
         const Tensor& t = kv.second;
-        if (!(t.dtype == 5 || t.dtype == 7 || t.dtype == 8 || t.dtype == 16 || t.dtype == 24))
+        if (!(t.dtype == 5 || t.dtype == 7 || t.dtype == 8 || t.dtype == 16 || t.dtype == 24 ||
+              (t.dtype >= 100 && ggd::type_ok((int)t.dtype - ggd::kDtypeBase))))
           continue;
         if (kv.first.rfind("layers.", 0) != 0) continue;
         const int l = atoi(kv.first.c_str() + 7);
@@ -630,26 +631,39 @@ static void gguf_dense_apply(Checkpoint& ck) {
     };
     fprintf(stderr, "gguf dense: filter %s\n", f);
   }
+  // QWENOX_GGUF_NATIVE=0: every non-Q8_0 dense matrix is requantized to q8g32
+  // (the earlier layout). Default: K-quant / IQ4 matrices stay native.
+  {
+    const char* ne = getenv("QWENOX_GGUF_NATIVE");
+    gguf_map::g_native_dense = !(ne && ne[0] == '0' && ne[1] == 0);
+  }
   size_t n = gguf_map::build(ck, *g_gguf, g_gguf_mtp);
   // PLE n-gram table: a hgn base keeps its fp8 table by default (KLD 0.0453
   // vs 0.0511 with the GGUF's IQ4_NL one); pure GGUF / QWENOX_GGUF_PLE=1 use IQ4_NL.
   const char* pe = getenv("QWENOX_GGUF_PLE");
   const bool ple = (pe && !strcmp(pe, "1")) || !ck.find("layers.1.ple.ngram_embedding.weight");
   if (ple) gguf_map::add_ple_table(ck, *g_gguf);
-  size_t bytes = 0;
-  int n8 = 0;
-  for (auto& kv : ck.tensors())
-    if (kv.second.dtype == 8 || kv.second.dtype == 1) {
+  size_t bytes = 0, nbytes = 0;
+  int n8 = 0, nn = 0;
+  for (auto& kv : ck.tensors()) {
+    const uint32_t dt = kv.second.dtype;
+    if (dt == 8 || dt == 1) {
       bytes += kv.second.data_size;
-      n8 += kv.second.dtype == 8;
+      n8 += dt == 8;
+    } else if (dt >= 100 && ggd::type_ok((int)dt - ggd::kDtypeBase)) {
+      bytes += kv.second.data_size;
+      nbytes += kv.second.data_size;
+      nn++;
     }
+  }
   g_gguf_dense = true;
   g_dense_rowfast = true;
   double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   fprintf(stderr,
-          "gguf dense: %zu tensors from GGUF%s (%d q8g32, %.2f GiB synthetic, %.1f s)%s\n", n,
-          g_gguf_mtp ? " + MTP sidecar" : "", n8, bytes / 1073741824.0, s,
-          ple ? "; PLE table IQ4_NL" : "");
+          "gguf dense: %zu tensors from GGUF%s (%d q8g32, %d native %.2f GiB, %.2f GiB synthetic, "
+          "%.1f s)%s\n",
+          n, g_gguf_mtp ? " + MTP sidecar" : "", n8, nn, nbytes / 1073741824.0,
+          bytes / 1073741824.0, s, ple ? "; PLE table IQ4_NL" : "");
 }
 // After GpuModel construction: free host copies of large synthetic tensors
 // (the device arena has them). Small ones stay: ensure_hcnorm/ensure_norm256
@@ -1546,6 +1560,71 @@ static bool q8g32_wmma(const WView& w, const void* x, bool xbf16, uint64_t xs, f
   return true;
 }
 
+// --- GGUF native dense (dtype 100 + GGML type, 26_kernels_dense_gguf.inc) -----
+static inline bool ggd_dtype(int dt) { return dt >= 100 && ggd::type_ok(dt - ggd::kDtypeBase); }
+template <class F>
+static inline void ggd_with_type(int t, F&& f) {
+  switch (t) {
+    case ggd::kQ4K: f(std::integral_constant<int, ggd::kQ4K>{}); break;
+    case ggd::kQ5K: f(std::integral_constant<int, ggd::kQ5K>{}); break;
+    case ggd::kQ6K: f(std::integral_constant<int, ggd::kQ6K>{}); break;
+    case ggd::kIQ4NL: f(std::integral_constant<int, ggd::kIQ4NL>{}); break;
+    default: f(std::integral_constant<int, ggd::kIQ4XS>{}); break;
+  }
+}
+// y row p at y + p*ys (row r of the slice at y[p*ys + r]); x row p at x + p*xs
+// (f32 or bf16). Any P: passes of <= 8 tokens, each token bit-identical to P = 1.
+static bool ggd_gemv(const WView& w, const void* x, bool xbf16, uint64_t xs, float* y,
+                     uint64_t ys, int P, uint64_t row_off, uint64_t nrows) {
+  if (!ggd_dtype(w.dtype) || P < 1 || !nrows || w.cols % 32) return false;
+  const int t = w.dtype - ggd::kDtypeBase;
+  if (t != ggd::kIQ4NL && w.cols % 256) return false;
+  if (xs % (xbf16 ? 8 : 4) || ((uintptr_t)x & 15)) return false;
+  const uint64_t rb = ggd::row_bytes(t, w.cols);
+  const uint8_t* wd = w.data + row_off * rb;
+  if (rb % 4 || ((uintptr_t)wd & 3)) return false;  // dword-staged rows
+  const unsigned blocks = (unsigned)((nrows + 3) / 4);
+  for (int off = 0; off < P; off += 8) {
+    const int pn = std::min(8, P - off);
+    const void* xp = xbf16 ? (const void*)((const uint16_t*)x + (size_t)off * xs)
+                           : (const void*)((const float*)x + (size_t)off * xs);
+    float* yp = y + (size_t)off * ys;
+    ggd_with_type(t, [&](auto tc_) {
+      constexpr int T = decltype(tc_)::value;
+#define QWENOX_GGD(NP)                                                                  \
+  case NP:                                                                              \
+    if (xbf16)                                                                          \
+      k_ggd_gemv<T, NP, true><<<blocks, 128, 0, g_str>>>(wd, rb, xp, xs, yp, ys,      \
+                                                         (int)nrows, (int)w.cols);      \
+    else                                                                                \
+      k_ggd_gemv<T, NP, false><<<blocks, 128, 0, g_str>>>(wd, rb, xp, xs, yp, ys,     \
+                                                          (int)nrows, (int)w.cols);     \
+    break;
+      switch (pn) {
+        QWENOX_GGD(1)
+        QWENOX_GGD(2)
+        QWENOX_GGD(3)
+        QWENOX_GGD(4)
+        QWENOX_GGD(5)
+        QWENOX_GGD(6)
+        QWENOX_GGD(7)
+        QWENOX_GGD(8)
+      }
+#undef QWENOX_GGD
+    });
+  }
+  return true;
+}
+static void ggd_deq_bf16(const WView& w, uint16_t* out, hipStream_t st) {
+  const int t = w.dtype - ggd::kDtypeBase;
+  const uint64_t rb = ggd::row_bytes(t, w.cols), n = w.rows * (w.cols / 32);
+  ggd_with_type(t, [&](auto tc_) {
+    constexpr int T = decltype(tc_)::value;
+    k_ggd_deq_bf16<T><<<(unsigned)((n + 255) / 256), 256, 0, st>>>(w.data, rb, out, w.rows,
+                                                                   (int)w.cols);
+  });
+}
+
 // ht / q6g64 -> bf16 W[rows][cols] (prefill GEMM operand).
 // fast (bit-identical variants): ht -> k_ht_deq_bf16_h (half LDS, 2x resident
 // blocks), q6g64 -> k_q6g64_deq_bf16_c8 (coalesced 8-column threads).
@@ -1622,6 +1701,9 @@ static void gemv(const WView& w, const float* x, float* y, uint64_t row_off = 0,
   } else if (w.dtype == 24) {
     if (!(dense_wmma_hc_on() && q6g64_wmma(w, x, false, w.cols, y, 0, 1, row_off, rows)))
       q6g64_gemv(w, x, false, 0, y, 0, 1, row_off, rows);
+  } else if (ggd_dtype(w.dtype)) {
+    if (!ggd_gemv(w, x, false, w.cols, y, 0, 1, row_off, rows))
+      throw std::runtime_error("gemv: GGUF native dense shape/alignment");
   } else {
     throw std::runtime_error("gemv: unsupported dtype");
   }
@@ -1959,6 +2041,9 @@ static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
   if (w.dtype == 8 && dense_wmma_q8_on() &&
       q8g32_wmma(w, x, xbf16, xstride, y, w.rows, P, 0, w.rows))
     return true;
+  // GGUF native dense: one kernel family for every P (<= 8-token passes), so
+  // batched rows are bit-identical to the P = 1 decode GEMV.
+  if (ggd_dtype(w.dtype)) return ggd_gemv(w, x, xbf16, xstride, y, w.rows, P, 0, w.rows);
   if (P <= 8) return gemv_multi_q4cp_le8(w, x, y, P, xstride, xbf16);
   // P > 8: chunked passes of ≤ 8 rows re-read the weight per pass
   // (0.5-0.75 B/elem/pass vs ~4.5 B/elem for deq+WMMA, so the crossover is

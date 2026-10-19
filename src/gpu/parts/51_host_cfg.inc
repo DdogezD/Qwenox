@@ -1205,6 +1205,9 @@ static uint64_t fingerprint(const GpuModel& m) {
                      bits(g_cfg.rope.beta_fast), bits(g_cfg.rope.beta_slow),
                      bits(g_cfg.rope.attention_factor)})
     add(v);
+  // GGUF native dense weights (not the q8g32 requant): different numerics,
+  // so snapshots of the two layouts never mix. Other setups keep their hash.
+  if (g_gguf_dense && gguf_map::g_native_dense) add(0x4e41544956453031ULL);
   return h;
 }
 static bool ends_with(const std::string& s, const char* suf) {

@@ -117,6 +117,22 @@ inline uint16_t f2h(float f) {
   return (uint16_t)(sign | ((r >> 13) - (112u << 10)));
 }
 
+// Native dense (engine opt-in, default off here so tools keep q8g32): Q4_K /
+// Q5_K / Q6_K / IQ4_XS / IQ4_NL matrices without a column-block map keep their
+// GGUF rows (row map applied) as dtype 100 + GGML type instead of the q8g32
+// requant (1.3-2.0x the bytes; decode GEMV is bandwidth-bound). The token
+// embedding stays q8g32 (gather kernels). Read by 26_kernels_dense_gguf.inc.
+inline bool g_native_dense = false;
+inline bool native_dense_ok(const std::string& name, const gguf::Tensor& t, const Map& blks) {
+  if (!g_native_dense || !blks.empty() || name == "embed_tokens.weight") return false;
+  if (!(t.type == gguf::Q4_K || t.type == gguf::Q5_K || t.type == gguf::Q6_K ||
+        t.type == gguf::IQ4_XS || t.type == gguf::IQ4_NL))
+    return false;
+  uint32_t be, bb;
+  gguf::block_info(t.type, be, bb);
+  return be && t.ne[0] % be == 0 && t.row_bytes() % 4 == 0;  // GEMV stages dwords
+}
+
 // Q8_0 [R][C] -> q8g32 [R'][C'] taking source row rows[r] (identity if empty)
 // and source 32-col block blks[b] (identity if empty). Other block types (the
 // UD-IQ4_XS lm_head is Q6_K) are dequantized (ggml semantics) and requantized
@@ -125,6 +141,20 @@ inline uint16_t f2h(float f) {
 inline void add_q8(hgn::Checkpoint& ck, const std::string& name, const gguf::Tensor& t,
                    std::initializer_list<uint64_t> dims, const Map& rows = {},
                    const Map& blks = {}) {
+  if (native_dense_ok(name, t, blks)) {
+    const uint64_t C = t.ne[0], R = t.rows(), rb = t.row_bytes();
+    const uint64_t Ro = rows.empty() ? R : rows.size();
+    hgn::Tensor d = desc(name, 100 + t.type, dims);
+    need(d.numel() == Ro * C, name + ": shape mismatch vs " + t.name);
+    for (uint32_t r : rows) need(r < R, name + ": row map out of range");
+    std::vector<uint8_t> buf(Ro * rb);
+    par_for(Ro, [&](uint64_t r0, uint64_t r1) {
+      for (uint64_t r = r0; r < r1; r++)
+        memcpy(buf.data() + r * rb, t.data + (uint64_t)(rows.empty() ? r : rows[r]) * rb, rb);
+    }, 256);
+    put(ck, d, std::move(buf));
+    return;
+  }
   if (t.type != gguf::Q8_0) {
     uint32_t be, bb;
     gguf::block_info(t.type, be, bb);

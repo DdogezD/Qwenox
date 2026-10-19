@@ -204,7 +204,9 @@ struct GpuModel {
     }();
     return v;
   }
-  static bool dpf_dtype(int dt) { return dt == 5 || dt == 7 || dt == 8 || dt == 16 || dt == 24; }
+  static bool dpf_dtype(int dt) {
+    return dt == 5 || dt == 7 || dt == 8 || dt == 16 || dt == 24 || ggd_dtype(dt);
+  }
   // Build the per-layer lists (call once ckpt is loaded); returns slot bytes.
   size_t dpf_plan() {
     dpf_list_.assign(g_cfg.layers, {});
@@ -246,6 +248,8 @@ struct GpuModel {
       const uint64_t tot = N * K / 32;
       k_dequant_q8g32_bf16<<<(unsigned)((tot + 255) / 256), 256, 0, st>>>(
           (const int8_t*)w.data, (const __half*)(w.data + N * K), out, N, K);
+    } else if (ggd_dtype(w.dtype)) {
+      ggd_deq_bf16(w, out, st);
     } else {
       v2_deq_bf16(w, out, st);
     }
@@ -2706,6 +2710,13 @@ struct GpuModel {
         throw std::runtime_error("gemm: weight too big for d_wbf16");
       KP_SUB("ht_deq");
       if (!abl_has("deq")) v2_deq_bf16(w, d_wbf16, g_str);
+      KP_SUB_END();
+      wp = d_wbf16;
+    } else if (ggd_dtype(w.dtype)) {  // GGUF native dense
+      if (N * K * 2 > ((size_t)64 << 20))
+        throw std::runtime_error("gemm: weight too big for d_wbf16");
+      KP_SUB("ht_deq");
+      ggd_deq_bf16(w, d_wbf16, g_str);
       KP_SUB_END();
       wp = d_wbf16;
     } else {
