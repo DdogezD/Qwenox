@@ -2477,6 +2477,10 @@ __global__ void k_qsa_kprep(const float* __restrict__ kb, const float* __restric
                             const int* __restrict__ dvb = nullptr);
 __global__ void k_axpy_sg(float* __restrict__ acc, const float* __restrict__ y,
                           const float* __restrict__ sg, int n, int total);
+// out[i] = acc[i] + sigmoid(sg[i/n]) * y[i] (same expression as k_axpy_sg).
+__global__ void k_axpy_sg_out(const float* __restrict__ acc, const float* __restrict__ y,
+                              const float* __restrict__ sg, float* __restrict__ out,
+                              int n, int total);
 
 // [gemm-wmma-begin]
 // --- k_gemm_wmma: self-written bf16 WMMA dense GEMM (Phase 3g) --------------

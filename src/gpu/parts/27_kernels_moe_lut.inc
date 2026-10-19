@@ -167,7 +167,7 @@ __device__ __forceinline__ void q2_0_pairs(uint32_t w, uint32_t& lo, uint32_t& h
 }  // namespace moelut
 
 template <int kLut, bool kPair, int BN = 64, bool kRaw = false, bool kF16Pairs = false,
-          bool kMid = false, bool kQ4Perm = false>
+          bool kMid = false, bool kQ4Perm = false, bool kPkForce = false>
 __launch_bounds__(256) __global__
     void k_moe_lut(moelut::LutW p, const __half* __restrict__ x, const int* __restrict__ tokidx,
                    const MoeTile* __restrict__ tiles, const int* __restrict__ ntiles,
@@ -217,7 +217,7 @@ __launch_bounds__(256) __global__
 #ifdef MOE_LUT_NOPK
   constexpr bool kPk = false;
 #else
-  constexpr bool kPk = kLut == kI4R && !kPair;
+  constexpr bool kPk = kPkForce || (kLut == kI4R && !kPair);
 #endif
   // kPk: row stride a multiple of 8 halves so the packed spill is one
   // ds_write_b128 (272 B stride = 68 dwords: 8 lanes of a phase hit
@@ -1058,6 +1058,17 @@ static bool moe_lut_down_mt_q4cp(const moelut::LutW& p, const __half* hid, const
   return true;
 }
 
+// P3: packed down epilogue (kPk) for the GGUF LUT types. The fetch reorder is
+// type-independent and the epilogue keeps the same values (measured rel-L2
+// unchanged); gains -5..-7% on IQ4_NL/Q2_0 down. QWENOX_GG_KPK=0 disables.
+static bool gg_kpk_env() {
+  static const bool v = [] {
+    const char* s = getenv("QWENOX_GG_KPK");
+    return !(s && s[0] == '0' && s[1] == 0);
+  }();
+  return v;
+}
+
 // down: pairs[slot][m] F32 (unweighted), hid = F16 [slot][k]. f16 = true: pairs
 // written as F16 (half the traffic; read back by k_v2_reduce_rot<..., __half> on
 // v2 i4r / k_moe_reduce_pw*_sg<..., __half> on w4b q4cp — B1).
@@ -1068,6 +1079,7 @@ static bool moe_lut_down(int type, const moelut::LutW& p, const __half* hid, con
     return false;  // no down instance (this model: down is IQ4_NL / Q2_0)
   if (m % 128 || !moelut::lut_ok(type, p, false, k)) return false;
   dim3 grid(m / 128, max_tiles);
+  const bool kpk = gg_kpk_env();
   if (type == moelut::kQ4CP && f16)
     k_moe_lut<moelut::kQ4CP, false, 64, false, true><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles,
                                                                            ntiles, pairs, nullptr, m, k);
@@ -1078,12 +1090,44 @@ static bool moe_lut_down(int type, const moelut::LutW& p, const __half* hid, con
                                                                          nullptr, m, k);
   else if (type == moelut::kI4R)
     k_moe_lut<moelut::kI4R, false><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
-  else if (type == moelut::kIQ4NL)
-    k_moe_lut<moelut::kIQ4NL, false><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
-  else if (type == moelut::kQ2_0) {
-    if (f16) return false;  // no f16-pairs instance
-    k_moe_lut<moelut::kQ2_0, false><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
+  else if (type == moelut::kIQ4NL) {
+    if (f16) {
+      if (kpk)
+        k_moe_lut<moelut::kIQ4NL, false, 64, false, true, false, false, true>
+            <<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
+      else
+        k_moe_lut<moelut::kIQ4NL, false, 64, false, true><<<grid, 256, 0, st>>>(
+            p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
+    } else if (kpk)
+      k_moe_lut<moelut::kIQ4NL, false, 64, false, false, false, false, true>
+          <<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
+    else
+      k_moe_lut<moelut::kIQ4NL, false><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
   }
+  else if (type == moelut::kQ2_0) {
+    if (f16) {
+      if (kpk)
+        k_moe_lut<moelut::kQ2_0, false, 64, false, true, false, false, true>
+            <<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
+      else
+        k_moe_lut<moelut::kQ2_0, false, 64, false, true><<<grid, 256, 0, st>>>(
+            p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
+    } else if (kpk)
+      k_moe_lut<moelut::kQ2_0, false, 64, false, false, false, false, true>
+          <<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
+    else
+      k_moe_lut<moelut::kQ2_0, false><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
+  }
+  else if (f16) {
+    if (kpk)
+      k_moe_lut<moelut::kIQ4XS, false, 64, false, true, false, false, true>
+          <<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
+    else
+      k_moe_lut<moelut::kIQ4XS, false, 64, false, true><<<grid, 256, 0, st>>>(
+          p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
+  } else if (kpk)
+    k_moe_lut<moelut::kIQ4XS, false, 64, false, false, false, false, true>
+        <<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
   else
     k_moe_lut<moelut::kIQ4XS, false><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
   return true;
@@ -1094,17 +1138,54 @@ static bool moe_lut_down_mt_lut(int type, const moelut::LutW& p, const __half* h
                                 const MoeTile* tiles, const int* ntiles, int max_tiles,
                                 float* pairs, int m, int k, hipStream_t st, bool f16 = false) {
   if (type == moelut::kIQ3S || type == moelut::kIQ3XXS || type == moelut::kIQ2S) return false;
-  if (f16 || m % 128 || !moelut::lut_ok(type, p, false, k)) return false;
+  if (m % 128 || !moelut::lut_ok(type, p, false, k)) return false;
   dim3 grid(m / 128, max_tiles);
+  const bool kpk = gg_kpk_env();
   if (type == moelut::kQ4CP)
-    k_moe_lut<moelut::kQ4CP, false, 128><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles,
-                                                               pairs, nullptr, m, k);
+    if (f16)
+      k_moe_lut<moelut::kQ4CP, false, 128, false, true><<<grid, 256, 0, st>>>(
+          p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
+    else
+      k_moe_lut<moelut::kQ4CP, false, 128><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles,
+                                                                 pairs, nullptr, m, k);
   else if (type == moelut::kIQ4NL)
-    k_moe_lut<moelut::kIQ4NL, false, 128><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles,
-                                                                pairs, nullptr, m, k);
+    if (f16) {
+      if (kpk)
+        k_moe_lut<moelut::kIQ4NL, false, 128, false, true, false, false, true>
+            <<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
+      else
+        k_moe_lut<moelut::kIQ4NL, false, 128, false, true><<<grid, 256, 0, st>>>(
+            p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
+    } else if (kpk)
+      k_moe_lut<moelut::kIQ4NL, false, 128, false, false, false, false, true>
+          <<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
+    else
+      k_moe_lut<moelut::kIQ4NL, false, 128><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles,
+                                                                  pairs, nullptr, m, k);
   else if (type == moelut::kQ2_0)
-    k_moe_lut<moelut::kQ2_0, false, 128><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles,
-                                                               pairs, nullptr, m, k);
+    if (f16) {
+      if (kpk)
+        k_moe_lut<moelut::kQ2_0, false, 128, false, true, false, false, true>
+            <<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
+      else
+        k_moe_lut<moelut::kQ2_0, false, 128, false, true><<<grid, 256, 0, st>>>(
+            p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
+    } else if (kpk)
+      k_moe_lut<moelut::kQ2_0, false, 128, false, false, false, false, true>
+          <<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
+    else
+      k_moe_lut<moelut::kQ2_0, false, 128><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles,
+                                                                 pairs, nullptr, m, k);
+  else if (f16) {
+    if (kpk)
+      k_moe_lut<moelut::kIQ4XS, false, 128, false, true, false, false, true>
+          <<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
+    else
+      k_moe_lut<moelut::kIQ4XS, false, 128, false, true><<<grid, 256, 0, st>>>(
+          p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
+  } else if (kpk)
+    k_moe_lut<moelut::kIQ4XS, false, 128, false, false, false, false, true>
+        <<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
   else
     k_moe_lut<moelut::kIQ4XS, false, 128><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles,
                                                                 pairs, nullptr, m, k);
@@ -1196,16 +1277,16 @@ static bool moe_ggx_up(int type, const uint8_t* gate, const uint8_t* up, const _
 }
 static bool moe_ggx_down(int type, const uint8_t* dn, const __half* hid, const MoeTile* tiles,
                          const int* ntiles, int max_tiles, float* pairs, int m, int k,
-                         hipStream_t st, bool mt = false) {
+                         hipStream_t st, bool mt = false, bool f16 = false) {
   if (!ggx_is_lut(type)) {
-    if (mt) return false;  // k_moe_gg is 64-slot only
+    if (mt || f16) return false;  // k_moe_gg is 64-slot / f32 only
     return moe_gg_down(type, dn, hid, tiles, ntiles, max_tiles, pairs, m, k, st);
   }
   moelut::LutW p{};
   p.w = p.w_up = dn;
   p.e_rows = m;
-  return mt ? moe_lut_down_mt_lut(type, p, hid, tiles, ntiles, max_tiles, pairs, m, k, st)
-            : moe_lut_down(type, p, hid, tiles, ntiles, max_tiles, pairs, m, k, st);
+  return mt ? moe_lut_down_mt_lut(type, p, hid, tiles, ntiles, max_tiles, pairs, m, k, st, f16)
+            : moe_lut_down(type, p, hid, tiles, ntiles, max_tiles, pairs, m, k, st, f16);
 }
 
 // --- W4A4 routed experts (QWENOX_MOE_A4, opt-in, default off) ---------------

@@ -1558,13 +1558,20 @@ struct GpuModel {
     float* hw = ensure_hcnorm(prefix);
     k_rmsnorm_zc_grouped<<<4, 1024, 0, g_str>>>(d_R, hw, d_Rhat, 2560, g_cfg.norm_eps, 4);
     snprintf(buf, sizeof buf, "%s.input_mix_weight_down.weight", prefix.c_str());
-    gemv(wview(ckpt.at(buf)), d_Rhat, d_t320);
-    k_silu_scale<<<(320 + 255) / 256, 256, 0, g_str>>>(d_t320, 0.25f, 320);
+    gemv_silu(wview(ckpt.at(buf)), d_Rhat, d_t320);  // D3: silu*0.25 epilogue
     snprintf(buf, sizeof buf, "%s.input_mix_weight_up.weight", prefix.c_str());
     gemv(wview(ckpt.at(buf)), d_t320, d_G);
-    k_sigmoid_inplace<<<(10240 + 255) / 256, 256, 0, g_str>>>(d_G, 10240);
-    k_gr_combine<<<(2560 + 255) / 256, 256, 0, g_str>>>(d_G, d_Rhat, x_out, g_cfg.d,
-                                              g_cfg.branches);
+    // D1: fold k_sigmoid_inplace into k_gr_combine (same expression). d_G is
+    // not read after this point. QWENOX_GR_COMBINE_SIG=0 restores the launch.
+    static const bool gr_sig = !env_zero("QWENOX_GR_COMBINE_SIG");
+    if (gr_sig) {
+      k_gr_combine<true><<<(2560 + 255) / 256, 256, 0, g_str>>>(d_G, d_Rhat, x_out,
+                                                                g_cfg.d, g_cfg.branches);
+    } else {
+      k_sigmoid_inplace<<<(10240 + 255) / 256, 256, 0, g_str>>>(d_G, 10240);
+      k_gr_combine<false><<<(2560 + 255) / 256, 256, 0, g_str>>>(d_G, d_Rhat, x_out,
+                                                                 g_cfg.d, g_cfg.branches);
+    }
   }
 
   void gr_write(const std::string& prefix, const float* y) {
@@ -1969,7 +1976,12 @@ struct GpuModel {
   void gdn(int l, int gi, const float* x, float* y) {
     char buf[128];
     snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_qkv.weight", l);
-    gemv(wview(ckpt.at(buf)), x, d_qkv);
+    const WView qkvw = wview(ckpt.at(buf));
+    snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_z.weight", l);
+    const WView zw = wview(ckpt.at(buf));
+    // D4: qkv and z share x; merge when the dtypes match (mixed -> fallback).
+    const bool gdn_pair = gemv2(qkvw, zw, x, d_qkv, d_z);
+    if (!gdn_pair) gemv(qkvw, x, d_qkv);
     // conv + silu (state per layer)
     float* convst = d_convst + (size_t)gi * 3 * 10240;
     const float* cw = d_convw + (size_t)gi * 10240 * 4;
@@ -1990,8 +2002,7 @@ struct GpuModel {
                             d_S + (size_t)gi * 48 * 128 * 128, vp /*out in place*/,
                             128, 128, 48, 16);
     // out written over vp is safe: k_gdn_step reads vh before writing out
-    snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_z.weight", l);
-    gemv(wview(ckpt.at(buf)), x, d_z);
+    if (!gdn_pair) gemv(zw, x, d_z);
     k_gdn_gatednorm<<<dim3(48, 1), 128, 0, g_str>>>(vp, d_z, d_gdnnorm + (size_t)gi * 128,
                                                     vp, 128, g_cfg.norm_eps, 10240,
                                                     6144);
@@ -2040,9 +2051,13 @@ struct GpuModel {
     snprintf(buf, sizeof buf, "layers.%d.self_attn.q_proj.weight", l);
     gemv(wview(ckpt.at(buf)), x, d_qg);
     snprintf(buf, sizeof buf, "layers.%d.self_attn.k_proj.weight", l);
-    gemv(wview(ckpt.at(buf)), x, d_kb);
+    const WView kw = wview(ckpt.at(buf));
     snprintf(buf, sizeof buf, "layers.%d.self_attn.v_proj.weight", l);
-    gemv(wview(ckpt.at(buf)), x, d_vb);
+    const WView vw = wview(ckpt.at(buf));
+    if (!gemv2(kw, vw, x, d_kb, d_vb)) {  // D4: k/v share the dtype in GGUF
+      gemv(kw, x, d_kb);
+      gemv(vw, x, d_vb);
+    }
     snprintf(buf, sizeof buf, "layers.%d.self_attn.q_norm.weight", l);
     float* qnw = ensure_norm256(buf);
     snprintf(buf, sizeof buf, "layers.%d.self_attn.k_norm.weight", l);
@@ -2167,8 +2182,12 @@ struct GpuModel {
   // P > 1: stable GPU bucketing + 64-slot tiles on the prefill workspaces
   // (F16 x in d_xbf16b, which is never cached; hid F16 in d_hidb; unweighted
   // pairs in d_guvb, dead again once the weighted reduce has run).
-  void moe_gguf(const GgExperts& g, const float* x, const int* topids, const float* topw,
-                float* acc, int P) {
+  // ey/sg (optional, P > 48 only): the shared-expert output/gate logit are
+  // added in the reduce (k_moe_reduce_pw_sg) instead of by k_axpy_sg after the
+  // call. Returns true when they were consumed; false means the caller must
+  // still add them (small-P GEMV path).
+  bool moe_gguf(const GgExperts& g, const float* x, const int* topids, const float* topw,
+                float* acc, int P, const float* ey = nullptr, const float* sg = nullptr) {
     const int k = g_cfg.topk, E = g_cfg.experts, d = g_cfg.d, mid = g_cfg.moe_mid;
     // Small P (decode, spec verify): raw-block GEMVs, FP32 hid, weighted sum in
     // expert-rank order written straight to acc (26_kernels_moe_gguf.inc).
@@ -2193,7 +2212,7 @@ struct GpuModel {
         moe_gg_gemv(g.tgu, g.tdn, g.gate, g.up, g.down, x, topids, topw,
                     P == 1 ? d_hid : d_hidb, acc, P, d, mid, 16, g_str,
                     uq ? d_gg_uq : nullptr, uq ? d_guvb : nullptr))
-      return;
+      return false;  // GEMV path: ey/sg not consumed
     int *tokidx, *pairids, *ntiles;
     float *pw, *pairs;
     MoeTile* tiles;
@@ -2267,9 +2286,16 @@ struct GpuModel {
       a4_dn_ok = moe_gg_iu4_down(g.tdn, g.down, d_a4h, d_a4hs, tiles, ntiles, max_tiles,
                                  (__half*)pairs, d, mid, qt_for(g.tdn), 9.0f, g_str);
     }
+    // P2: GGUF LUT down writes f16 pairs (half the reduce traffic). Default
+    // off until the GGUF KLD gate passes; QWENOX_GG_PAIRS_F16=1 enables.
+    static const bool gg_pairs_f16_env = [] {
+      const char* s = getenv("QWENOX_GG_PAIRS_F16");
+      return s && s[0] != '0';
+    }();
+    const bool pairs_f16 = gg_pairs_f16_env && !a4_dn_ok && ggx_is_lut(g.tdn);
     if (!a4_dn_ok &&
         !moe_ggx_down(g.tdn, g.down, hid, tiles, ntiles, max_tiles, pairs, d, mid, g_str,
-                      mt_tiles))
+                      mt_tiles, pairs_f16))
       throw std::runtime_error("moe_gguf: unsupported expert type");
     if (a4_up_ok || a4_dn_ok) {
       static bool logged = false;
@@ -2280,12 +2306,20 @@ struct GpuModel {
                 (int)a4_up_ok, (int)a4_dn_ok);
       }
     }
-    if (a4_dn_ok)
-      k_moe_reduce_pw<10, __half><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(
-          (const __half*)pairs, pairids, pw, acc, P, d);
+    if (a4_dn_ok || pairs_f16)
+      if (ey)
+        k_moe_reduce_pw_sg<10, __half><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(
+            (const __half*)pairs, pairids, pw, ey, sg, acc, P, d);
+      else
+        k_moe_reduce_pw<10, __half><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(
+            (const __half*)pairs, pairids, pw, acc, P, d);
+    else if (ey)
+      k_moe_reduce_pw_sg<10><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(
+          pairs, pairids, pw, ey, sg, acc, P, d);
     else
       k_moe_reduce_pw<10><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(pairs, pairids, pw, acc,
                                                                        P, d);
+    return ey != nullptr;
   }
 
   // hgn q4cp routed experts through the LUT-decode WMMA kernels (QWENOX_MOE_Q4W):
@@ -2434,9 +2468,16 @@ struct GpuModel {
     gemv(wview(ckpt.at(buf)), d_hid, d_ey);
     snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert_gate.weight", l);
     gemv(wview(ckpt.at(buf)), x, d_sg);
-    k_axpy_sg<<<(2560 + 255) / 256, 256, 0, g_str>>>(d_moeacc, d_ey, d_sg, g_cfg.d,
-                                                     g_cfg.d);
-    CK(hipMemcpyAsync(y, d_moeacc, g_cfg.d * 4, hipMemcpyDeviceToDevice, g_str));
+    // D2: write y directly instead of acc += ... followed by a 40 KiB D2D.
+    static const bool axpy_out = !env_zero("QWENOX_AXPY_SG_OUT");
+    if (axpy_out) {
+      k_axpy_sg_out<<<(2560 + 255) / 256, 256, 0, g_str>>>(d_moeacc, d_ey, d_sg, y,
+                                                           g_cfg.d, g_cfg.d);
+    } else {
+      k_axpy_sg<<<(2560 + 255) / 256, 256, 0, g_str>>>(d_moeacc, d_ey, d_sg, g_cfg.d,
+                                                       g_cfg.d);
+      CK(hipMemcpyAsync(y, d_moeacc, g_cfg.d * 4, hipMemcpyDeviceToDevice, g_str));
+    }
   }
 
   // PLE host phase: hash + read 16 rows into pinned staging (disk latency — overlapped).
@@ -5234,8 +5275,25 @@ struct GpuModel {
       fflush(moe_dump);
     }
     if (gg_on()) {
-      moe_gguf(g_ggx.at(l), d_xb, d_topidsb, d_topwb, acc, P);
-      moe_b_shared(l, P, acc, direct_output);
+      // P1: shared expert first (its d_guvb/d_hidb/d_xbf16b scratch is dead
+      // after it returns), then fold its add into the routed reduce.
+      // QWENOX_GG_SG_FUSE=0 restores the old order + k_axpy_sg.
+      static const bool gg_sg_fuse = !env_zero("QWENOX_GG_SG_FUSE");
+      if (gg_sg_fuse) {
+        KP("moe:shared");
+        moe_b_shared_ey(l, P);
+        if (!moe_gguf(g_ggx.at(l), d_xb, d_topidsb, d_topwb, acc, P, d_eyb, d_sgb)) {
+          // Small-P GEMV path: shared add still has to run separately.
+          k_axpy_sg<<<(P * 2560 + 255) / 256, 256, 0, g_str>>>(acc, d_eyb, d_sgb,
+                                                               g_cfg.d, P * g_cfg.d);
+        }
+        if (!direct_output)
+          CK(hipMemcpyAsync(d_yb, acc, (size_t)P * g_cfg.d * 4, hipMemcpyDeviceToDevice,
+                            g_str));
+      } else {
+        moe_gguf(g_ggx.at(l), d_xb, d_topidsb, d_topwb, acc, P);
+        moe_b_shared(l, P, acc, direct_output);
+      }
       return false;
     }
     snprintf(buf, sizeof buf, "layers.%d.mlp.experts.gate_up_proj.weight", l);
@@ -6091,6 +6149,7 @@ struct GpuModel {
     if (dense_wmma_on() && (one_row || (!no_mr && P <= gemvmr_maxp())) &&
         ht_wmma_pair(g, u, x, false, g.cols, yg, yu, g.rows, P))
       return;
+    if (one_row && gemv2(g, u, x, yg, yu)) return;  // D4: same dtype/cols
     if (one_row) {
       gemv(g, x, yg);
       gemv(u, x, yu);
@@ -7928,13 +7987,18 @@ struct GpuModel {
     k_rmsnorm_zc_grouped<<<4, 1024, 0, g_str>>>(d_mR, hw, d_mRhat, 2560,
                                                 g_cfg.norm_eps, 4);
     snprintf(buf, sizeof buf, "%s.input_mix_weight_down.weight", prefix.c_str());
-    gemv(wview(ckpt.at(buf)), d_mRhat, d_t320);
-    k_silu_scale<<<(320 + 255) / 256, 256, 0, g_str>>>(d_t320, 0.25f, 320);
+    gemv_silu(wview(ckpt.at(buf)), d_mRhat, d_t320);  // D3: silu*0.25 epilogue
     snprintf(buf, sizeof buf, "%s.input_mix_weight_up.weight", prefix.c_str());
     gemv(wview(ckpt.at(buf)), d_t320, d_G);
-    k_sigmoid_inplace<<<(10240 + 255) / 256, 256, 0, g_str>>>(d_G, 10240);
-    k_gr_combine<<<(2560 + 255) / 256, 256, 0, g_str>>>(d_G, d_mRhat, x_out,
-                                                        g_cfg.d, g_cfg.branches);
+    static const bool gr_sig = !env_zero("QWENOX_GR_COMBINE_SIG");
+    if (gr_sig) {
+      k_gr_combine<true><<<(2560 + 255) / 256, 256, 0, g_str>>>(d_G, d_mRhat, x_out,
+                                                                g_cfg.d, g_cfg.branches);
+    } else {
+      k_sigmoid_inplace<<<(10240 + 255) / 256, 256, 0, g_str>>>(d_G, 10240);
+      k_gr_combine<false><<<(2560 + 255) / 256, 256, 0, g_str>>>(d_G, d_mRhat, x_out,
+                                                                 g_cfg.d, g_cfg.branches);
+    }
   }
   void mtp_gr_write(const std::string& prefix, const float* y) {
     char buf[128];
@@ -7977,9 +8041,13 @@ struct GpuModel {
     snprintf(buf, sizeof buf, "%s.q_proj.weight", pfx);
     gemv(wview(ckpt.at(buf)), x, d_qg);
     snprintf(buf, sizeof buf, "%s.k_proj.weight", pfx);
-    gemv(wview(ckpt.at(buf)), x, d_kb);
+    const WView mkw = wview(ckpt.at(buf));
     snprintf(buf, sizeof buf, "%s.v_proj.weight", pfx);
-    gemv(wview(ckpt.at(buf)), x, d_vb);
+    const WView mvw = wview(ckpt.at(buf));
+    if (!gemv2(mkw, mvw, x, d_kb, d_vb)) {  // D4
+      gemv(mkw, x, d_kb);
+      gemv(mvw, x, d_vb);
+    }
     snprintf(buf, sizeof buf, "%s.q_norm.weight", pfx);
     float* qnw = ensure_norm256(buf);
     snprintf(buf, sizeof buf, "%s.k_norm.weight", pfx);
@@ -8124,9 +8192,15 @@ struct GpuModel {
     gemv(wview(ckpt.at(buf)), d_hid, d_ey);
     snprintf(buf, sizeof buf, "%s.shared_expert_gate.weight", pfx);
     gemv(wview(ckpt.at(buf)), x, d_sg);
-    k_axpy_sg<<<(2560 + 255) / 256, 256, 0, g_str>>>(d_moeacc, d_ey, d_sg,
-                                                     g_cfg.d, g_cfg.d);
-    CK(hipMemcpyAsync(y, d_moeacc, g_cfg.d * 4, hipMemcpyDeviceToDevice, g_str));
+    static const bool axpy_out = !env_zero("QWENOX_AXPY_SG_OUT");
+    if (axpy_out) {
+      k_axpy_sg_out<<<(2560 + 255) / 256, 256, 0, g_str>>>(d_moeacc, d_ey, d_sg, y,
+                                                           g_cfg.d, g_cfg.d);
+    } else {
+      k_axpy_sg<<<(2560 + 255) / 256, 256, 0, g_str>>>(d_moeacc, d_ey, d_sg,
+                                                       g_cfg.d, g_cfg.d);
+      CK(hipMemcpyAsync(y, d_moeacc, g_cfg.d * 4, hipMemcpyDeviceToDevice, g_str));
+    }
   }
 
   // One full MTP draft step: appends (tap, tok) at mtp_pos. Greedy callers get
@@ -12388,5 +12462,18 @@ __global__ void k_axpy_sg(float* __restrict__ acc, const float* __restrict__ y,
   if (i < total) {
     float s = 1.f / (1.f + expf(-sg[i / n]));
     acc[i] += s * y[i];
+  }
+}
+// --- out[r] = acc[r] + sigmoid(sg[i/n]) * y[i]; same FMA as k_axpy_sg, so the
+// values are identical to `k_axpy_sg(acc,...)` followed by a copy acc -> out.
+__global__ void k_axpy_sg_out(const float* __restrict__ acc, const float* __restrict__ y,
+                              const float* __restrict__ sg, float* __restrict__ out,
+                              int n, int total) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < total) {
+    float s = 1.f / (1.f + expf(-sg[i / n]));
+    float v = acc[i];
+    v += s * y[i];
+    out[i] = v;
   }
 }

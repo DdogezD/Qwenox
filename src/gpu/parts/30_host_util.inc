@@ -1615,6 +1615,34 @@ static bool ggd_gemv(const WView& w, const void* x, bool xbf16, uint64_t xs, flo
   }
   return true;
 }
+// D4: two same-dtype/same-cols native-GGUF GEMVs in one launch (P = 1 decode).
+// Per-row K order is k_ggd_gemv's, so this is bit-identical to two launches.
+static bool ggd_gemv2(const WView& a, const WView& b, const float* x, float* ya, float* yb) {
+  if (a.dtype != b.dtype || a.cols != b.cols || !ggd_dtype(a.dtype)) return false;
+  if (!a.rows || !b.rows || a.cols % 32 || ((uintptr_t)x & 15)) return false;
+  const int t = a.dtype - ggd::kDtypeBase;
+  if (t != ggd::kIQ4NL && a.cols % 256) return false;
+  const uint64_t rb = ggd::row_bytes(t, a.cols);
+  if (rb % 4 || ((uintptr_t)a.data & 3) || ((uintptr_t)b.data & 3)) return false;
+  const int RA = (int)a.rows, RB = (int)b.rows;
+  const unsigned blocks = (unsigned)((RA + RB + 3) / 4);
+  ggd_with_type(t, [&](auto tc_) {
+    constexpr int T = decltype(tc_)::value;
+    k_ggd_gemv2<T, false><<<blocks, 128, 0, g_str>>>(a.data, b.data, RA, RB, rb, x, ya, yb,
+                                                     (int)a.cols);
+  });
+  return true;
+}
+// D4: merge two independent GEMVs that share x and dtype/cols. Only the
+// native-GGUF path is fused today; everything else falls back (caller runs
+// the old two launches). QWENOX_GEMV_MERGE=0 disables.
+static bool gemv2(const WView& a, const WView& b, const float* x, float* ya, float* yb) {
+  static const bool on = [] {
+    const char* s = getenv("QWENOX_GEMV_MERGE");
+    return !(s && s[0] == '0' && s[1] == 0);
+  }();
+  return on && ggd_gemv2(a, b, x, ya, yb);
+}
 static void ggd_deq_bf16(const WView& w, uint16_t* out, hipStream_t st) {
   const int t = w.dtype - ggd::kDtypeBase;
   const uint64_t rb = ggd::row_bytes(t, w.cols), n = w.rows * (w.cols / 32);
@@ -1707,6 +1735,27 @@ static void gemv(const WView& w, const float* x, float* y, uint64_t row_off = 0,
   } else {
     throw std::runtime_error("gemv: unsupported dtype");
   }
+}
+
+// D3: GEMV with k_silu_scale's (v*0.25 -> silu) epilogue folded in. The GGUF
+// q8g32 path fuses it into the row store; every other dtype keeps the old two
+// launches (same result). QWENOX_GEMV_SILU=0 restores the old path.
+static void gemv_silu(const WView& w, const float* x, float* y) {
+  static const bool on = [] {
+    const char* s = getenv("QWENOX_GEMV_SILU");
+    return !(s && s[0] == '0' && s[1] == 0);
+  }();
+  if (on && w.dtype == 8) {
+    const int8_t* q = (const int8_t*)w.data;
+    const __half* s = (const __half*)(w.data + w.rows * w.cols);
+    if (w.cols < 1024)
+      q8g32_gemv_small<8, 256, true>(q, s, x, y, w.rows, w.cols, g_str);
+    else
+      q8g32_gemv_small<32, 256, true>(q, s, x, y, w.rows, w.cols, g_str);
+    return;
+  }
+  gemv(w, x, y);
+  k_silu_scale<<<(unsigned)((w.rows + 255) / 256), 256, 0, g_str>>>(y, 0.25f, (int)w.rows);
 }
 
 // Embedding gather for P tokens (d_tok[0..P)): fp32 rows at out + p*outstride,

@@ -311,6 +311,82 @@ void k_ggd_gemv(const uint8_t* __restrict__ w, uint64_t rb, const void* __restri
   }
 }
 
+// D4: two native-GGUF GEMVs with the same dtype/cols in one launch. Rows
+// [0, RA) read wA and write yA; rows [RA, RA+RB) read wB and write yB. Each
+// row's K loop / reduction is exactly k_ggd_gemv's, so the values are
+// bit-identical to two separate launches. P = 1 only (decode).
+template <int T, bool XB>
+__launch_bounds__(128) __global__
+void k_ggd_gemv2(const uint8_t* __restrict__ wA, const uint8_t* __restrict__ wB,
+                 int RA, int RB, uint64_t rb, const void* __restrict__ x,
+                 float* __restrict__ yA, float* __restrict__ yB, int C) {
+  using namespace ggd;
+  constexpr int BB = blk_bytes<T>(), BU = blk_units<T>(), SL = lds_slot<T>();
+  constexpr int SEGB = kSegU / BU * BB;               // source bytes of a full segment
+  constexpr int SEGL = (kSegU / BU * SL + 15) & ~15;  // LDS bytes per wave
+  constexpr int NV = (SEGB / 4 + 31) / 32;            // dwords per lane
+  __shared__ __attribute__((aligned(16))) uint8_t lds[4][SEGL];
+  const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int r = (int)blockIdx.x * 4 + wave;
+  const int R = RA + RB;
+  const bool live = r < R;
+  const bool second = r >= RA;
+  const int rr = live ? (second ? r - RA : r) : 0;
+  const uint8_t* row = (second ? wB : wA) + (size_t)rr * rb;
+  const int nu = C / 32, nseg = (nu + kSegU - 1) / kSegU;
+  uint8_t* L = lds[wave];
+  float acc = 0.f;
+  for (int sg = 0; sg < nseg; sg++) {
+    const int u0 = sg * kSegU;
+    const int nun = min(kSegU, nu - u0);
+    const int nw = nun / BU * BB / 4;
+    const uint32_t* src = (const uint32_t*)(row + (size_t)(u0 / BU) * BB);
+    uint32_t v[NV];
+#pragma unroll
+    for (int k = 0; k < NV; k++) {
+      const int i = lane + 32 * k;
+      v[k] = i < nw ? src[i] : 0u;
+    }
+#pragma unroll
+    for (int k = 0; k < NV; k++) {
+      const int i = lane + 32 * k;
+      if (i < nw) {
+        if constexpr (SL == BB) {
+          ((uint32_t*)L)[i] = v[k];
+        } else {
+#pragma unroll
+          for (int hh = 0; hh < 2; hh++) {
+            const int o = 4 * i + 2 * hh, bk = o / BB;
+            *(uint16_t*)(L + bk * SL + (o - bk * BB)) = (uint16_t)(v[k] >> (16 * hh));
+          }
+        }
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int k = 0; k < kSegU / 32; k++) {
+      const int u = lane + 32 * k;
+      if (u < nun) {
+        float wv[32];
+        unit_deq_lds<T>(L + (u / BU) * SL, u % BU, wv);
+        const uint64_t e0 = (uint64_t)(u0 + u) * 32;
+        acc = dot32<XB>(wv, x, e0, acc);
+      }
+    }
+    __syncthreads();
+  }
+  float v = acc;
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor(v, o, 32);
+  if (live && lane == 0) {
+    if (second) {
+      if (rr < RB) yB[rr] = v;
+    } else {
+      if (rr < RA) yA[rr] = v;
+    }
+  }
+}
+
 // W (R x C, native rows) -> bf16 [R][C], one thread per 32-element unit.
 template <int T>
 __global__ void k_ggd_deq_bf16(const uint8_t* __restrict__ w, uint64_t rb,

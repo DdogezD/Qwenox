@@ -519,7 +519,7 @@ __global__ void k_bf16_gemv(const uint16_t* __restrict__ w, const float* __restr
 // blocks. For the decode shapes where k_q8g32_gemv_mr<1> (2 rows per wave,
 // 512-thread blocks) runs below bandwidth: few rows (2560 x 6144: only 80
 // blocks on 40 CUs) or short rows (640 cols = 20 groups < 32 lanes).
-template <int LPR>
+template <int LPR, bool kSilu = false>
 __global__ void k_q8g32_gemv_lpr(const int8_t* __restrict__ q, const __half* __restrict__ s,
                                  const float* __restrict__ x, float* __restrict__ y,
                                  uint64_t rows, uint64_t cols) {
@@ -548,13 +548,21 @@ __global__ void k_q8g32_gemv_lpr(const int8_t* __restrict__ q, const __half* __r
   }
 #pragma unroll
   for (int off = LPR / 2; off > 0; off >>= 1) acc += __shfl_down_sync(~0ull, acc, off, LPR);
-  if (ll == 0 && live) y[row] = acc;
+  if (ll == 0 && live) {
+    float v = acc;
+    if (kSilu) {  // same expression as k_silu_scale(v, 0.25f)
+      const float z = v * 0.25f;
+      v = z / (1.f + expf(-z));
+    }
+    y[row] = v;
+  }
 }
-template <int LPR, int TPB>
+template <int LPR, int TPB, bool kSilu = false>
 static void q8g32_gemv_small(const int8_t* q, const __half* s, const float* x, float* y,
                              uint64_t rows, uint64_t cols, hipStream_t st) {
   constexpr uint64_t rpb = (TPB / 32) * (32 / LPR);
-  k_q8g32_gemv_lpr<LPR><<<(unsigned)((rows + rpb - 1) / rpb), TPB, 0, st>>>(q, s, x, y, rows, cols);
+  k_q8g32_gemv_lpr<LPR, kSilu>
+      <<<(unsigned)((rows + rpb - 1) / rpb), TPB, 0, st>>>(q, s, x, y, rows, cols);
 }
 
 // --- q8g32 multi-row (P input rows, spec verify / small batches) with LPR
@@ -1463,12 +1471,19 @@ __global__ void k_sigmoid_inplace(float* __restrict__ v, int n) {
   if (i < n) v[i] = 1.f / (1.f + expf(-v[i]));
 }
 // x_out[i] = mean_b G[b*d+i] * Rhat[b*d+i]
+// kSig: apply the k_sigmoid_inplace expression to each G element before the
+// product (same expression/order -> bit-identical to the separate launch).
+template <bool kSig = false>
 __global__ void k_gr_combine(const float* __restrict__ G, const float* __restrict__ Rhat,
                              float* __restrict__ x, int d, int branches) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= d) return;
   float acc = 0.f;
-  for (int b = 0; b < branches; b++) acc += G[b * d + i] * Rhat[b * d + i];
+  for (int b = 0; b < branches; b++) {
+    float g = G[b * d + i];
+    if (kSig) g = 1.f / (1.f + expf(-g));
+    acc += g * Rhat[b * d + i];
+  }
   x[i] = acc / branches;
 }
 // GR write: s = 2*sigmoid(w/4); R[b*d+i] += s[b] * y[i]
