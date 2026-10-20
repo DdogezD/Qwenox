@@ -785,6 +785,23 @@ struct GpuModel {
   float* d_mRb = nullptr;      // batch stream (maxbatch, 10240)
   float* d_mRhatb = nullptr;   // batch normed stream
   float* d_mtap = nullptr;     // captured trunk taps (maxbatch, 10240)
+  // ---- DFlash2 draft head (sidecar GGUF, 41_dflash2.inc) ----
+  // Independent of MTP: a 5-block masked draft with its own KV ring and a
+  // selector. Context features are HC-mean taps of trunk layers 5/15/25/35/45.
+  Df2State df2;
+  bool df2_init();
+  void df2_capture_layer(int l, int P, int base, int mode);
+  void df2_hc_capture(const std::string& prefix, int P);
+  void df2_inject(int base, int P, bool verify_rows);
+  void df2_inject_chunk(int base, int P);
+  void df2_propose(int anchor, int g, int* drafts, bool select = true);
+  template <typename Sampler>
+  std::vector<int> df2_spec_loop_sample(int cur, int gen, Sampler& sampler,
+                                        const std::function<bool(int, float)>& emit);
+  void df2_round_dump(int round, int anchor, int g, const int* drafts);
+  std::vector<int> df2_spec_loop(int cur, int gen, int gamma,
+                                 const std::function<bool(int)>& emit,
+                                 bool hybrid = false, int mtp_gamma = 4);
   // Offline test hook (--spec-gen + QWENOX_SPEC_FORCE=<ids file>): greedy
   // spec_loop verifies drafts against these ids instead of the trunk argmax,
   // so every γ policy commits the same trajectory (paired γ A/B without greedy
@@ -1536,6 +1553,7 @@ struct GpuModel {
                 (int)ckpt.at("mtp.fc_hidden.weight").dtype);
       }
     }
+    df2_init();  // no-op unless QWENOX_DFLASH2 is set
     fprintf(stderr, "qwenox: state allocated (maxctx=%d)\n", maxctx);
   }
 
@@ -3505,6 +3523,7 @@ struct GpuModel {
     else
       k_gr_write_b<<<(P * 2560 + 255) / 256, 256, 0, g_str>>>(
           d_w4b, d_Rb, d_yb, g_cfg.d, g_cfg.branches, P);
+    df2_hc_capture(prefix, P);
   }
 
   void gr_write_read_b(const std::string& write_prefix,
@@ -3599,6 +3618,7 @@ struct GpuModel {
     if (!wn) injp_cur = -1;
     if (xf16_src == d_Rhatb) xf16_src = nullptr;
     gr_mix_b(read_prefix, P, hw, wn && hc_norhat(P));
+    df2_hc_capture(write_prefix, P);
   }
 
   // GDN: projections batched. Chunked path: conv/l2norm/gates batched, then
@@ -6874,6 +6894,7 @@ struct GpuModel {
     }
     if (flush_mlp) {
       if (!hcw) gr_write_b(mlp_prefix, P);
+      else df2_hc_capture(mlp_prefix, P);  // moe_b already applied the write
       if (srep && flush_mlp && !hcw && !vg_capturing_) {
         stm("hc3.prep", [&] { gr_write_prep_b(mlp_prefix, P); });
         if (gr_bf16)
@@ -7388,6 +7409,9 @@ struct GpuModel {
       id = prefill_chunk(
           std::vector<int>(tokens.begin() + off, tokens.begin() + off + n),
           base + off, final, quiet, nxt.empty() ? nullptr : &nxt);
+      // DFlash2: build the draft context K/V for this chunk's (last <= 2048)
+      // positions before the next chunk overwrites the tap ring.
+      if (df2.on && df2.cap_mode == 1) df2_inject_chunk(base + off, n);
       if (mtp_tap_capture) {
         // Ingest this chunk's taps (chunk-local rows in d_mtap) into the MTP
         // layer before the next chunk overwrites them. MTP position i takes
@@ -11953,6 +11977,9 @@ struct GpuModel {
     CK(hipDeviceSynchronize());
     kv_trim(0);  // A2: the next sequence maps its pages from scratch
     if (kv_zero_dbg && !kv_paged) kv_zero_unpaged();
+    // DFlash2: no target taps / draft context survive a reset.
+    df2.tap_hi = 0;
+    df2.cap_mode = 0;
   }
 
   // ---- D2-S1c vseg selftest ----

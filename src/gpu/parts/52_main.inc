@@ -407,6 +407,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "loaded %zu tensors (base+%zu overlay)\n", ckpt.tensor_count(),
             overlays.size());
     gguf_dense_apply(ckpt);
+    df2_load_sidecar(ckpt);  // QWENOX_DFLASH2: draft tensors into the arena
     g_cfg.vocab = (int)ckpt.at("lm_head.weight").dims[0];
     memstats_capture_hip_baseline();
     // D1a：并发 serve 用更小的 prefill 分段，缩短 D1b 层间让出的最长停顿。
@@ -485,6 +486,7 @@ int main(int argc, char** argv) {
   fprintf(stderr, "loaded %zu tensors (base+%zu overlay)\n", ckpt.tensor_count(),
           overlays.size());
   gguf_dense_apply(ckpt);
+  df2_load_sidecar(ckpt);  // QWENOX_DFLASH2: draft tensors into the arena
   g_cfg.vocab = (int)ckpt.at("lm_head.weight").dims[0];
   if (ppl) {
     for (size_t i = 0; i < tokens.size(); i++) {
@@ -505,6 +507,9 @@ int main(int argc, char** argv) {
   gguf_dense_release(ckpt);
   m.ple_on = ple_on;
   m.build_graphs();
+  // --spec-gen + QWENOX_SPEC_DF2=1 drives the DFlash2 draft head instead of
+  // MTP (offline greedy acceptance/equality harness).
+  const bool df2_spec = spec_gen > 0 && getenv("QWENOX_SPEC_DF2") && m.df2.on;
   if (getenv("QWENOX_DEQ_BENCH")) return m.deq_bench();
   if (vseg_selftest_spec)  // D2-S1c: multi-segment verify selftest owns the run
     return m.vseg_selftest(vseg_selftest_spec) ? 0 : 1;
@@ -514,11 +519,14 @@ int main(int argc, char** argv) {
               "measures text only)\n");
       return 1;
     }
-    if (!m.mtp_avail) {
+    if (!df2_spec && !m.mtp_avail) {
       fprintf(stderr, "mtp: no usable mtp.* weights in checkpoint\n");
       return 1;
     }
-    m.mtp_tap_capture = true;  // prefill_chunk records per-row trunk streams
+    if (df2_spec)
+      m.df2.cap_mode = 1;  // capture tap ring over the prompt
+    else
+      m.mtp_tap_capture = true;  // prefill_chunk records per-row trunk streams
   }
 
   std::vector<int> all = tokens;
@@ -633,6 +641,11 @@ int main(int argc, char** argv) {
 
   int next_id = -1;
   if (getenv("QWENOX_NOPREFILLBATCH")) {
+    if (df2_spec) {
+      fprintf(stderr, "spec-gen dflash2: QWENOX_NOPREFILLBATCH unsupported "
+                      "(no tap capture without prefill_batch)\n");
+      return 1;
+    }
     for (size_t i = 0; i < tokens.size(); i++) {
       next_id = m.forward(tokens[i]);
       if (dump) {
@@ -645,6 +658,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "\n");
   } else {
     next_id = m.prefill_batch(tokens);
+    if (df2_spec) m.df2.cap_mode = 0;  // prompt tap ring complete
     if (dump) {  // per-position prefill dump unavailable; dump last position
       m.get_logits(logits);
       dump_pos(logits, (int)tokens.size() - 1, -1);
@@ -759,8 +773,11 @@ int main(int argc, char** argv) {
       spec_out = chain ? m.spec_loop_chain_sample(next_id, spec_gen, gamma, smp, true)
                        : m.spec_loop_sample(next_id, spec_gen, gamma, smp);
     } else {
-      spec_out = chain ? m.spec_loop_chain(next_id, spec_gen, gamma)
-                       : m.spec_loop(next_id, spec_gen, gamma);
+      if (df2_spec)
+        spec_out = m.df2_spec_loop(next_id, spec_gen, gamma, nullptr);
+      else
+        spec_out = chain ? m.spec_loop_chain(next_id, spec_gen, gamma)
+                         : m.spec_loop(next_id, spec_gen, gamma);
     }
     printf("ids:");
     for (int t : tokens) printf(" %d", t);

@@ -374,6 +374,24 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
       if (index_f32) add((size_t)640 * 2560 * 4);   // miw
     }
   }
+  // DFlash2 draft head (GpuModel::df2_init): fused draft matrices (q8g32 by
+  // default, QWENOX_DF2_WQ=bf16; not Checkpoint tensors), tap/vtap
+  // rings, context K/V rings, injection + block-forward scratch.
+  if (getenv("QWENOX_DFLASH2")) {
+    const size_t welems = (size_t)12800 * 2560 + (size_t)10240 * 2560 +
+                          5 * ((size_t)6144 * 2560 + (size_t)2560 * 4096 +
+                               (size_t)15360 * 2560 + (size_t)2560 * 7680 +
+                               2 * (size_t)640 * 2560);
+    const char* wq = getenv("QWENOX_DF2_WQ");
+    add(wq && !strcmp(wq, "bf16") ? welems * 2 : welems + welems / 16);  // weights
+    add((size_t)256 * 2560 * 2);                           // selector_hidden
+    add((size_t)2048 * 5 * 2560 * 4);                      // d_tap
+    add((size_t)9 * 5 * 2560 * 4);                         // d_vtap
+    add(2 * (size_t)5 * 2048 * 8 * 128 * 4);               // d_kctx + d_vctx
+    add((size_t)48 * (12800 + 2 * 2560 + 10240) * 4);      // injection scratch
+    add((size_t)8 * (5 * 2560 + 6144 + 4096 + 640 + 3 * 7680 + 256 + 33) * 4);
+    add((size_t)8 * 17 * 32 * 130 * 4);                    // attention partials
+  }
   add((size_t)1536 << 20);  // vision tower 权重（dup_dev 进 arena）约 1.5 GiB
   return total;
 }

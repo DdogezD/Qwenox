@@ -3222,12 +3222,40 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
                            (!cont || mtp_live) &&
                            getenv("QWENOX_NOSPEC") == nullptr;
     const bool use_spec = !use_ngram && !use_chain && m.mtp_avail &&
-                          g.drafter != 0 && g.drafter != 3 &&
-                          g.drafter != 4 &&
+                          g.drafter != 0 && g.drafter != 2 &&
+                          g.drafter != 3 && g.drafter != 4 &&
                           (!cont || mtp_live) &&
                           (!g.sample ||
                            getenv("QWENOX_NOSPEC_SAMPLE") == nullptr) &&
                           getenv("QWENOX_NOSPEC") == nullptr;
+    // DFlash2 (drafter 2): 5-block masked draft + selector. v1 is greedy,
+    // single-slot, and requires a fresh prompt: target taps only exist for
+    // positions this process prefilled (a restored/continued prefix has no
+    // tap ring). Anything else falls back to plain serial decode.
+    const bool use_df2 = g.drafter == 2 && m.df2.on && m.nslots == 1 &&
+                         !cont && ckpt_toks.empty() &&
+                         getenv("QWENOX_NOSPEC") == nullptr;
+    // Hybrid (QWENOX_DF2_HYBRID=1, greedy, needs MTP weights): the MTP layer
+    // is prefilled too and every round picks the drafter with the better
+    // recent tokens/ms (df2_spec_loop); MTP stays in lockstep for the next
+    // turn. Off by default: 10-20 A/B pooled 0.98x of pure MTP (the per-round
+    // winner changes faster than any history estimate tracks).
+    static const bool df2_hyb_env = [] {
+      const char* e = getenv("QWENOX_DF2_HYBRID");
+      return e && e[0] == '1';
+    }();
+    const bool df2_hyb = use_df2 && !g.sample && m.mtp_avail && df2_hyb_env;
+    if (g.drafter == 2) {
+      static bool said_df2 = false;
+      if (!said_df2 && !use_df2) {
+        said_df2 = true;
+        fprintf(stderr,
+                "%s dflash2: drafter 2 requested but unavailable "
+                "(on=%d slots=%d sample=%d cont=%d ckpts=%zu) -> serial\n",
+                log_ts(), (int)m.df2.on, m.nslots, (int)g.sample, (int)cont,
+                ckpt_toks.size());
+      }
+    }
     m.last_spec_rounds = m.last_spec_commit = m.last_spec_rollbacks = 0;
     // Prompt ingest. A failure here (or a KvOverflow anywhere below) lands
     // in the catch at the end: the slot is reset, the client gets D error.
@@ -3239,6 +3267,9 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
         std::vector<int> bt{g.ids[mcp]};
         m.mtp_ingest_b(m.d_R, bt, 1, (int)mcp - 1);
       }
+    } else if (use_df2) {
+      m.df2.cap_mode = 1;  // capture tap ring + build draft KV per chunk
+      if (df2_hyb) m.mtp_tap_capture = true;  // MTP KV over the prompt too
     }
     // Frontend-hinted snapshot points (SNAPS/SNAP/SNAP2) that fall
     // inside the uncached range: pause the prefill there, checkpoint,
@@ -3357,8 +3388,9 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     m.prog_total = 0;
     m.pf_end = 0;
     m.mtp_tap_capture = false;  // decode/verify must not capture taps
+    if (use_df2) m.df2.cap_mode = 0;  // prompt tap ring is complete
     hist = g.ids;  // prompt fully ingested on both paths
-    if (use_spec || chain_mtp) mtp_live = true;  // MTP KV complete & in lockstep
+    if (use_spec || chain_mtp || df2_hyb) mtp_live = true;  // MTP KV complete & in lockstep
     if (g.sample) {  // d_logits still holds the last position's logits
       m.get_logits(lbuf);
       cur = smp.sample(lbuf, &cur_lp);
@@ -3520,6 +3552,52 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
         m.last_spec_proposed = spec_p;
       }
       hist.assign(m.chist.begin(), m.chist.end());
+    } else if (use_df2) {
+      // DFlash2 greedy speculative decode. The loop verifies every round
+      // against the trunk, so committed ids are exactly serial-decode ids.
+      // Hybrid keeps the MTP layer in lockstep; plain DFlash2 leaves it stale.
+      mtp_live = df2_hyb;
+      if (eos.count(cur)) {
+        reason = "done";
+      } else if (send_tok(cur, g.sample && g.logprobs, cur_lp)) {
+        for (;;) {
+          pause_tok = -1;
+          if (g.sample) {
+            auto emit = [&](int tok, float lp) -> bool {
+              if (ngen >= g.max_tokens) return false;
+              if (eos.count(tok)) {
+                reason = "done";
+                return false;
+              }
+              if (!send_tok(tok, g.logprobs, lp)) return false;
+              dl_tick();
+              return !cancel;
+            };
+            m.df2_spec_loop_sample(cur, g.max_tokens - 1, smp, emit);
+          } else {
+            auto emit = [&](int tok) -> bool {
+              if (ngen >= g.max_tokens) return false;
+              if (eos.count(tok)) {
+                reason = "done";
+                return false;
+              }
+              if (!send_tok(tok, false, 0.0f)) return false;
+              dl_tick();
+              return !cancel;
+            };
+            m.df2_spec_loop(cur, g.max_tokens - 1, spec_gamma, emit, df2_hyb,
+                            spec_gamma);
+          }
+          spec_r += m.last_spec_rounds;
+          spec_c += m.last_spec_commit;
+          spec_p += m.last_spec_proposed;
+          break;  // no ckpt-pause tokens on the dflash2 path
+        }
+        m.last_spec_rounds = spec_r;
+        m.last_spec_commit = spec_c;
+        m.last_spec_proposed = spec_p;
+        hist.assign(m.chist.begin(), m.chist.end());
+      }
     } else if (use_spec) {
       // Stream each token as the spec loop commits it. eos/cancel/length
       // return false, rolling the round back so trunk and MTP stop at the
@@ -3579,7 +3657,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     } else {
       mtp_live = false;  // plain decode leaves the MTP layer stale
     }
-    if (!use_spec && !use_ngram && !use_chain)
+    if (!use_spec && !use_ngram && !use_chain && !use_df2)
       for (int i = 0; i < g.max_tokens; i++) {
         if (eos.count(cur)) {
           reason = "done";
@@ -3616,12 +3694,14 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
                         .count();
     if (cancel)
       snprintf(db, sizeof db, "D %lld cancel 0 0 0.0 0.0\n", (long long)g.req);
-    else if ((use_spec || use_ngram || use_chain) && m.last_spec_rounds > 0)
+    else if ((use_spec || use_ngram || use_chain || use_df2) &&
+             m.last_spec_rounds > 0)
       snprintf(db, sizeof db,
                "D %lld %s %zu %d %.1f %.1f %d %d %d %d %d\n",
                (long long)g.req, reason.c_str(), g.ids.size(), ngen, pre_ms,
                ngen > 1 ? dec_ms : 0.0,
-               use_chain ? (chain_mtp ? 4 : 3) : (use_ngram ? 3 : 1),
+               use_chain ? (chain_mtp ? 4 : 3)
+                         : (use_ngram ? 3 : (use_df2 ? 2 : 1)),
                m.last_spec_rounds,
                m.last_spec_commit, n_cached, m.last_spec_proposed);
     else
@@ -3777,11 +3857,12 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
       const long long kv_pool_tokens =
           m.kv_paged ? (long long)m.kv_pool_pages * KV_PAGE
                      : (long long)m.nslots * m.maxctx;
-      snprintf(ib, sizeof ib, "I %d 0 %d 8 %d %d 0 0 0 %d %d 1 1 %lld\n",
+      snprintf(ib, sizeof ib, "I %d 0 %d 8 %d %d %d 0 0 %d %d 1 1 %lld\n",
                m.mtp_avail ? 1 : 0, m.maxctx,
                env_default_drafter() >= 0 ? env_default_drafter()
                                           : (m.mtp_avail ? 1 : 0),
-               m.mtp_avail ? 1 : 0, m.nslots, m.maxctx, kv_pool_tokens);
+               m.mtp_avail ? 1 : 0, m.df2.on ? 1 : 0, m.nslots, m.maxctx,
+               kv_pool_tokens);
       alive = c.send(ib);
     } else if (verb == "MEM") {
       EngineMemStats ms = memstats_snapshot();
