@@ -577,20 +577,27 @@ bool prepare_messages(const json& messages, std::vector<Frame>* frames,
 
 bool encode_prompt(const std::string& prompt, const qwenox::Tokenizer& tokenizer,
                    const std::vector<Frame>& frames, std::vector<int>* ids,
-                   std::string* error, std::vector<size_t>* starts) {
+                   std::string* error, std::vector<size_t>* starts,
+                   const std::vector<qwenox::LiteralRange>* literal) {
     std::vector<size_t> pad_offsets;
     size_t at = 0;
     const size_t pad_in_span = std::string("<|vision_start|>").size();
+    const size_t span_len = std::char_traits<char>::length(kPadSpan);
     while ((at = prompt.find(kPadSpan, at)) != std::string::npos) {
-        pad_offsets.push_back(at + pad_in_span);
-        at += std::char_traits<char>::length(kPadSpan);
+        bool typed = false;
+        if (literal)
+            for (const auto& r : *literal)
+                if (r.begin < at + span_len && at < r.end) typed = true;
+        if (!typed) pad_offsets.push_back(at + pad_in_span);
+        at += span_len;
     }
     if (pad_offsets.size() != frames.size()) {
         *error = "image placeholder count does not match the number of supplied images";
         return false;
     }
 
-    const std::vector<qwenox::TokenSpan> spans = tokenizer.encode_with_offsets(prompt);
+    const std::vector<qwenox::TokenSpan> spans =
+        tokenizer.encode_with_offsets(prompt, false, nullptr, literal);
     ids->clear();
     if (starts) starts->clear();
     size_t image_index = 0;

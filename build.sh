@@ -13,7 +13,7 @@
 #   build/qwenox-engine    引擎(src/gpu/qwenox.cpp)
 #   build/qwenox-bench    独立性能测试工具(src/gpu/bench_main.cpp)
 #   build/qwenox-api      API 服务器(src/api/*.cpp)
-#   build/{tok_cli,tpl_cli,eng_cli,http_selftest,toolparse_test,vision_test,snap_cuts_test}
+#   build/{tok_cli,tpl_cli,eng_cli,http_selftest,toolparse_test,vision_test,snap_cuts_test,inject_test}
 #   build/ktest         引擎内核测试
 #   build/lib/          --bundle 时生成的运行库与 gfx1151 kernel db
 #
@@ -328,6 +328,9 @@ build_api() {
     src/api/snap_cuts.cpp src/api/chat_template.cpp src/api/json_py.cpp \
     src/api/tokenizer.cpp src/api/vision.cpp src/api/snap_cuts_test.cpp \
     -lpng -ljpeg -lwebp -lpthread || return 1
+  compile build/inject_test 8 120 "$CXX" "${API_FLAGS[@]}" \
+    src/api/chat_template.cpp src/api/json_py.cpp src/api/tokenizer.cpp \
+    src/api/vision.cpp src/api/inject_test.cpp -lpng -ljpeg -lwebp -lpthread || return 1
   compile build/vision_test 8 120 "$CXX" "${API_FLAGS[@]}" \
     src/api/vision.cpp src/api/tokenizer.cpp src/api/vision_test.cpp \
     -lpng -ljpeg -lwebp -lpthread || return 1

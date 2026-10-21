@@ -52,8 +52,11 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
+
+#include "tokenizer.h"  // qwenox::LiteralRange
 
 namespace chat_template {
 
@@ -84,6 +87,13 @@ struct RenderResult {
     // splitting the model's reply must use this, not their own reconstruction.
     bool thinking_enabled = true;
     std::string text;   // when ok
+    // Byte ranges of `text` that came from the client (message content,
+    // reasoning, tool schemas, tool-call names/arguments), sorted and
+    // disjoint. Everything else is template markup. Encoding with these
+    // keeps a literal "<|im_end|>" typed by a user or returned by a tool from
+    // becoming the control token. Assistant ranges are keep_plain: the
+    // model's own <think>/<tool_call> round-trip as the ids it generated.
+    std::vector<qwenox::LiteralRange> literal;
     std::string error;  // when !ok: the exact raise_exception / jinja2
                         // runtime error message the template would produce
 };

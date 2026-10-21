@@ -36,6 +36,8 @@ GUARD_LOG = []
 GUARD_RESUMES = {}
 # BIAS pairs of every GEN (api_notools_ban_test.py); BIASLOG returns and clears.
 BIAS_LOG = []
+# Prompt ids of every GEN (api_inject_tcache_test.py); IDSLOG returns and clears.
+IDS_LOG = []
 
 
 def guard_scenario(key, resumed, max_tokens):
@@ -151,6 +153,11 @@ def handle(conn):
                     send_line(conn, json.dumps(BIAS_LOG))
                     BIAS_LOG.clear()
                 continue
+            if line == "IDSLOG":
+                with TRACE_LOCK:
+                    send_line(conn, json.dumps(IDS_LOG))
+                    IDS_LOG.clear()
+                continue
             if line.startswith("X "):
                 record_cancel(int(line.split()[1]))
                 continue
@@ -172,6 +179,7 @@ def handle(conn):
             with TRACE_LOCK:
                 BIAS_LOG.append({"max_tokens": int(fields[2]), "sampled": "SAMPLE" in fields,
                                  "bias": bias})
+                IDS_LOG.append(ids)
 
             grids = []
             if "MROPE" in fields:

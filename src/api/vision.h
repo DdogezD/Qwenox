@@ -38,9 +38,12 @@ bool prepare_messages(const json& messages, std::vector<Frame>* frames,
 // Expand only image-pad tokens inside complete vision placeholder spans.
 // `starts` (optional) receives each id's byte offset in `prompt` (the copies
 // of an expanded pad share the pad's offset). Only frames[i].pad_tokens() is
-// read, so the frames may carry grids without patches.
+// read, so the frames may carry grids without patches. `literal`: the
+// prompt's client-text ranges (chat_template RenderResult::literal); a
+// placeholder inside one is typed text, not an image.
 bool encode_prompt(const std::string& prompt, const qwenox::Tokenizer& tokenizer,
                    const std::vector<Frame>& frames, std::vector<int>* ids,
-                   std::string* error, std::vector<size_t>* starts = nullptr);
+                   std::string* error, std::vector<size_t>* starts = nullptr,
+                   const std::vector<qwenox::LiteralRange>* literal = nullptr);
 
 }  // namespace vision

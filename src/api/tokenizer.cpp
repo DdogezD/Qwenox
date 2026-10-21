@@ -410,6 +410,7 @@ bool Tokenizer::load(const std::string& dir, std::string* err) {
             AddedToken at{t["content"].get<std::string>(), t["id"].get<int>(),
                           t.value("special", false)};
             added_.push_back(at);
+            if (!at.content.empty()) added_first_[(uint8_t)at.content[0]] = true;
             added_special_[at.id] = at.special;
             added_ids_[at.content] = at.id;
             max_id = std::max(max_id, at.id);
@@ -507,18 +508,54 @@ void Tokenizer::bpe(const std::string& alphabet_str, std::vector<int>* out,
     *token_char_lens = std::move(lens);
 }
 
+const Tokenizer::AddedToken* Tokenizer::match_added(
+    const std::string& text, size_t pos, const std::unordered_set<int>* exclude_added,
+    const std::vector<LiteralRange>* literal) const {
+    const size_t n = text.size();
+    if (pos >= n || !added_first_[(uint8_t)text[pos]]) return nullptr;
+    for (const AddedToken& at : added_) {  // sorted longest-first
+        const size_t end = pos + at.content.size();
+        if (end > n || text.compare(pos, at.content.size(), at.content) != 0 ||
+            (exclude_added && exclude_added->count(at.id)))
+            continue;
+        if (literal && !literal->empty()) {
+            // First range ending after pos; it overlaps [pos, end) iff it
+            // begins before end.
+            const auto r = std::upper_bound(
+                literal->begin(), literal->end(), pos,
+                [](size_t p, const LiteralRange& lr) { return p < lr.end; });
+            if (r != literal->end() && r->begin < end &&
+                !(r->keep_plain && !at.special && r->begin <= pos && end <= r->end))
+                continue;
+        }
+        return &at;
+    }
+    return nullptr;
+}
+
+std::vector<TokenSpan> Tokenizer::added_matches(
+    const std::string& text, const std::unordered_set<int>* exclude_added,
+    const std::vector<LiteralRange>* literal) const {
+    std::vector<TokenSpan> result;
+    for (size_t pos = 0; pos < text.size();) {
+        if (const AddedToken* at = match_added(text, pos, exclude_added, literal)) {
+            result.push_back({at->id, pos, pos + at->content.size()});
+            pos += at->content.size();
+        } else {
+            ++pos;
+        }
+    }
+    return result;
+}
+
 std::vector<TokenSpan> Tokenizer::encode_with_offsets(
     const std::string& text, bool /*add_special_tokens*/,
-    const std::unordered_set<int>* exclude_added) const {
+    const std::unordered_set<int>* exclude_added,
+    const std::vector<LiteralRange>* literal) const {
     std::vector<TokenSpan> result;
     const size_t n = text.size();
     auto match_added = [&](size_t pos) -> const AddedToken* {
-        for (const AddedToken& at : added_)  // sorted longest-first
-            if (pos + at.content.size() <= n &&
-                text.compare(pos, at.content.size(), at.content) == 0 &&
-                !(exclude_added && exclude_added->count(at.id)))
-                return &at;
-        return nullptr;
+        return this->match_added(text, pos, exclude_added, literal);
     };
 
     size_t pos = 0;

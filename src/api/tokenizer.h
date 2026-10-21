@@ -31,6 +31,13 @@
 //    their literal text goes through plain BPE instead (used to keep
 //    user-typed <|image_pad|>/<|video_pad|> from becoming real vision
 //    placeholder ids; the vision path inserts those programmatically).
+//  - encode_with_offsets(..., literal) takes the client-content byte ranges
+//    of a rendered chat prompt (chat_template RenderResult::literal): an
+//    added token whose text overlaps such a range BPEs as ordinary text,
+//    except inside a keep_plain range, where non-special added tokens
+//    (<think>, <tool_call>) are still recognized. Pieces are not split at
+//    range boundaries, so text without literal control strings encodes
+//    exactly as without the ranges.
 //  - decode(skip_special_tokens=true) drops only added tokens flagged
 //    special=true; non-special added tokens like `<tool_call>` survive as
 //    literal text.
@@ -60,6 +67,15 @@ struct TokenSpan {
     size_t end;    // byte offset in the input text (exclusive)
 };
 
+// A byte range of client-supplied text inside a rendered prompt. keep_plain:
+// non-special added tokens stay recognized (assistant history, which holds
+// the model's own <think>/<tool_call> ids decoded back to text).
+struct LiteralRange {
+    size_t begin;
+    size_t end;
+    bool keep_plain;
+};
+
 class Tokenizer {
   public:
     // Loads <dir>/tokenizer.json. Returns false on error (message in `err`).
@@ -77,9 +93,18 @@ class Tokenizer {
     // original input text. When NFC normalization rewrites a span, the
     // reported offsets are interpolated from the surrounding codepoints
     // (exact whenever normalization is the identity on that span).
+    // `literal` (sorted, disjoint) limits where added tokens are recognized;
+    // see the header notes.
     std::vector<TokenSpan> encode_with_offsets(
         const std::string& text, bool add_special_tokens = false,
-        const std::unordered_set<int>* exclude_added = nullptr) const;
+        const std::unordered_set<int>* exclude_added = nullptr,
+        const std::vector<LiteralRange>* literal = nullptr) const;
+
+    // The added tokens encode_with_offsets(text, false, exclude_added,
+    // literal) would produce, in order, without running BPE.
+    std::vector<TokenSpan> added_matches(
+        const std::string& text, const std::unordered_set<int>* exclude_added = nullptr,
+        const std::vector<LiteralRange>* literal = nullptr) const;
 
     // Decode token ids back to text. skip_special_tokens drops added tokens
     // flagged special=true. Ill-formed UTF-8 byte runs become U+FFFD
@@ -116,6 +141,7 @@ class Tokenizer {
     // Merge table: (left_id, right_id) -> (rank << 32) | merged_id.
     std::unordered_map<uint64_t, uint64_t> merges_;
     std::vector<AddedToken> added_;                   // sorted longest-first
+    bool added_first_[256] = {};                      // first bytes of added_
     std::unordered_map<int, bool> added_special_;     // id -> special flag
     std::unordered_map<std::string, int> added_ids_;  // content -> id
     int eos_id_ = -1;
@@ -123,6 +149,10 @@ class Tokenizer {
 
     void bpe(const std::string& pretoken_alphabet, std::vector<int>* out,
              std::vector<uint32_t>* token_char_lens) const;
+    // The added token encode recognizes at text[pos], or nullptr.
+    const AddedToken* match_added(const std::string& text, size_t pos,
+                                  const std::unordered_set<int>* exclude_added,
+                                  const std::vector<LiteralRange>* literal) const;
 };
 
 }  // namespace qwenox
