@@ -10711,8 +10711,25 @@ struct GpuModel {
     };
     std::vector<int> pool_ids;  // post-callback top-k rows (worker-local)
     std::vector<float> pool_vals;
+    // QWENOX_SYNC_PROF (T1): per-MTP-round wall split, host-side clock only.
+    // GPU work is async, so a segment holds its enqueue time plus whatever it
+    // blocked on (syncprof attributes the blocking to call sites).
+    enum { RP_YIELD, RP_TOP, RP_PRE, RP_DRAFT, RP_VERIFY, RP_VPOOL, RP_JUDGE, RP_EMIT,
+           RP_COMMIT, RP_WALL, RP_N };
+    double rp[RP_N] = {};
+    using sclk = std::chrono::steady_clock;
+    sclk::time_point rp_t;
+    auto rp_lap = [&](int k) {  // add time since the last lap to segment k
+      if (!g_sp_on) return;
+      const auto n = sclk::now();
+      rp[k] += std::chrono::duration<double, std::milli>(n - rp_t).count();
+      rp_t = n;
+    };
     while ((int)out.size() < gen && pos < maxctx) {
+      const sclk::time_point rp_top = g_sp_on ? sclk::now() : sclk::time_point{};
+      rp_t = rp_top;
       yield_point();  // round top: only persistent slot state is live
+      rp_lap(RP_YIELD);
       if (chist.size() != (size_t)pos)
         throw std::runtime_error(
             "chain-sample: token history and trunk position disagree");
@@ -10978,6 +10995,7 @@ struct GpuModel {
         ng_ms += elapsed(t_round);
       } else if (mtp_ok) {
         // ---- MTP round (ngram table missed): spec_loop_sample's round ----
+        rp_lap(RP_TOP);
         int q = pos - 1;
         int g = std::min({spec_conf() > 0 ? kSpecConfMax : gctl.cur,
                           gen - (int)out.size(), maxctx - pos - 1});
@@ -11001,6 +11019,7 @@ struct GpuModel {
         // GPU sampling prep (direction A), as in spec_loop_sample.
         std::vector<typename Sampler::SDist> q_sd(smg ? gd : 0);
         std::vector<char> q_sparse(gd, 0);
+        rp_lap(RP_PRE);
         for (int j = 0; j < gd; j++) {
           bool dense = true;
           if (smg) {
@@ -11041,6 +11060,7 @@ struct GpuModel {
             break;
           }
         }
+        rp_lap(RP_DRAFT);
         std::vector<int> vt;
         vt.reserve(g + 1);
         vt.push_back(cur);
@@ -11074,7 +11094,10 @@ struct GpuModel {
           };
           std::vector<int> vtmp((size_t)g + 1);
           const VSeg vseg{bound_, &vt, q + 1};
-          if (vseg_pool_fn(*this, vseg, vtmp.data(), &post)) {
+          rp_lap(RP_VERIFY);
+          const bool vp_ok = vseg_pool_fn(*this, vseg, vtmp.data(), &post);
+          rp_lap(RP_VPOOL);  // rendezvous wait + batched pass (+ peers' turns)
+          if (vp_ok) {
             pooled = true;
             smg_v = cb_smg;
             if (smg_v) {
@@ -11097,6 +11120,7 @@ struct GpuModel {
         spec_snap = false;
         const int smk = sampler.top_k;
         verify_ms += elapsed(t);
+        rp_lap(RP_VERIFY);
         Sampler target_view = sampler;
         std::vector<typename Sampler::SDist> p_sd(smg_v ? g + 1 : 0);
         int a = 0;
@@ -11166,6 +11190,7 @@ struct GpuModel {
         last_spec_proposed += g;
         int d = a, stopped_token = -1;
         bool keep_next = true;
+        rp_lap(RP_JUDGE);
         if (emit) {
           for (int j = 0; j < a; j++)
             if (!emit(drafts[j], draft_lps[j])) {
@@ -11177,6 +11202,7 @@ struct GpuModel {
             }
           if (!stop && !emit(next, next_lp)) { stop = true; keep_next = false; }
         }
+        rp_lap(RP_EMIT);
         for (int j = 0; j < d; j++) {
           out.push_back(drafts[j]);
           sampler.remember(drafts[j]);
@@ -11231,6 +11257,9 @@ struct GpuModel {
           CK(hipMemcpyAsync(d_mpos, &mtp_pos, 4, hipMemcpyHostToDevice, g_str));
         }
         vsnap_row0_ = 0;
+        rp_lap(RP_COMMIT);
+        if (g_sp_on)
+          rp[RP_WALL] += std::chrono::duration<double, std::milli>(sclk::now() - rp_top).count();
       } else {
         // ---- no draft, no MTP: plain serial sampling step ----
         VrExcuseS vr_x(*this, vr_on);
@@ -11278,6 +11307,18 @@ struct GpuModel {
       fprintf(stderr, "\n");
       gctl.report("chain-sample");
       occ.report("chain-sample");
+    }
+    if (g_sp_on && mtp_rounds) {
+      static const char* const nm[RP_N] = {"yield", "top", "pre", "draft", "verify", "vpool",
+                                           "judge", "emit", "commit", "wall"};
+      double seg = 0;
+      for (int k = 0; k < RP_WALL; k++) seg += rp[k];
+      fprintf(stderr, "[roundprof] chain-sample mtp %d rounds, ms/round:", mtp_rounds);
+      for (int k = 0; k < RP_N; k++) fprintf(stderr, " %s %.2f", nm[k], rp[k] / mtp_rounds);
+      fprintf(stderr, " | other %.2f | γ avg %.2f, commit/round %.2f\n",
+              (rp[RP_WALL] - seg) / mtp_rounds, (double)last_spec_proposed / std::max(1, last_spec_rounds),
+              last_spec_rounds ? (double)out.size() / last_spec_rounds : 0.0);
+      g_sp.report("chain-sample", last_spec_rounds);
     }
     return out;
   }

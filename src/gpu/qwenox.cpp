@@ -149,6 +149,7 @@
 #include "../version.h"
 
 #include "parts/00_platform.inc"
+#include "parts/01_syncprof.inc"
 #include "parts/05_config.inc"
 #include "parts/06_memstats.inc"
 #include "parts/07_kprof.inc"
