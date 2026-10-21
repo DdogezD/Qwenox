@@ -26,6 +26,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <memory>
@@ -112,7 +113,37 @@ struct GpuModel {
   void kv_trim(int) {}
   void kv_reserve(int) {}
   uint16_t* vct_layer(int) { return nullptr; }
+  static bool env_zero(const char* k) {
+    const char* v = getenv(k);
+    return v && v[0] == '0' && !v[1];
+  }
 };
+
+// rckpt (49_rckpt.inc) as kvsnap::capture_ram sees it: host copies of one
+// RAM checkpoint. The harness keeps none (find -> nullptr) unless a test adds.
+namespace rckpt {
+struct Buf {
+  std::vector<float> v;
+  const float* data() const { return v.data(); }
+  size_t size() const { return v.size(); }
+};
+struct Ck {
+  std::vector<int> toks;
+  int pos = 0, ringpos = 0;
+  Buf s, convst, ring, iraw;
+  bool mtp_ok = false;
+  int mtp_pos = 0;
+  Buf mR, miraw;
+};
+static std::vector<Ck> g_list;
+static const Ck* find(const std::vector<int>& hist, size_t n) {
+  for (const Ck& ck : g_list)
+    if (ck.toks.size() == n && n <= hist.size() &&
+        std::equal(ck.toks.begin(), ck.toks.end(), hist.begin()))
+      return &ck;
+  return nullptr;
+}
+}  // namespace rckpt
 
 #include "kvsnap_gen.inc"  // the real namespace kvsnap (extracted by run.sh)
 
@@ -231,6 +262,7 @@ static bool disk_ok(const std::string& dir, std::string* info) {
   unsigned long long by = 0;
   for (auto& de : std::filesystem::directory_iterator(dir)) {
     const std::string fn = de.path().filename().string();
+    if (fn == kvsnap::HITS_FILE) continue;  // restore counts, not a cache file
     by += de.file_size();
     if (fn[0] == 'k') ck++;
     else if (fn[0] == 'c') pg++;
@@ -250,8 +282,78 @@ static std::vector<int> toks(int n, int seed, const std::vector<int>& prefix = {
 static bool exists(const std::string& dir, const std::string& name) {
   return std::filesystem::exists(dir + "/" + name);
 }
+// Index entry of t's checkpoint (copied out under the lock); hits -1: none.
+struct CkInfo {
+  int hits = -1;
+  bool hot = false;
+};
+static CkInfo ckinfo(const std::vector<int>& t) {
+  const std::string n = ckname(t);
+  std::lock_guard<std::mutex> lk(kvsnap::g_mtx);
+  for (auto& e : kvsnap::g_ck)
+    if (e->name == n && e->pub) return {e->hits, e->hot};
+  return {};
+}
+static std::string read_file_str(const std::string& p) {
+  std::ifstream f(p, std::ios::binary);
+  return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+// Two-segment eviction (K2): a checkpoint restored twice survives a cap
+// squeeze although it is the LRU one; the hot segment over its share is
+// demoted; restore counts land in kvsnap_hits.txt.
+static void test_two_segment(GpuModel& m, const std::string& dir) {
+  std::string info;
+  const auto E = toks(1200, 20), F = toks(1250, 21), G = toks(1300, 22);
+  save(m, E), save(m, F), save(m, G);
+  kvsnap::sync_line();
+  restore(m, E), restore(m, E);
+  const CkInfo ie = ckinfo(E);
+  check(ie.hot && ie.hits == 2, "2Q：恢复两次进保护段",
+        "hits " + std::to_string(ie.hits) + " hot " + std::to_string(ie.hot));
+  // every other checkpoint restored once after E (F first: the oldest
+  // probation one; it is larger than the next save, so it alone is evicted
+  // and A..D stay for the restart stage): E is now the LRU one
+  const auto A = toks(1300, 1), B = toks(1700, 2, std::vector<int>(A.begin(), A.begin() + 600)),
+             C = toks(1500, 3), D = toks(1400, 9);
+  for (const auto* t : {&F, &G, &A, &B, &C, &D}) restore(m, *t);
+  kvsnap::sync_line();
+  uint64_t total;
+  {
+    std::lock_guard<std::mutex> lk(kvsnap::g_mtx);
+    total = kvsnap::g_total;
+  }
+  set_cap(total - 1);  // the next save must evict at least one checkpoint
+  save(m, toks(1100, 23));
+  kvsnap::sync_line();
+  check(exists(dir, ckname(E)) && !exists(dir, ckname(F)) && exists(dir, ckname(G)) &&
+            exists(dir, ckname(A)) && disk_ok(dir, &info),
+        "2Q：上限挤压时只淘汰试用段最旧的 F，保护段的 E（最旧）保留", info);
+  const std::string hits = read_file_str(dir + "/" + kvsnap::HITS_FILE);
+  check(hits.find(ckname(E) + " 2\n") != std::string::npos &&
+            hits.find(ckname(B) + " 1\n") != std::string::npos,
+        "2Q：命中数写入 kvsnap_hits.txt");
+  {
+    std::lock_guard<std::mutex> lk(kvsnap::g_mtx);
+    kvsnap::g_hot_frac = 1e-12;  // any hot checkpoint is over its share
+  }
+  set_cap(1ull << 40);
+  save(m, toks(1150, 24));  // a publish runs evict_locked -> demote_locked
+  kvsnap::sync_line();
+  {
+    std::lock_guard<std::mutex> lk(kvsnap::g_mtx);
+    kvsnap::g_hot_frac = 0.5;
+  }
+  const CkInfo id = ckinfo(E);
+  check(!id.hot && id.hits == 0, "2Q：保护段超额时降回试用段、命中数清零",
+        "hits " + std::to_string(id.hits) + " hot " + std::to_string(id.hot));
+}
 
 int main(int argc, char** argv) {
+  // serve-only entry points (tier choice, pause checkpoints): not exercised here
+  (void)&kvsnap::capture_ram;
+  (void)&kvsnap::note_prefill;
+  (void)&kvsnap::release;
+  (void)&kvsnap::prefer_over_ram;
   if (argc < 3) return 2;
   const std::string mode = argv[1], dir = argv[2];
   kvsnap::g_model_files = {"/dev/null"};
@@ -309,6 +411,8 @@ int main(int argc, char** argv) {
     set_cap(1ull << 40);
     save(m, A), save(m, B), save(m, C);
     check(disk_ok(dir, &info) && exists(dir, ckA), "再存 A、B、C：索引 == 磁盘", info);
+    test_two_segment(m, dir);
+    // B: one restore above, kept across the restart (kvsnap_hits.txt)
     FILE* f = fopen((dir + ".index").c_str(), "w");
     fputs(kvsnap::sync_line().c_str(), f);
     fclose(f);
@@ -326,6 +430,9 @@ int main(int argc, char** argv) {
         break;
       }
     kvsnap::init(m, cfg);
+    const CkInfo ib = ckinfo(B);
+    check(ib.hits == 1 && !ib.hot, "重启后从 kvsnap_hits.txt 读回命中数（B 1 次）",
+          "hits " + std::to_string(ib.hits));
     const std::string s = kvsnap::sync_line();
     check(s == want, "重启后索引 == 重启前", "now " + s.substr(0, s.size() - 1) + " / before " + std::string(want, strlen(want) - 1));
     check(!exists(dir, "tmp_c_0000000000000001.kvc") && exists(dir, "notes.txt") && !exists(dir, kvsnap::ch_name(0x123)),

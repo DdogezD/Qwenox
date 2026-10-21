@@ -573,6 +573,8 @@ TokenCache g_tcache;
 // a checkpoint at the same spot turns a template-roundtrip mismatch from a
 // full reply re-prefill into re-decoding only the tool call + tool result.
 // QWENOX_CKPT_TOKENS=0 disables; the engine ignores unknown/empty hints.
+// Order matters: the engine also writes the turn's first pause on the FIRST
+// id (<tool_call>) to its SSD tier (else the last pause; kvsnap::capture_ram).
 std::vector<int> g_ckpt_ids;
 
 std::vector<int> default_ckpt_tokens() {

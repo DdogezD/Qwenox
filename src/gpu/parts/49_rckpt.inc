@@ -318,6 +318,20 @@ int match(const std::vector<int>& prompt, const std::vector<int64_t>& chist,
   return best;
 }
 
+// Tokens covered by / MTP state carried by match() result `idx`.
+size_t length(int idx) { return g_list[(size_t)idx].toks.size(); }
+bool has_mtp(int idx) { return g_list[(size_t)idx].mtp_ok; }
+
+// The checkpoint of exactly hist[0, n), or nullptr. The pointer is valid
+// until the next save/restore/eviction (GPU owner thread only).
+const Ck* find(const std::vector<int>& hist, size_t n) {
+  if (!g_on || n == 0 || n > hist.size()) return nullptr;
+  for (const Ck& ck : g_list)
+    if (ck.toks.size() == n && std::equal(ck.toks.begin(), ck.toks.end(), hist.begin()))
+      return &ck;
+  return nullptr;
+}
+
 // Longest common prefix of `prompt` with any checkpoint's tokens: how far an
 // earlier sequence shared this prompt (fork detection, see fork_cut).
 size_t lcp(const std::vector<int>& prompt) {

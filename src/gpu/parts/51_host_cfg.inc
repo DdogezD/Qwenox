@@ -8,6 +8,15 @@ struct Cfg {
   // file system, 1 locally -- parallel writes slowed a local NVMe 0.8 -> 2.2 s
   // per 1.8 GB and buy nothing there)
   int readers = 4, writers = 0;
+  // Two-segment eviction: a checkpoint restored hot_hits times moves to the
+  // hot segment, evicted only after every probation checkpoint; the hot
+  // segment holds at most hot_frac of cap (its LRU entries are demoted past
+  // that). hot_hits = 0: plain LRU.
+  int hot_hits = 2;
+  double hot_frac = 0.5;
+  // Also store this turn's <tool_call> / </think> pause checkpoint (taken
+  // from its RAM copy at the end of the turn).
+  bool pause_ckpt = true;
 };
 
 // Model identity for the cache fingerprint (set by main before serve::run).
@@ -376,6 +385,8 @@ struct CkEnt {
   std::vector<int> tail;               // tokens [256*nc, n)
   int64_t t = 0;                       // LRU time (file_time clock)
   int busy = 0;                        // restores in progress: not evictable
+  int hits = 0;                        // successful restores (kvsnap_hits.txt)
+  bool hot = false;                    // hot segment (two-segment eviction)
 };
 static std::mutex g_mtx;
 static std::condition_variable g_cv;
@@ -392,15 +403,26 @@ static uint64_t g_total = 0;  // bytes of published files
 // again): a queued delete is skipped when the name is in the index again by
 // the time it runs, and a writer about to publish a name waits while that
 // name is being deleted.
+// J_HITS rewrites kvsnap_hits.txt (restore counts, read back by init): at
+// most one is queued, it snapshots the index when it runs.
+enum { J_DEL, J_TOUCH, J_HITS };
 struct JOp {
   std::string name;
-  bool del;  // false: bump the mtime (LRU order across restarts)
+  int op;  // J_TOUCH: bump the mtime (LRU order across restarts)
 };
 static std::deque<JOp> g_jq;
 static std::string g_jcur;    // name being deleted right now
 static bool g_jbusy = false;  // the janitor holds an operation
+static bool g_hits_q = false; // a J_HITS is queued
+static const char* const HITS_FILE = "kvsnap_hits.txt";
 static void del_locked(const std::string& name) {
-  g_jq.push_back({name, true});
+  g_jq.push_back({name, J_DEL});
+  g_cv.notify_all();
+}
+static void hits_dirty_locked() {
+  if (g_hits_q) return;
+  g_hits_q = true;
+  g_jq.push_back({std::string(), J_HITS});
   g_cv.notify_all();
 }
 // The index holds this name (published or pending): its file is wanted.
@@ -433,25 +455,105 @@ static void drop_ck_locked(std::shared_ptr<CkEnt> e, bool del_file) {
     g_total -= e->bytes;
     if (del_file) del_locked(e->name);
   }
+  // its line must leave kvsnap_hits.txt: the name may be saved again later
+  if (e->hits > 0) hits_dirty_locked();
   for (uint64_t k : e->chunks) unref_locked(g_ch, k, false);
   for (uint64_t k : e->mtps)
     if (k) unref_locked(g_mt, k, true);
 }
-static void evict_locked(const CkEnt* keep) {
-  while (g_total > g_cap) {
+// Two-segment eviction (2Q-style). Checkpoints enter on probation; one
+// restored g_hot_hits times becomes hot. Eviction takes the LRU probation
+// checkpoint first, a hot one only when none is left, so the few prefixes
+// that are read again and again (a client's fixed system prompt) are not
+// flushed by a run of one-off long prompts. The hot segment is bounded by
+// checkpoint file bytes (pages are shared, not counted): past g_hot_frac of
+// the cap its LRU entries go back to probation and must earn their place
+// again. Only a restore counts as a hit: commit_seed also re-meets known
+// states (the next turn's cut at the previous turn end), which would make
+// every checkpoint hot. g_hot_hits == 0: plain LRU.
+static int g_hot_hits = 2;
+static double g_hot_frac = 0.5;
+static void demote_locked() {
+  uint64_t hot_b = 0;
+  for (auto& e : g_ck)
+    if (e->pub && e->hot) hot_b += e->bytes;
+  const uint64_t lim = (uint64_t)(g_cap * g_hot_frac);
+  while (hot_b > lim) {
     std::shared_ptr<CkEnt> v;
     for (auto& e : g_ck)
-      if (e->pub && !e->busy && e.get() != keep && (!v || e->t < v->t)) v = e;
+      if (e->pub && e->hot && (!v || e->t < v->t)) v = e;
     if (!v) break;
-    logf_locked("kvsnap: evicted %s (LRU, cap %.1f GB)\n", v->name.c_str(),
+    v->hot = false;
+    v->hits = 0;
+    hot_b -= v->bytes;
+    logf_locked("kvsnap: %s back to probation (hot segment over %.1f GB)\n", v->name.c_str(),
+                lim / 1073741824.0);
+    hits_dirty_locked();
+  }
+}
+static void evict_locked(const CkEnt* keep) {
+  demote_locked();
+  while (g_total > g_cap) {
+    std::shared_ptr<CkEnt> v;  // probation before hot, LRU within a segment
+    for (auto& e : g_ck)
+      if (e->pub && !e->busy && e.get() != keep &&
+          (!v || (v->hot && !e->hot) || (v->hot == e->hot && e->t < v->t)))
+        v = e;
+    if (!v) break;
+    logf_locked("kvsnap: evicted %s (%s LRU, %d hit%s, cap %.1f GB)\n", v->name.c_str(),
+                v->hot ? "hot" : "probation", v->hits, v->hits == 1 ? "" : "s",
                 g_cap / 1073741824.0);
     drop_ck_locked(v, true);
   }
 }
 static void touch_locked(const std::shared_ptr<CkEnt>& e) {
   e->t = now_t();
-  g_jq.push_back({e->name, false});  // the file mtime carries it across restarts
+  g_jq.push_back({e->name, J_TOUCH});  // the file mtime carries it across restarts
   g_cv.notify_all();
+}
+// A successful restore of `e`.
+static void hit_locked(const std::shared_ptr<CkEnt>& e) {
+  touch_locked(e);
+  e->hits++;
+  if (g_hot_hits > 0 && !e->hot && e->hits >= g_hot_hits) {
+    e->hot = true;
+    logf_locked("kvsnap: %s is hot (%d restores)\n", e->name.c_str(), e->hits);
+    demote_locked();
+  }
+  hits_dirty_locked();
+}
+// kvsnap_hits.txt: "<checkpoint file name> <restores>" per line, checkpoints
+// with at least one restore. Written whole (tmp + rename) by the janitor.
+static std::string hits_text_locked() {
+  std::string s;
+  for (auto& e : g_ck)
+    if (e->pub && e->hits > 0) s += e->name + " " + std::to_string(e->hits) + "\n";
+  return s;
+}
+static void write_hits(const std::string& text) {
+  const std::string tmp = path_of(std::string("tmp_") + HITS_FILE);
+  std::error_code ec;
+  {
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    f.write(text.data(), (std::streamsize)text.size());
+    if (!f.good()) {
+      f.close();
+      std::filesystem::remove(tmp, ec);
+      return;
+    }
+  }
+  std::filesystem::rename(tmp, path_of(HITS_FILE), ec);
+  if (ec) std::filesystem::remove(tmp, ec);
+}
+static std::unordered_map<std::string, int> read_hits() {
+  std::unordered_map<std::string, int> mp;
+  std::ifstream f(path_of(HITS_FILE), std::ios::binary);
+  std::string name;
+  int n;
+  while (f >> name >> n)
+    if (n > 0) mp[name] = n;
+  return mp;
 }
 
 static void janitor() {
@@ -459,26 +561,32 @@ static void janitor() {
   double ds = 0;
   for (;;) {
     JOp op;
+    std::string hits;  // J_HITS: the file text, snapshotted under the lock
     {
       std::unique_lock<std::mutex> lk(g_mtx);
       g_cv.wait(lk, [] { return !g_jq.empty(); });
       op = std::move(g_jq.front());
       g_jq.pop_front();
-      if (op.del == live_locked(op.name)) {  // re-created since / already gone
+      if (op.op == J_HITS) {
+        g_hits_q = false;
+        hits = hits_text_locked();
+      } else if ((op.op == J_DEL) == live_locked(op.name)) {  // re-created / already gone
         lk.unlock();
         g_cv.notify_all();
         continue;
       }
       g_jbusy = true;
-      if (op.del) g_jcur = op.name;
+      if (op.op == J_DEL) g_jcur = op.name;
     }
     const auto t0 = std::chrono::steady_clock::now();
     std::error_code ec;
-    if (op.del)
+    if (op.op == J_DEL)
       std::filesystem::remove(path_of(op.name), ec);
-    else
+    else if (op.op == J_TOUCH)
       std::filesystem::last_write_time(path_of(op.name),
                                        std::filesystem::file_time_type::clock::now(), ec);
+    else
+      write_hits(hits);
     bool drained;
     {
       std::lock_guard<std::mutex> lk(g_mtx);
@@ -487,7 +595,7 @@ static void janitor() {
       drained = g_jq.empty();
     }
     g_cv.notify_all();
-    if (!op.del) continue;
+    if (op.op != J_DEL) continue;
     nd++;
     ds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     // Windows: a sharing violation (antivirus scan, indexer, an open handle)
@@ -601,8 +709,11 @@ static void writer() {
           drop_ck_locked(e, false);
         } else {
           // same state saved before without MTP state: this file replaced it
+          // (it inherits the restore count and segment)
           for (auto& o : g_ck)
             if (o != e && o->name == e->name) {
+              e->hits = o->hits;
+              e->hot = o->hot;
               drop_ck_locked(o, false);
               break;
             }
@@ -686,20 +797,43 @@ struct Pending {
   double cap_s = 0;
 };
 
-// GPU-owner thread. `toks` must be exactly the live state (m.pos). `mtp`: the
-// MTP layer is in lockstep (mtp_pos == pos-1, rows [0, pos-1) ingested); the
-// checkpoint then carries d_R/d_miraw/mtp_pos and names MTP sections.
-static void capture(GpuModel& m, const std::vector<int>& toks, bool mtp,
-                    std::vector<Pending>& out) {
+// GPU-owner thread. Without `rc`: `toks` must be exactly the live state
+// (m.pos); `mtp`: the MTP layer is in lockstep (mtp_pos == pos-1, rows
+// [0, pos-1) ingested), the checkpoint then carries d_R/d_miraw/mtp_pos and
+// names MTP sections.
+//
+// With `rc` (capture_ram): a RAM checkpoint of `toks`, a strict prefix of
+// the live state -- a <tool_call> / </think> pause of this turn, captured at
+// its end. The GDN/PLE/indexer-raw/MTP-stream state comes from the
+// checkpoint's pinned host copies; the partial page rows [256*nc, n) of
+// every layer from the live KV: rows below the live position are
+// append-only, so they still hold the values at n. Later writes do reach a
+// few slots past them -- the straddling indexer key block, MTP row n-1 --
+// exactly as in a cut capture taken before the next segment; a restore
+// re-pools that block from the raw ring and re-ingests MTP row n-1 at the
+// continuation boundary.
+static void capture_impl(GpuModel& m, const std::vector<int>& toks, bool mtp,
+                         const rckpt::Ck* rc, std::vector<Pending>& out) {
   if (!g_on) return;
   const int n = (int)toks.size();
-  if (n <= 0 || n != m.pos) {
+  if (n <= 0 || (rc ? (n >= m.pos || rc->pos != n) : n != m.pos)) {
     fprintf(stderr, "kvsnap: save skipped: %d tokens but live pos %d\n", n, m.pos);
     return;
   }
   const auto t0 = std::chrono::steady_clock::now();
   const Geo G = geo(m);
-  mtp = mtp && m.kv_nl > G.nqsa && m.mtp_pos == m.pos - 1;
+  if (rc) {
+    if (rc->s.size() * 4 != G.s_b || rc->convst.size() * 4 != G.conv_b ||
+        rc->ring.size() * 4 != G.ring_b || rc->iraw.size() * 4 != G.iraw_b) {
+      fprintf(stderr, "kvsnap: pause checkpoint of %d tokens skipped (RAM copy layout)\n", n);
+      return;
+    }
+    mtp = rc->mtp_ok && m.kv_nl > G.nqsa && rc->mtp_pos == n - 1 &&
+          rc->mR.size() == (size_t)g_cfg.branches * g_cfg.d &&
+          rc->miraw.size() == (m.d_miraw ? (size_t)4 * 128 : 0);
+  } else {
+    mtp = mtp && m.kv_nl > G.nqsa && m.mtp_pos == m.pos - 1;
+  }
   const int nc = (n - 1) / KV_PAGE, nt = n - nc * KV_PAGE;
   auto e = std::make_shared<CkEnt>();
   e->seed = seed_of(m, toks.data(), (size_t)n);
@@ -726,9 +860,9 @@ static void capture(GpuModel& m, const std::vector<int>& toks, bool mtp,
   h.nc = nc;
   h.nl = e->nl;
   h.kvb = G.kvb;
-  h.ringpos = m.ple_ringpos;
+  h.ringpos = rc ? rc->ringpos : m.ple_ringpos;
   h.mtp = mtp;
-  h.mtp_pos = mtp ? m.mtp_pos : 0;
+  h.mtp_pos = mtp ? (rc ? rc->mtp_pos : m.mtp_pos) : 0;
   h.nik = tail_ik(m, n, nc);
   h.has_ik = G.has_ik;
   h.s_b = G.s_b;
@@ -749,18 +883,25 @@ static void capture(GpuModel& m, const std::vector<int>& toks, bool mtp,
   p += (size_t)nc * 8;
   memcpy(p, e->tail.data(), (size_t)nt * 4);
   p += (size_t)nt * 4;
-  CK(hipStreamSynchronize(g_str));
+  CK(hipStreamSynchronize(g_str));  // also completes rckpt's async D2H into rc
   bool ok = true;
-  auto blob = [&](const void* d, size_t sz) {
-    if (ok) ok = d2h(p, d, sz);
+  // device state (rc == nullptr) or its RAM checkpoint copy
+  auto blob = [&](const void* d, const void* host, size_t sz) {
+    if (ok) {
+      if (rc) {
+        if (sz) memcpy(p, host, sz);
+      } else {
+        ok = d2h(p, d, sz);
+      }
+    }
     p += sz;
   };
-  blob(m.d_S, h.s_b);
-  blob(m.d_convst, h.conv_b);
-  blob(m.d_ring, h.ring_b);
-  blob(m.d_iraw, h.iraw_b);
-  blob(m.d_R, h.mR_b);
-  blob(m.d_miraw, h.miraw_b);
+  blob(m.d_S, rc ? rc->s.data() : nullptr, h.s_b);
+  blob(m.d_convst, rc ? rc->convst.data() : nullptr, h.conv_b);
+  blob(m.d_ring, rc ? rc->ring.data() : nullptr, h.ring_b);
+  blob(m.d_iraw, rc ? rc->iraw.data() : nullptr, h.iraw_b);
+  blob(m.d_R, rc ? rc->mR.data() : nullptr, h.mR_b);
+  blob(m.d_miraw, rc ? rc->miraw.data() : nullptr, h.miraw_b);
   const int r0 = nc * KV_PAGE, b0 = nc * KV_PAGE_BLOCKS;
   for (int l = 0; l < h.nl && ok; l++) {
     ok = xfer(m, false, kv_layer(m, 0, l), p, r0, n, KV_PAGE, G.row_b) &&
@@ -779,6 +920,25 @@ static void capture(GpuModel& m, const std::vector<int>& toks, bool mtp,
   pd.buf = std::move(b);
   pd.cap_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   out.push_back(std::move(pd));
+}
+static void capture(GpuModel& m, const std::vector<int>& toks, bool mtp,
+                    std::vector<Pending>& out) {
+  capture_impl(m, toks, mtp, nullptr, out);
+}
+// End of turn, before commit(): the RAM checkpoint of hist[0, n) (a pause of
+// this turn) for this tier too. Without one -- evicted for pool space, not
+// saved -- nothing is captured. The MTP state goes with it when the RAM copy
+// has it.
+static void capture_ram(GpuModel& m, const std::vector<int>& hist, size_t n,
+                        std::vector<Pending>& out) {
+  if (!g_on || n == 0 || n >= hist.size() || (int)hist.size() != m.pos) return;
+  const rckpt::Ck* rc = rckpt::find(hist, n);
+  if (!rc) {
+    fprintf(stderr, "kvsnap: pause checkpoint of %zu tokens not saved (no RAM copy)\n", n);
+    return;
+  }
+  capture_impl(m, std::vector<int>(hist.begin(), hist.begin() + (std::ptrdiff_t)n), true, rc,
+               out);
 }
 
 // One page's (or MTP section's) file image, read from the live sequence.
@@ -955,6 +1115,63 @@ static void commit(GpuModel& m, const std::vector<int>& hist, std::vector<Pendin
   }
   commit_seed(m, hist, pend, g_fp);
   commit_seed(m, hist, img, seed_for(m.mrope_active_, m.img_hash_, m.mrope_grids_));
+}
+
+// ---- tier choice -------------------------------------------------------------
+// serve tries the RAM tier (rckpt) before this one. A RAM hit used to win
+// outright even when this tier held a far longer prefix: subagents keep
+// refreshing the shared system-prompt checkpoint in RAM (8 entries) while the
+// main conversation's long checkpoint survives only here, and switching back
+// re-prefilled the difference (tens of seconds) instead of a restore of about
+// a second. prefer_over_ram() decides from two running estimates, both under
+// g_mtx: restore throughput (bytes/s of past restores; until one is seen,
+// 2 GB/s on a local disk, 0.15 GB/s on a share) and prefill speed (tokens/s
+// of past prompt evals of >= 1024 new tokens; 1000 until one is seen).
+// QWENOX_KVSNAP_OVER_RAM=0: a RAM hit always wins.
+static double g_rs_bps = 0;     // restore bytes/s (0: none measured yet)
+static double g_rs_bps0 = 2e9;  // initial guess (init: 0.15e9 on a share)
+static double g_pf_tps = 0;     // prefill tokens/s (0: none measured yet)
+
+// A prompt eval of `n` new tokens took `ms` (serve, after the prefill).
+static void note_prefill(size_t n, double ms) {
+  if (!g_on || n < 1024 || ms <= 0) return;
+  std::lock_guard<std::mutex> lk(g_mtx);
+  const double tps = n / (ms / 1000.0);
+  g_pf_tps = g_pf_tps > 0 ? 0.7 * g_pf_tps + 0.3 * tps : tps;
+}
+// Drop a match() that is not restored (its busy mark).
+static void release(const std::shared_ptr<CkEnt>& e) {
+  std::lock_guard<std::mutex> lk(g_mtx);
+  e->busy--;
+}
+// Restore `e` rather than a RAM checkpoint of `ram_n` tokens? A RAM
+// checkpoint that carries the MTP state wins over one here that does not
+// (the turn would decode without speculation).
+static bool prefer_over_ram(const CkEnt& e, size_t ram_n, bool ram_mtp, long long req) {
+  static const bool on = !GpuModel::env_zero("QWENOX_KVSNAP_OVER_RAM");
+  if (!on || (size_t)e.n <= ram_n || (ram_mtp && !e.mtp)) return false;
+  double bytes = 0, bps, tps;
+  {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    bytes = (double)e.bytes;
+    for (uint64_t k : e.chunks) {
+      auto f = g_ch.find(k);
+      if (f != g_ch.end()) bytes += (double)f->second.bytes;
+    }
+    if (e.mtp)
+      for (uint64_t k : e.mtps) {
+        auto f = k ? g_mt.find(k) : g_mt.end();
+        if (f != g_mt.end()) bytes += (double)f->second.bytes;
+      }
+    bps = g_rs_bps > 0 ? g_rs_bps : g_rs_bps0;
+    tps = g_pf_tps > 0 ? g_pf_tps : 1000.0;
+  }
+  const double rs = bytes / bps, pf = (double)((size_t)e.n - ram_n) / tps;
+  const bool take = rs + 0.25 < pf;  // 0.25 s: restore set-up, estimate slack
+  fprintf(stderr, "%s kvsnap: req %lld: SSD checkpoint %d tokens vs RAM %zu: restore ~%.1fs "
+          "(%.0f MB) vs prefill ~%.1fs -> %s\n", log_ts(), req, e.n, ram_n, rs,
+          bytes / 1048576.0, pf, take ? "SSD" : "RAM");
+  return take;
 }
 
 // ---- restore -----------------------------------------------------------------
@@ -1245,7 +1462,7 @@ static bool restore(GpuModel& m, const std::shared_ptr<CkEnt>& e,
     std::lock_guard<std::mutex> lk(g_mtx);
     e->busy--;
     if (rc == RS_OK) {
-      touch_locked(e);
+      hit_locked(e);
     } else if (rc == RS_CKPT) {
       drop_ck_locked(e, true);
     } else if (rc == RS_PAGE) {
@@ -1267,6 +1484,11 @@ static bool restore(GpuModel& m, const std::shared_ptr<CkEnt>& e,
     return false;
   }
   hist.assign(prompt.begin(), prompt.begin() + e->n);
+  if (tm.bytes >= (64ull << 20) && s > 0) {  // restore throughput (prefer_over_ram)
+    std::lock_guard<std::mutex> lk(g_mtx);
+    const double bps = tm.bytes / s;
+    g_rs_bps = g_rs_bps > 0 ? 0.7 * g_rs_bps + 0.3 * bps : bps;
+  }
   // ckpt = checkpoint read + verify; pages read/verify on the prefetch thread;
   // io wait = GPU thread waiting for pages; device = H2D + derived-state rebuild
   fprintf(stderr,
@@ -1384,6 +1606,9 @@ static void init(GpuModel& m, Cfg& cfg) {
   g_readers = std::max(1, std::min(cfg.readers, 32));
   g_writers = std::max(1, std::min(cfg.writers > 0 ? cfg.writers : remote ? 4 : 1, 32));
   g_direct = cfg.direct;
+  g_rs_bps0 = remote ? 0.15e9 : 2e9;
+  g_hot_hits = std::max(0, cfg.hot_hits);
+  g_hot_frac = std::max(0.0, std::min(1.0, cfg.hot_frac));
   g_fp = fingerprint(m);
   g_vis_id = g_vision_file.empty() ? 0 : file_id(g_vision_file);
   struct Ck {
@@ -1399,7 +1624,8 @@ static void init(GpuModel& m, Cfg& cfg) {
     std::error_code e2;
     const std::string fn = de.path().filename().string();
     if (!fn.rfind("tmp_", 0)) {
-      if (own_name(fn.substr(4)) && de.is_regular_file(e2)) fs::remove(de.path(), e2);
+      if ((own_name(fn.substr(4)) || fn.substr(4) == HITS_FILE) && de.is_regular_file(e2))
+        fs::remove(de.path(), e2);
     } else if (!fn.rfind("s_", 0) && de.is_directory(e2) &&
                fs::is_regular_file(de.path() / "meta", e2)) {
       fs::remove_all(de.path(), e2);  // KVS1-3 whole-state snapshots
@@ -1436,6 +1662,7 @@ static void init(GpuModel& m, Cfg& cfg) {
     for (auto& t : th) t.join();
   }
   const double ck_s = secs_since(tc);
+  const std::unordered_map<std::string, int> hits = read_hits();
   std::unique_lock<std::mutex> lk(g_mtx);
   for (auto& c : cks) {
     if (!c.e) {
@@ -1446,6 +1673,10 @@ static void init(GpuModel& m, Cfg& cfg) {
     }
     const auto& e = c.e;
     e->t = c.t;
+    if (auto h = hits.find(e->name); h != hits.end()) {
+      e->hits = h->second;
+      e->hot = g_hot_hits > 0 && e->hits >= g_hot_hits;
+    }
     bool whole = true;
     for (uint64_t k : e->chunks) whole = whole && g_ch.count(k);
     if (!whole) {
@@ -1475,6 +1706,8 @@ static void init(GpuModel& m, Cfg& cfg) {
       }
     }
   evict_locked(nullptr);
+  size_t nhot = 0;
+  for (auto& e : g_ck) nhot += e->hot;
   lk.unlock();  // writer not started, no request yet: the index is ours alone
   flush_log();
   if (legacy)
@@ -1483,10 +1716,10 @@ static void init(GpuModel& m, Cfg& cfg) {
   if (bad || orphans)
     fprintf(stderr, "kvsnap: removing %zu unusable and %zu unreferenced files\n", bad,
             orphans);
-  fprintf(stderr, "kvsnap: index %zu checkpoints, %zu pages, %zu mtp sections, %.2f GB "
-          "(cap %.1f GB, queue %.0f MB, %s, %d readers, %d writers; scanned in %.2fs: "
+  fprintf(stderr, "kvsnap: index %zu checkpoints (%zu hot), %zu pages, %zu mtp sections, "
+          "%.2f GB (cap %.1f GB, queue %.0f MB, %s, %d readers, %d writers; scanned in %.2fs: "
           "listing %.2fs, %zu checkpoint headers %.2fs)\n",
-          g_ck.size(), g_ch.size(), g_mt.size(), g_total / 1073741824.0,
+          g_ck.size(), nhot, g_ch.size(), g_mt.size(), g_total / 1073741824.0,
           g_cap / 1073741824.0, g_qcap / 1048576.0, remote ? "network" : "local",
           g_readers, g_writers, secs_since(ti), list_s, cks.size(), ck_s);
   g_on = true;
@@ -3064,6 +3297,20 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       cont = false;
       n_cached = 0;
     }
+    // Below the live slot: the RAM tier (rckpt), then the SSD tier
+    // (kvsnap). The SSD match (index only, no IO) is looked up first: when
+    // it covers a much longer prefix than the best RAM checkpoint, restoring
+    // it beats prefilling the difference (kvsnap::prefer_over_ram).
+    const bool is_mrope = !g.mrope_grids.empty();
+    const uint64_t req_ih = is_mrope && !cont ? fnv1a_patches(vpatches) : 0;
+    std::shared_ptr<kvsnap::CkEnt> ssd_ck;  // busy until restored or released
+    if (!cont && !kvs.dir.empty())
+      // M-RoPE requests: placeholder ids are pixel-agnostic, so the vision
+      // tower, grids and patch-bytes hash are folded into the page-key seed;
+      // a different image is simply a cache miss. + the text prefix of a
+      // vision prompt (g_fp).
+      ssd_ck = kvsnap::match(g.ids, kvsnap::seed_for(is_mrope, req_ih, g.mrope_grids),
+                             kvsnap::g_fp);
     if (!cont && rckpt::enabled()) {
       // RAM checkpoint tier (llama.cpp-style PARTIAL_ONLY): only GDN
       // state is stored; validity requires the checkpoint tokens to be a
@@ -3072,11 +3319,13 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       // its pages, any slot may restore it). B0: the pinned pages include
       // the MTP layer, so a checkpoint saved with the MTP layer in lockstep
       // restores it too and speculation stays available.
-      const bool is_mrope = !g.mrope_grids.empty();
-      const uint64_t req_ih = is_mrope ? fnv1a_patches(vpatches) : 0;
       auto r0 = std::chrono::steady_clock::now();
       int ci = rckpt::match(g.ids, m.chist, is_mrope,
                             is_mrope ? &g.mrope_grids : nullptr, req_ih);
+      if (ci >= 0 && ssd_ck &&
+          kvsnap::prefer_over_ram(*ssd_ck, rckpt::length(ci), rckpt::has_mtp(ci),
+                                  (long long)g.req))
+        ci = -1;
       bool ck_mtp = false;
       if (ci >= 0 && rckpt::restore(m, ci, &hist, &ck_mtp)) {
         mcp = hist.size();
@@ -3090,25 +3339,22 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
                 log_ts(), mcp, rs, ck_mtp ? " (mtp live)" : "");
       }
     }
-    if (!cont && !kvs.dir.empty()) {
-      // SSD tier. M-RoPE requests: placeholder ids are pixel-agnostic, so
-      // the vision tower, grids and patch-bytes hash are folded into the
-      // page-key seed; a different image is simply a cache miss. A
-      // checkpoint saved with the MTP layer in lockstep restores it too.
-      const bool is_mrope = !g.mrope_grids.empty();
-      const uint64_t req_ih = is_mrope ? fnv1a_patches(vpatches) : 0;
-      auto ck = kvsnap::match(g.ids, kvsnap::seed_for(is_mrope, req_ih, g.mrope_grids),
-                              kvsnap::g_fp);  // + the text prefix of a vision prompt
+    if (ssd_ck && cont) {  // the RAM tier won: drop the SSD match
+      kvsnap::release(ssd_ck);
+      ssd_ck.reset();
+    }
+    if (ssd_ck) {
+      // SSD tier. A checkpoint saved with the MTP layer in lockstep restores
+      // it too. restore() releases the match.
+      std::shared_ptr<kvsnap::CkEnt> ck = std::move(ssd_ck);
       bool ck_mtp = false;
-      if (ck) {
-        if (kvsnap::restore(m, ck, g.ids, hist, &ck_mtp)) {  // hist := its tokens
-          mcp = hist.size();
-          cont = true;
-          n_cached = (int)mcp;
-          mtp_live = ck_mtp;
-        } else {
-          hist.clear();  // live state undefined after a failed restore
-        }
+      if (kvsnap::restore(m, ck, g.ids, hist, &ck_mtp)) {  // hist := its tokens
+        mcp = hist.size();
+        cont = true;
+        n_cached = (int)mcp;
+        mtp_live = ck_mtp;
+      } else {
+        hist.clear();  // live state undefined after a failed restore
       }
     }
     if (!cont) m.reset_state();
@@ -3399,6 +3645,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     double pre_ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0)
                         .count();
+    kvsnap::note_prefill(g.ids.size() - (size_t)std::max(0, n_cached), pre_ms);
     // Phase 1: snapshot only at end-of-turn. This removes the first-token
     // stall while the full asynchronous capture path is being designed.
     // prompt-end RAM checkpoint (cheap, deduped)
@@ -3474,11 +3721,26 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     int pause_tok = -1;
     float pause_lp = 0.0f;
     int spec_r = 0, spec_c = 0, spec_p = 0;
+    // The one pause checkpoint per turn that also goes to the SSD tier (from
+    // its RAM copy, at the end of the turn: kvsnap::capture_ram), so a
+    // re-rendered reply still resumes inside it after a restart or RAM
+    // eviction. The first pause on g.ckpt[0] -- the API sends <tool_call>
+    // first, and a re-serialized tool call is where a re-rendered reply
+    // usually stops matching (later pauses sit past it) -- else the last one.
+    size_t ssd_pause_n = 0;
+    bool ssd_pause_fixed = false;
+    auto note_pause = [&](size_t n, int tok) {
+      if (ssd_pause_fixed) return;
+      ssd_pause_n = n;
+      ssd_pause_fixed = !g.ckpt.empty() && tok == g.ckpt[0];
+    };
     auto ckpt_pause = [&](bool mtp_ok) -> bool {
       hist.assign(m.chist.begin(), m.chist.end());
-      if (rckpt::save(m, hist, mtp_ok && mtp_live))
+      if (rckpt::save(m, hist, mtp_ok && mtp_live)) {
         fprintf(stderr, "%s ckpt: saved %zu tokens (before token %d, req %lld)\n",
                 log_ts(), hist.size(), pause_tok, (long long)g.req);
+        note_pause(hist.size(), pause_tok);
+      }
       if (!send_tok(pause_tok, g.sample && g.logprobs, pause_lp)) return false;
       if (g.sample) smp.remember(pause_tok);  // the loop's sampler view is gone
       dl_tick();
@@ -3671,9 +3933,11 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
           // Serial decode advances one token at a time: checkpoint right
           // after a ckpt token (mtp is stale on this path).
           if (!ckpt_toks.empty() && ckpt_toks.count(fed) &&
-              rckpt::save(m, hist, false))
+              rckpt::save(m, hist, false)) {
             fprintf(stderr, "%s ckpt: saved %zu tokens (after token %d, req %lld)\n",
                     log_ts(), hist.size(), fed, (long long)g.req);
+            note_pause(hist.size(), fed);
+          }
           if (g.sample) {
             m.get_logits(lbuf);
             cur = smp.sample(lbuf, &cur_lp);
@@ -3772,7 +4036,10 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // the cut captures (new pages + MTP sections + checkpoints go to the
     // background writer). Cancelled turns are valid too -- hist tracks
     // exactly the ingested tokens. The MTP layer is saved only when live.
+    // + this turn's SSD pause checkpoint (QWENOX_KVSNAP_PAUSE=0: none).
     if (!kvs.dir.empty()) {
+      if (kvs.pause_ckpt && ssd_pause_n >= kvs.min_tokens)
+        kvsnap::capture_ram(m, hist, ssd_pause_n, pend);
       if (hist.size() >= kvs.min_tokens) kvsnap::capture(m, hist, mtp_live, pend);
       kvsnap::commit(m, hist, pend);
     }
@@ -4138,6 +4405,9 @@ static int run(GpuModel& m, const std::string& host, int port) {
   if (const char* v = getenv("QWENOX_KVSNAP_DIRECT")) kvs.direct = strcmp(v, "0") != 0;
   if (const char* v = getenv("QWENOX_KVSNAP_READERS")) kvs.readers = atoi(v);
   if (const char* v = getenv("QWENOX_KVSNAP_WRITERS")) kvs.writers = atoi(v);
+  if (const char* v = getenv("QWENOX_KVSNAP_HOT_HITS")) kvs.hot_hits = atoi(v);
+  if (const char* v = getenv("QWENOX_KVSNAP_HOT_FRAC")) kvs.hot_frac = atof(v);
+  if (const char* v = getenv("QWENOX_KVSNAP_PAUSE")) kvs.pause_ckpt = strcmp(v, "0") != 0;
   if (!kvs.dir.empty()) {
     fprintf(stderr, "kvsnap: dir %s, cap %.1f GB, min %zu tokens, %s IO\n",
             kvs.dir.c_str(), kvs.cap_bytes / 1073741824.0, kvs.min_tokens,
