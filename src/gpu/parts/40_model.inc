@@ -7701,6 +7701,10 @@ struct GpuModel {
     int g;
     int tok0;
     int* drafts;  // worker stack
+    // C7 (sampled drafts): called by the executor after step j with this
+    // member's raw logits row (device); sets tok to the drawn draft, returns
+    // false to stop after this step. nullptr = greedy (device argmax).
+    const std::function<bool(int, const float*, int&)>* step = nullptr;
   };
 
   // D2-S1c: the multi-segment verify chunk. Guards (any failure -> false, the
@@ -8471,19 +8475,23 @@ struct GpuModel {
     if (!d_tokmat) DALLOC(&d_tokmat, 64 * sizeof(int));
     const int rb = g_cfg.branches * g_cfg.d;
     int lists[8][8];  // step j's member seg indices (submission order)
-    int ln[8];
+    int ln[8] = {};
+    int gcur[8];      // steps each member still runs (a sampled member may stop early)
+    int stok[8][8];   // sampled draws, host copy (lives until the final D2H)
+    for (int i = 0; i < n; i++) gcur[i] = segs[i].g;
     for (int j = 0; j < gmax; j++) {
       int cur[8], prow[8], B = 0;
       if (j == 0) {
         for (int i = 0; i < n; i++) { cur[B] = i; prow[B] = -1; B++; }
       } else {
         for (int r = 0; r < ln[j - 1]; r++)
-          if (segs[lists[j - 1][r]].g > j) {
+          if (gcur[lists[j - 1][r]] > j) {
             cur[B] = lists[j - 1][r];
             prow[B] = r;
             B++;
           }
       }
+      if (B == 0) break;  // every member stopped
       for (int r = 0; r < B; r++) lists[j][r] = cur[r];
       ln[j] = B;
       // mtp_step's per-slot prologue: map the MTP KV row, upload the position
@@ -8549,6 +8557,17 @@ struct GpuModel {
         if (j == 0)
           CK(hipMemcpyAsync(slot_d_mring_ckpt(s), slot_d_miraw(s), 512 * 4,
                             hipMemcpyDeviceToDevice, g_str));
+      }
+      // C7: sampled members draw on the host from their own row (same logits
+      // as the serial mtp_step: row-invariant kernels), then the draw replaces
+      // the argmax in the token matrix that step j+1 gathers from.
+      for (int r = 0; r < B; r++) {
+        const DrSeg& sg = segs[cur[r]];
+        if (!sg.step) continue;
+        if (!(*sg.step)(j, d_logits_b + (size_t)r * g_cfg.vocab, stok[j][r]))
+          gcur[cur[r]] = j + 1;
+        CK(hipMemcpyAsync(d_tokmat + j * 8 + r, &stok[j][r], 4, hipMemcpyHostToDevice,
+                          g_str));
       }
     }
     int host[64];
@@ -10696,7 +10715,26 @@ struct GpuModel {
     // QWENOX_VR_SAMPLE=0 keeps sampled requests out of the rendezvous.
     static const bool vr_sample = !env_zero("QWENOX_VR_SAMPLE");
     const bool vr_on = vr_sample && mtp_ok && vseg_pool_fn != nullptr;
-    OccGamma occ(true, nslots, false, seeded);  // sampled drafts: serial per slot
+    // C7: MTP draft bursts go to the draft rendezvous pool too (one batched
+    // MTP layer + lm_head pass per step; each member draws on the host from
+    // its own row, see DrSeg::step). Same membership discipline as the
+    // verify pool: the whole loop counts, ngram rounds and serial steps
+    // excuse themselves. QWENOX_DR_SAMPLE=0 keeps the serial per-slot burst.
+    static const bool dr_sample = !env_zero("QWENOX_DR_SAMPLE");
+    const bool dr_on = dr_sample && mtp_ok && dr_round_enter_fn && dr_worker_ok();
+    OccGamma occ(true, nslots, dr_on, seeded);
+    struct DrLoopS {
+      GpuModel& m;
+      bool on;
+      DrLoopS(GpuModel& m, bool on) : m(m), on(on) { if (on) m.dr_round_enter(); }
+      ~DrLoopS() { if (on) m.dr_round_exit(); }
+    } dr_loop(*this, dr_on);
+    struct DrExcuseS {
+      GpuModel& m;
+      bool on;
+      DrExcuseS(GpuModel& m, bool on) : m(m), on(on) { if (on) m.dr_round_exit(); }
+      ~DrExcuseS() { if (on) m.dr_round_enter(); }
+    };
     struct VrLoopS {
       GpuModel& m;
       bool on;
@@ -10753,6 +10791,7 @@ struct GpuModel {
       if (!draft.empty() && ng_legacy) {
         // ---- ngram round: long draft, whole-state checkpoint + replay ----
         VrExcuseS vr_x(*this, vr_on);
+        DrExcuseS dr_x(*this, dr_on);
         const int base = pos;
         const size_t history_size = chist.size();
         if (mtp_ok)
@@ -10865,6 +10904,7 @@ struct GpuModel {
         // walks rows in draft order across chunks, so the draw stream matches
         // the single-pass form; tokens emit per chunk (see the greedy chain).
         VrExcuseS vr_x(*this, vr_on);
+        DrExcuseS dr_x(*this, dr_on);
         if (mtp_ok)
           // Stash h_{base-1} (d_R) for the per-chunk MTP patch below.
           CK(hipMemcpyAsync(d_mtap, d_R, 10240 * 4, hipMemcpyDeviceToDevice,
@@ -11020,26 +11060,36 @@ struct GpuModel {
         std::vector<typename Sampler::SDist> q_sd(smg ? gd : 0);
         std::vector<char> q_sparse(gd, 0);
         rp_lap(RP_PRE);
-        for (int j = 0; j < gd; j++) {
+        // Draw draft j from its logits row. src: d_logits after the serial
+        // mtp_step, a batched step's row of d_logits_b (C7), or nullptr when
+        // the serial dense mtp_step already filled q_rows[j]. False = stop
+        // drafting after this step (QWENOX_SPEC_CONF), g = j + 1.
+        auto draw = [&](int j, const float* src) -> bool {
           bool dense = true;
           if (smg) {
-            mtp_step(j ? d_mR : d_R, j ? drafts[j - 1] : cur, nullptr, false);
-            if (sms_topk_rows(d_logits, g_cfg.vocab, 1, sampler.top_k, false,
+            // A batched step runs between peers' rounds: re-upload this
+            // request's correction lists first (no-op without bias/penalties).
+            if (src != d_logits) sms_round_shared(sampler);
+            if (sms_topk_rows(const_cast<float*>(src), g_cfg.vocab, 1, sampler.top_k, false,
                               sms_out_ids.data(), sms_out_vals.data())) {
               dense = false;
             } else {
-              // Candidate overflow: regenerate the raw row, then go dense.
-              gemv(dlm_on ? w_dlm : wview(ckpt.at("lm_head.weight")), d_x,
-                   d_logits);
+              // Candidate overflow: go dense on the raw row (sms_topk_rows
+              // only reads it; the serial path regenerates it as before).
+              if (src == d_logits)
+                gemv(dlm_on ? w_dlm : wview(ckpt.at("lm_head.weight")), d_x, d_logits);
               q_rows[j].resize(g_cfg.vocab);
-              CK(hipMemcpy(q_rows[j].data(), d_logits,
-                           (size_t)g_cfg.vocab * 4, hipMemcpyDeviceToHost));
+              CK(hipMemcpy(q_rows[j].data(), src, (size_t)g_cfg.vocab * 4,
+                           hipMemcpyDeviceToHost));
             }
-          } else {
-            mtp_step(j ? d_mR : d_R, j ? drafts[j - 1] : cur, &q_rows[j]);
+          } else if (src) {
+            q_rows[j].resize(g_cfg.vocab);
+            CK(hipMemcpy(q_rows[j].data(), src, (size_t)g_cfg.vocab * 4,
+                         hipMemcpyDeviceToHost));
           }
           // Provisional drafts stay out of the penalty history (as
           // spec_loop_sample): q_rows[j]/q_sd[j] records the distribution.
+          // (QWENOX_SMS_CHECK compares against d_logits: serial path only.)
           if (dense) {
             draft_sampler.prepare(q_rows[j]);
             drafts[j] =
@@ -11050,15 +11100,41 @@ struct GpuModel {
                 draft_sampler.draw_sparse(q_sd[j], &draft_lps[j], false);
             q_sparse[j] = 1;
           }
+          if (spec_conf_stop(j, g, q_sparse[j] ? &q_sd[j].pr : nullptr, q_rows[j])) {
+            g = j + 1;
+            return false;
+          }
+          return true;
+        };
+        // C7: one batched pass per step across the rendezvous members (the
+        // executor calls draw on our row; logits are the serial ones bit for
+        // bit, so seeded output does not depend on batching); false = this
+        // round keeps the serial burst below.
+        bool dr_done = false;
+        if (dr_on) {
+          const std::function<bool(int, const float*, int&)> step =
+              [&](int j, const float* row, int& tok) {
+                const bool more = draw(j, row);
+                tok = drafts[j];
+                return more;
+              };
+          dr_done = dr_pool_fn(*this, DrSeg{bound_, gd, cur, drafts.data(), &step});
+          // peers ran while we waited: restore our lists for the verify below
+          if (dr_done && smg) sms_round_shared(sampler);
+        }
+        if (!dr_done)
+        for (int j = 0; j < gd; j++) {
+          if (smg)
+            mtp_step(j ? d_mR : d_R, j ? drafts[j - 1] : cur, nullptr, false);
+          else
+            mtp_step(j ? d_mR : d_R, j ? drafts[j - 1] : cur, &q_rows[j]);
+          const bool more = draw(j, smg ? d_logits : nullptr);
           if (j == 0) {
             // Draft 1's indexer ring rows are truth; later drafts pollute.
             CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4,
                               hipMemcpyDeviceToDevice, g_str));
           }
-          if (spec_conf_stop(j, g, q_sparse[j] ? &q_sd[j].pr : nullptr, q_rows[j])) {
-            g = j + 1;
-            break;
-          }
+          if (!more) break;
         }
         rp_lap(RP_DRAFT);
         std::vector<int> vt;
@@ -11263,6 +11339,7 @@ struct GpuModel {
       } else {
         // ---- no draft, no MTP: plain serial sampling step ----
         VrExcuseS vr_x(*this, vr_on);
+        DrExcuseS dr_x(*this, dr_on);
         ++fallback;
         forward(cur);
         if (!ple_on) chist.push_back(cur);

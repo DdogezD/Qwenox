@@ -2972,6 +2972,7 @@ struct DrReq {
   int g;
   int tok0;
   int* drafts;                 // worker stack; room for g ints
+  const std::function<bool(int, const float*, int&)>* step = nullptr;  // C7 sampled
   bool done = false;
   bool dropped = false;        // abort/guard refusal -> worker serial rerun
 };
@@ -3027,7 +3028,7 @@ static void dr_execute(GpuModel& m) {
       std::lock_guard<std::mutex> lk(g_sm);
       if (g_slots[(size_t)r->slot].abort) { r->dropped = true; continue; }
     }
-    segs.push_back(GpuModel::DrSeg{r->slot, r->g, r->tok0, r->drafts});
+    segs.push_back(GpuModel::DrSeg{r->slot, r->g, r->tok0, r->drafts, r->step});
   }
   // Guard refusal (incl. a borrow window being up: mtp_draft_batch rejects
   // ws_lent_) -> every worker re-runs its own serial burst.
@@ -3062,7 +3063,7 @@ static bool dr_pool(GpuModel& m, const GpuModel::DrSeg& self) {
     std::lock_guard<std::mutex> lk(g_dr.mu);
     if (g_dr.active <= 1) return false;  // sole decoder: keep the serial path
   }
-  DrReq req{self.slot, self.g, self.tok0, self.drafts, false, false};
+  DrReq req{self.slot, self.g, self.tok0, self.drafts, self.step, false, false};
   bool am_exec = false;
   {
     std::lock_guard<std::mutex> lk(g_dr.mu);

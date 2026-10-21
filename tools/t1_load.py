@@ -4,6 +4,8 @@
 # [syncprof] 行写在引擎日志里，用 tools/t1_parse.py 汇总。纯 stdlib。
 #
 # 用法：python3 tools/t1_load.py --conc 4 --rpw 2 [--max-tokens 512] [--base-url ...]
+#       [--seed 1000 --out res.json]   带 seed（每题 seed+题号）并把各题输出写成 JSON，
+#                                       供不同并发 / 开关下逐字对比（tools/c7_verify.sh）
 
 import argparse
 import json
@@ -24,9 +26,11 @@ PROMPTS = [
 ]
 
 
-def chat(base, prompt, max_tokens, timeout):
+def chat(base, prompt, max_tokens, timeout, seed=None):
     body = {"model": "default", "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens, "stream": False}
+    if seed is not None:
+        body["seed"] = seed
     req = urllib.request.Request(base.rstrip("/") + "/v1/chat/completions",
                                  data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
@@ -41,18 +45,25 @@ def main():
     ap.add_argument("--rpw", type=int, default=2, help="每路请求数")
     ap.add_argument("--max-tokens", type=int, default=512)
     ap.add_argument("--timeout", type=float, default=900)
+    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--out", default=None)
     a = ap.parse_args()
     res, lock = [], threading.Lock()
+    outs = {}
     bar = threading.Barrier(a.conc)
 
     def worker(w):
         bar.wait()
         for r in range(a.rpw):
-            p = PROMPTS[(w + r * a.conc) % len(PROMPTS)]
+            pi = (w + r * a.conc) % len(PROMPTS)
+            p = PROMPTS[pi]
             t0 = time.time()
             try:
-                n = (chat(a.base_url, p, a.max_tokens, a.timeout).get("usage") or {}).get(
-                    "completion_tokens", 0)
+                j = chat(a.base_url, p, a.max_tokens, a.timeout,
+                         None if a.seed is None else a.seed + pi)
+                n = (j.get("usage") or {}).get("completion_tokens", 0)
+                with lock:
+                    outs[str(pi)] = (j.get("choices") or [{}])[0].get("message")
                 err = None
             except Exception as e:  # noqa: BLE001
                 n, err = 0, str(e)
@@ -70,6 +81,9 @@ def main():
     fails = [r for r in res if r[3]]
     for f in fails:
         print("FAIL", f)
+    if a.out:
+        with open(a.out, "w", encoding="utf-8") as f:
+            json.dump(outs, f, ensure_ascii=False, indent=1, sort_keys=True)
     print(f"C{a.conc}: {len(res)} req, {tok} tokens in {wall:.1f} s = {tok / wall:.1f} tok/s")
     print("T1_LOAD", "PASS" if not fails and tok > 0 else "FAIL")
     sys.exit(0 if not fails and tok > 0 else 1)
