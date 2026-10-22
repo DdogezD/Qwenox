@@ -731,6 +731,11 @@ std::string build(const Opts& o, std::string* err) {
             if (err) *err = "rename failed: " + ec.message();
             return {};
         }
+        {  // 绝对路径（托盘在资源管理器里选中它、HTTP 返回给调用方）
+            std::error_code ae;
+            const fs::path ab = fs::absolute(fs::path(path), ae).lexically_normal();
+            if (!ae) path = fs::path(ab).make_preferred().string();
+        }
         // 只留最近 kKeepPacks 个
         auto packs = list_files(dir, [](const std::string& n) { return valid_name(n); });
         for (size_t k = kKeepPacks; k < packs.size(); k++) fs::remove(fs::path(packs[k].path), ec);

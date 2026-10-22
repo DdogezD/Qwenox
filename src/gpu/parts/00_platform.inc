@@ -144,6 +144,7 @@ using hgn::Tensor;
 //                              处理器、打印环境后立刻崩，不加载模型）
 // 也可直接运行 qwenox-engine --crash-test <kind>（同 start）。
 [[maybe_unused]] static void crash_test_now(const char* kind) {
+  crashdiag::rearm();  // HIP 初始化时 amd_comgr 的 LLVM 会抢走顶层异常过滤器
   if (!strcmp(kind, "hipfatal")) {
     CK(hipSetDevice(9999));
     return;

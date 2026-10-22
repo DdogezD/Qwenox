@@ -3267,6 +3267,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
             (long long)g.req, s, hist.size());
   crashdiag::note("req %lld -> slot %d (live %zu, prompt %zu, max %d, %s)", (long long)g.req, s,
                   hist.size(), g.ids.size(), g.max_tokens, g.sample ? "sampled" : "greedy");
+  crashdiag::rearm();
   crash_test_point("gen");
   try {
     // KV reuse: longest common prefix of live state and this prompt.

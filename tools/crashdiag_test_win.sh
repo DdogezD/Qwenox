@@ -19,6 +19,7 @@ E=build/qwenox-engine-win.exe
 A=build/qwenox-win.exe
 T=build/.crashdiag-test
 PY="$(command -v python || command -v python3 || true)"
+export PYTHONIOENCODING=utf-8  # 中文系统默认 GBK，管道里的检查结果会乱码
 [[ -x "$E" && -x "$A" ]] || { echo "先运行 bash build_win.sh all（缺 $E 或 $A）"; echo "CRASHDIAG WIN TEST: FAIL"; exit 1; }
 [[ -n "$PY" ]] || { echo "需要 python（检查 zip 内容）"; echo "CRASHDIAG WIN TEST: FAIL"; exit 1; }
 rm -rf "$T"
@@ -51,14 +52,14 @@ for kind in write thread stack abort throw fatal hipfatal; do
       if grep -a '^thread:' "$rep" | grep -q 'main thread'; then bad "$kind: 应记为工作线程"; else ok "$kind: 记为工作线程"; fi ;;
     stack) has "$kind: 栈溢出" "$rep" 'EXCEPTION_STACK_OVERFLOW' ;;
     abort) has "$kind: abort" "$rep" 'kind: abort' ;;
-    throw) has "$kind: 未捕获异常" "$rep" 'uncaught C\+\+ exception' ;;
+    throw) has "$kind: 未捕获异常及其内容" "$rep" '(uncaught C\+\+ exception|last C\+\+ exception thrown:).*crashdiag self-test: uncaught exception' ;;
     fatal) has "$kind: fatal" "$rep" 'kind: fatal' ;;
     hipfatal)
       has "$kind: HIP 错误" "$rep" 'message: HIP error'
       has "$kind: HIP 环境" "$rep" '^hip: runtime' ;;
   esac
   has "$kind: 出错位置已解析到模块" "$rep" '^pc: 0x[0-9A-F]+ [^ ]+\+0x'
-  has "$kind: 飞行记录" "$rep" 'crashdiag self-test'
+  has "$kind: 飞行记录" "$rep" 'crashdiag installed'
   has "$kind: 环境快照（显卡驱动）" "$rep" '^gpu: '
   has "$kind: 模块表" "$rep" 'amdhip64'
   if [[ -n "$dmp" && "$(head -c 4 "$dmp")" == "MDMP" ]]; then
@@ -156,8 +157,8 @@ if d:
         chk("诊断包可读（%s）" % e, False)
 EOF
 )"
-      echo "$out" | grep -E '^  (PASS|FAIL)'
-      fails=$((fails + $(echo "$out" | grep -c '^  FAIL')))
+      echo "$out" | grep -a -E '^  (PASS|FAIL)'
+      fails=$((fails + $(echo "$out" | grep -a -c '^  FAIL')))
       c_log="$(echo "$out" | sed -n 's/^LOG //p')"
       c_diag="$(echo "$out" | sed -n 's/^DIAG //p')"
       c_pid="$(echo "$out" | sed -n 's/^PID //p')"

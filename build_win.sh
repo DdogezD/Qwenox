@@ -176,13 +176,14 @@ run_parallel() {
 # 调试符号（PDB）：崩溃时的 minidump / 崩溃报告里的 "模块+偏移" 要靠同一次编译的
 # PDB 才能还原成函数名和源码行。只给主机代码加 -g（-Xarch_host；GPU kernel 不受
 # 影响，主机代码生成也不变），链接时 /DEBUG 生成 build/<exe 名>.pdb，并显式保留
-# /OPT:REF,ICF（/DEBUG 默认会关掉它们）。PDB 不进用户分发包，发版时用
+# /OPT:REF,ICF（/DEBUG 默认会关掉它们；写成大写 -OPT:：hipcc 的 clang-linker-wrapper
+# 会把小写 -opt:ref 拆成 "-o pt:ref"）。PDB 不进用户分发包，发版时用
 # tools/pack_symbols_win.sh 另存。QWENOX_PDB=0 不生成。
 PDB_ON=1
 [[ "${QWENOX_PDB:-1}" == 0 ]] && PDB_ON=0
 pdb_link() {  # $1 = pdb 路径；输出链接器参数（逐行）
     (( PDB_ON )) || return 0
-    printf '%s\n' -Xlinker -debug -Xlinker "-pdb:$1" -Xlinker -opt:ref -Xlinker -opt:icf
+    printf '%s\n' -Xlinker -DEBUG -Xlinker "-PDB:$1" -Xlinker -OPT:REF -Xlinker -OPT:ICF
 }
 
 build_engine() {

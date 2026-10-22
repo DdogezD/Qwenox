@@ -48,6 +48,10 @@
 #include <windows.h>
 #include <dbghelp.h>
 #include <csignal>
+// 注册表（驱动版本 / TDR / 系统版本）；dbghelp / version / powrprof 运行时动态加载
+#ifdef _MSC_VER  // TheRock clang（MSVC 目标）与 MSVC；mingw 目标由链接命令自带
+#pragma comment(lib, "advapi32")
+#endif
 #else
 #include <dirent.h>
 #include <dlfcn.h>
@@ -463,6 +467,7 @@ inline DWORD g_writer_tid = 0;
 inline char g_buf[64 * 1024];
 inline char g_mirror[256 * 1024];
 inline void put_first_chance(Out& o);  // 定义在 veh 旁
+inline void put_cxx(Out& o);
 inline char g_stamp[32];
 
 inline const char* exc_name(DWORD c) {
@@ -783,6 +788,7 @@ inline void win_write_report() {
     if (g_wc.first_chance) o.s("  (written at first chance: this code cannot be handled)");
     o.nl();
     if (g_wc.why[0]) o.s("message: ").s(g_wc.why).nl();
+    put_cxx(o);
     put_thread(o, g_wc.tid);
     if ((er.ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
          er.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) &&
@@ -923,8 +929,59 @@ inline void report_from(EXCEPTION_POINTERS* ep, const char* kind, bool first_cha
   hand_to_writer();
 }
 
+// 最近一次抛出的 C++ 异常（MSVC ABI 异常码 0xE06D7363）：类型名 + what()。
+// MSVC 的 terminate 处理器是每线程的，工作线程里没接住的异常直接 abort，
+// 报告靠这里给出是哪个异常。
+struct CxxThrow {
+  uint64_t t_us;
+  uint32_t tid;
+  char type[96];
+  char what[256];
+};
+inline CxxThrow g_cxx;
+inline volatile LONG g_cxx_n = 0;
+inline void note_cxx_throw(const EXCEPTION_RECORD& er) {
+  // ExceptionInformation: [0] 魔数 0x19930520..22  [1] 异常对象  [2] ThrowInfo  [3] 映像基址
+  if (er.NumberParameters < 4 || (er.ExceptionInformation[0] & ~ULONG_PTR(3)) != 0x19930520)
+    return;
+  const unsigned char* base = reinterpret_cast<const unsigned char*>(er.ExceptionInformation[3]);
+  const unsigned char* obj = reinterpret_cast<const unsigned char*>(er.ExceptionInformation[1]);
+  const int32_t* ti = reinterpret_cast<const int32_t*>(er.ExceptionInformation[2]);
+  if (!base || !ti) return;
+  CxxThrow c{};
+  c.t_us = wall_us();
+  c.tid = GetCurrentThreadId();
+  int32_t cta_rva = 0, n = 0;
+  if (!rd(ti + 3, &cta_rva, 4) || !cta_rva || !rd(base + cta_rva, &n, 4)) return;
+  for (int32_t k = 0; k < n && k < 16; k++) {
+    int32_t ct_rva = 0;
+    if (!rd(base + cta_rva + 4 + 4 * k, &ct_rva, 4) || !ct_rva) break;
+    int32_t ct[4] = {};  // properties, pType, thisDisplacement.mdisp, ...
+    if (!rd(base + ct_rva, ct, sizeof ct) || !ct[1]) break;
+    char name[96] = {};
+    for (size_t i = 0; i + 1 < sizeof name; i++)  // TypeDescriptor: vftable, spare, name[]
+      if (!rd(base + ct[1] + 16 + i, &name[i], 1) || !name[i]) break;
+    if (k == 0) strncpy(c.type, name, sizeof c.type - 1);  // 最派生的类型
+    if (obj && !strcmp(name, ".?AVexception@std@@")) {
+      const std::exception* e = reinterpret_cast<const std::exception*>(obj + ct[2]);
+      const char* w = e->what();
+      size_t i = 0;
+      for (; w && i + 1 < sizeof c.what; i++)
+        if (!rd(w + i, &c.what[i], 1) || !c.what[i]) break;
+      c.what[i] = 0;
+      break;
+    }
+  }
+  g_cxx = c;
+  InterlockedIncrement(&g_cxx_n);
+}
+
 inline LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
   const DWORD code = ep->ExceptionRecord->ExceptionCode;
+  if (code == 0xE06D7363 && g.installed) {
+    note_cxx_throw(*ep->ExceptionRecord);
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
   if (!is_fatal(code) || !g.installed) return EXCEPTION_CONTINUE_SEARCH;
   if (GetCurrentThreadId() == g_writer_tid) return EXCEPTION_CONTINUE_SEARCH;
   const EXCEPTION_RECORD& er = *ep->ExceptionRecord;
@@ -960,6 +1017,15 @@ inline void rearm() {
   if (!g.installed) return;
   const LPTOP_LEVEL_EXCEPTION_FILTER p = SetUnhandledExceptionFilter(uef);
   if (p && p != uef) g_prev_uef = p;  // 别人后装的（如 LLVM 的）：串在我们后面
+}
+
+inline void put_cxx(Out& o) {
+  if (!g_cxx_n) return;
+  o.s("last C++ exception thrown: ");
+  put_time(o, g_cxx.t_us);
+  o.s(" t").u(g_cxx.tid).s("  ").s(g_cxx.type[0] ? g_cxx.type : "?");
+  if (g_cxx.what[0]) o.s(": ").s(g_cxx.what);
+  o.nl();
 }
 
 inline void put_first_chance(Out& o) {

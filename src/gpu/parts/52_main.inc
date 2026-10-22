@@ -122,6 +122,7 @@ static std::string diag_hip_report() {
     s += b;
   }
   s += crashdiag::module_versions();
+  crashdiag::rearm();  // HIP/comgr 已初始化：把崩溃报告的异常过滤器装回顶层
   return s;
 }
 
