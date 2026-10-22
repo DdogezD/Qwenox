@@ -268,8 +268,13 @@ bundle_api_runtime() {
   require_bundled_lib 'libwebp.so.*'
 }
 
+# 主机代码行号表（-g1，只作用于主机编译，GPU kernel 与代码生成不变）：崩溃报告里的
+# "文件+偏移" 在打诊断包时由 addr2line 还原成函数与源码行。QWENOX_HOST_DEBUG=0 关闭。
+HOST_DEBUG=()
+[[ "${QWENOX_HOST_DEBUG:-1}" == 0 ]] || HOST_DEBUG=(-Xarch_host -g1)
+
 build_engine() {
-  compile "build/$ENGINE_NAME" 8 600 "$HIPCC" -O3 -Werror "${VER_FLAGS[@]}" \
+  compile "build/$ENGINE_NAME" 8 600 "$HIPCC" -O3 -Werror "${VER_FLAGS[@]}" "${HOST_DEBUG[@]}" \
     --offload-arch="$GPU_ARCH" "${NPU_FLAGS[@]}" src/gpu/qwenox.cpp -lrocblas -lhipblaslt \
     "${NPU_LINK[@]}" "${BUNDLE_RPATH[@]}"
 }
@@ -309,7 +314,7 @@ build_api() {
     src/api/chat_template.cpp src/api/json_py.cpp src/api/toolparse.cpp \
     src/api/vision.cpp src/api/reqstat.cpp src/api/reqstat_read.cpp \
     src/api/power.cpp src/api/engine_sup.cpp src/api/snap_cuts.cpp \
-    src/api/reqlog.cpp "$objdir"/miniz.o "$objdir"/miniz_tdef.o \
+    src/api/reqlog.cpp src/api/diagpack.cpp "$objdir"/miniz.o "$objdir"/miniz_tdef.o \
     "$objdir"/miniz_tinfl.o "$objdir"/miniz_zip.o \
     src/api/main.cpp -lpng -ljpeg -lwebp -lpthread || return 1
   compile build/tok_cli 8 120 "$CXX" "${API_FLAGS[@]}" \

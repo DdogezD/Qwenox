@@ -64,6 +64,9 @@ static hipError_t hipMemcpy(void* d, const void* s, size_t n, hipMemcpyKind) {
 static hipError_t hipStreamSynchronize(int) { return hipSuccess; }
 static hipError_t hipGetLastError() { return hipSuccess; }
 #define CK(x) (void)(x)
+namespace crashdiag {  // 飞行记录：桩里不记
+static inline void note(const char*, ...) {}
+}  // namespace crashdiag
 template <class... A>
 static void k_bf16_rows_to_bt(A...) {}
 template <class... A>

@@ -81,6 +81,50 @@ static void lmhead_base_capture(const Checkpoint& ck) {
 }
 
 #if !defined(QWENOX_NO_MAIN)
+// 环境快照写进引擎日志（每行 "[diag] " 前缀）并存进崩溃报告的环境段。
+static void diag_log_env(const char* tag, const std::string& s) {
+  crashdiag::append_env(std::string("[") + tag + "]\n" + s);
+  size_t a = 0;
+  while (a < s.size()) {
+    size_t e = s.find('\n', a);
+    if (e == std::string::npos) e = s.size();
+    fprintf(stderr, "[diag] %.*s\n", (int)(e - a), s.data() + a);
+    a = e + 1;
+  }
+}
+// HIP 运行时/驱动版本、设备属性、显存，及此刻已加载的 GPU 栈模块版本
+// （amd_comgr 等在首次加载 kernel 时才载入，故模型就绪后再记一次）。
+static std::string diag_hip_report() {
+  std::string s;
+  char b[512];
+  int rt = 0, drv = 0, n = 0;
+  (void)hipRuntimeGetVersion(&rt);
+  (void)hipDriverGetVersion(&drv);
+  const hipError_t ce = hipGetDeviceCount(&n);
+  snprintf(b, sizeof b, "hip: runtime %d, driver %d, devices %d%s%s\n", rt, drv, n,
+           ce != hipSuccess ? ", hipGetDeviceCount: " : "",
+           ce != hipSuccess ? hipGetErrorString(ce) : "");
+  s += b;
+  for (int d = 0; d < n && d < 4; d++) {
+    hipDeviceProp_t p{};
+    if (hipGetDeviceProperties(&p, d) != hipSuccess) continue;
+    snprintf(b, sizeof b,
+             "hip-device %d: %s (%s), %.1f GiB, %d CUs, pci %04x:%02x:%02x, integrated %d\n", d,
+             p.name, p.gcnArchName, p.totalGlobalMem / 1073741824.0, p.multiProcessorCount,
+             (unsigned)p.pciDomainID, (unsigned)p.pciBusID, (unsigned)p.pciDeviceID,
+             (int)p.integrated);
+    s += b;
+  }
+  size_t fr = 0, tot = 0;
+  if (n > 0 && hipMemGetInfo(&fr, &tot) == hipSuccess) {
+    snprintf(b, sizeof b, "hip-memory: free %.2f / total %.2f GiB\n", fr / 1073741824.0,
+             tot / 1073741824.0);
+    s += b;
+  }
+  s += crashdiag::module_versions();
+  return s;
+}
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
   if (!wsa_init()) {
@@ -93,6 +137,15 @@ int main(int argc, char** argv) {
     return 0;
   }
   fprintf(stderr, "qwenox-engine %s\n", QWENOX_VERSION_FULL);
+  // 崩溃诊断：处理器 + 启动环境快照（进引擎日志，崩溃报告末尾也附一份）
+  crashdiag::install("engine", QWENOX_VERSION_FULL);
+  diag_log_env("startup", crashdiag::env_report());
+  if (argc >= 3 && strcmp(argv[1], "--crash-test") == 0) {
+    diag_log_env("hip", diag_hip_report());
+    crash_test_now(argv[2]);
+    return 2;  // 未知 kind
+  }
+  crash_test_point("start");
   if (argc < 2) {
     fprintf(stderr,
             "usage: qwenox --version\n"
@@ -444,6 +497,9 @@ int main(int argc, char** argv) {
       m.reset_state();
     }
     memstats_log("ready");
+    diag_log_env("ready", diag_hip_report());
+    crashdiag::note("model ready (maxctx %d, %d slots)", maxctx, eff_parallel());
+    crash_test_point("ready");
     // kvsnap cache identity: the weights (and the vision tower for image
     // prompts) that produced the cached KV
     kvsnap::g_model_files = overlays;

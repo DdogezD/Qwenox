@@ -52,7 +52,9 @@
 #include "../service_conf.h"
 #include "../engine_net.h"
 #include "../version.h"
+#include "../crashdiag.h"
 #include "chat_template.h"
+#include "diagpack.h"
 #include "engine_client.h"
 #include "engine_sup.h"
 #include "http.h"
@@ -1459,6 +1461,7 @@ json engine_status_json() {
     j["external"] = st.external;
     j["detail"] = st.detail;
     j["can_control"] = enginesup::supported();
+    j["diag"] = st.diag;  // 意外退出后自动生成的诊断包（空 = 没有）
     return j;
 }
 
@@ -4722,12 +4725,96 @@ static int gexit(int code) {
     return code;
 }
 
+// ---- 诊断包 -----------------------------------------------------------------
+struct DiagCli {
+    bool on = false;
+    std::string engine_log, api_log, reason;
+    int pid = 0;
+    bool has_exit = false;
+    unsigned long exit_code = 0;
+};
+static DiagCli g_diag_cli;
+
+// 手动导出（托盘菜单 / POST /admin/diag）：引擎在跑时顺带取在线快照（DIAG 动词），
+// 本进程拉起的引擎还写一份在线 minidump（看卡死时各线程停在哪）。
+static std::string make_diag(const std::string& reason, std::string* err) {
+    diagpack::Opts o;
+    o.root = g_conf_root;
+    o.conf_path = g_conf_path;
+    o.reason = reason;
+#ifdef _WIN32
+    o.api_log = g_api_log_abs;
+#endif
+    const enginesup::Status st = enginesup::status(eff_engine_host(), eff_engine_port());
+    o.engine_log = st.log;
+    o.engine_pid = st.pid;
+    o.since_unix = st.start_unix;
+    if (st.state == "exited") {
+        o.has_exit = true;
+        o.exit_code = st.exit_code;
+    }
+    if (st.state == "running") {
+        o.engine_host = eff_engine_host();
+        o.engine_port = eff_engine_port();
+    }
+    if (st.state == "running" && !st.external && enginesup::supported()) {
+        std::error_code ec;
+        std::filesystem::create_directories(diagpack::out_dir(g_conf_root), ec);
+        const std::string dp = diagpack::out_dir(g_conf_root) + "/engine-live.dmp.tmp";
+        std::string e;
+        if (enginesup::write_live_dump(dp, &e))
+            o.live_dump = dp;
+        else
+            fprintf(stderr, "qwenox-api: live engine dump skipped: %s\n", e.c_str());
+    }
+    const std::string p = diagpack::build(o, err);
+    fprintf(stderr, "qwenox-api: diagnostic package (%s): %s\n", reason.c_str(),
+            p.empty() ? ("FAILED: " + (err ? *err : std::string())).c_str() : p.c_str());
+    return p;
+}
+
+// POST /admin/diag — 生成诊断包，返回路径与下载地址
+static void handle_diag_post(const http::Request& q, http::Response* r, http::Stream*) {
+    if (!admin_ok(q))
+        http::fail(401, "admin key required (Authorization: Bearer <key> or X-Admin-Key)");
+    std::string err;
+    const std::string p = make_diag("manual export via HTTP from " + q.remote, &err);
+    if (p.empty()) http::fail(500, err.empty() ? "diagnostic package failed" : err, "server_error");
+    const std::string name = std::filesystem::path(p).filename().string();
+    std::error_code ec;
+    json j;
+    j["path"] = p;
+    j["name"] = name;
+    j["bytes"] = static_cast<uint64_t>(std::filesystem::file_size(std::filesystem::path(p), ec));
+    j["url"] = "/admin/diag/file?name=" + name;
+    r->set("Cache-Control", "no-store");
+    r->body = json_py::dumps(j, /*spaced=*/false);
+}
+
+// GET /admin/diag/file?name=qwenox-diag-....zip — 下载（只认 logs/diag 下本模块生成的名字）
+static void handle_diag_file(const http::Request& q, http::Response* r, http::Stream*) {
+    if (!admin_ok(q))
+        http::fail(401, "admin key required (Authorization: Bearer <key> or X-Admin-Key)");
+    const auto qp = parse_query(q.query);
+    const auto it = qp.find("name");
+    const std::string name = it == qp.end() ? std::string() : it->second;
+    if (!diagpack::valid_name(name)) http::fail(400, "invalid diagnostic package name");
+    std::string data;
+    if (!svcconf::read_text_file(diagpack::out_dir(g_conf_root) + "/" + name, &data))
+        http::fail(404, "no such diagnostic package");
+    r->content_type = "application/zip";
+    r->set("Content-Disposition", "attachment; filename=\"" + name + "\"");
+    r->set("Cache-Control", "no-store");
+    r->body = std::move(data);
+}
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
     // 预扫描 --console：本程序是 GUI 子系统，默认托盘模式（无控制台）；
     // --console 立即开控制台，让用法/错误输出可见。
     for (int i = 1; i < argc; ++i)
-        if (std::strcmp(argv[i], "--console") == 0) g_tray_mode = false;
+        if (std::strcmp(argv[i], "--console") == 0 || std::strcmp(argv[i], "--collect-diag") == 0)
+            g_tray_mode = false;
     if (!g_tray_mode) console_open();
     if (!wsa_init()) {
         std::fprintf(stderr, "WSAStartup failed\n");
@@ -4755,6 +4842,15 @@ int main(int argc, char** argv) {
         else if (a == "--listen") { g_cfg.listen = next(); arg_listen = true; }
         else if (a == "--overrides") g_cfg.overrides_path = next();  // "" = memory only
         else if (a == "--service-conf") g_cfg.service_conf = next();
+        else if (a == "--collect-diag") g_diag_cli.on = true;
+        else if (a == "--diag-engine-log") g_diag_cli.engine_log = next();
+        else if (a == "--diag-api-log") g_diag_cli.api_log = next();
+        else if (a == "--diag-reason") g_diag_cli.reason = next();
+        else if (a == "--diag-pid") g_diag_cli.pid = std::atoi(next().c_str());
+        else if (a == "--diag-exit-code") {
+            g_diag_cli.has_exit = true;
+            g_diag_cli.exit_code = std::strtoul(next().c_str(), nullptr, 0);
+        }
 #ifdef _WIN32
         else if (a == "--console") g_tray_mode = false;  // 已在 main 开头预扫描并开控制台
 #endif
@@ -4762,12 +4858,14 @@ int main(int argc, char** argv) {
             fprintf(stderr,
                     "usage: %s [--tokenizer DIR] [--engine H:P] [--listen H:P] "
                     "[--port N] [--host H] [--context N] [--model NAME] "
-                    "[--overrides FILE] [--service-conf FILE]"
+                    "[--overrides FILE] [--service-conf FILE]\n"
+                    "       %s --collect-diag [--diag-engine-log F] [--diag-api-log F] "
+                    "[--diag-reason TEXT] [--diag-pid N] [--diag-exit-code N]"
 #ifdef _WIN32
                     " [--console]"
 #endif
                     "\n",
-                    argv[0]);
+                    argv[0], argv[0]);
             return gexit(2);
         }
     }
@@ -4861,6 +4959,41 @@ int main(int argc, char** argv) {
         }
         reqlog::configure(on != "0", dir, static_cast<int>(level));
     }
+    // 崩溃报告目录统一为 <项目根>/logs/crash（引擎由本进程拉起时继承同一个值）
+    if (!std::getenv("QWENOX_CRASH_DIR")) {
+        std::error_code ec;
+        const std::string cd =
+            std::filesystem::absolute(std::filesystem::path(g_conf_root) / "logs" / "crash", ec).string();
+        if (!ec) {
+#ifdef _WIN32
+            _putenv(("QWENOX_CRASH_DIR=" + cd).c_str());
+#else
+            setenv("QWENOX_CRASH_DIR", cd.c_str(), 1);
+#endif
+        }
+    }
+    // --collect-diag：只打诊断包（不监听端口）。Linux 启动脚本在引擎异常退出时调用。
+    if (g_diag_cli.on) {
+        diagpack::Opts o;
+        o.root = g_conf_root;
+        o.conf_path = g_conf_path;
+        o.reason = g_diag_cli.reason.empty() ? "collected from the command line" : g_diag_cli.reason;
+        o.engine_log = g_diag_cli.engine_log;
+        o.api_log = g_diag_cli.api_log;
+        o.engine_pid = g_diag_cli.pid;
+        o.has_exit = g_diag_cli.has_exit;
+        o.exit_code = g_diag_cli.exit_code;
+        o.engine_host = eff_engine_host();
+        o.engine_port = eff_engine_port();
+        std::string e;
+        const std::string p = diagpack::build(o, &e);
+        if (p.empty()) {
+            fprintf(stderr, "qwenox-api: diagnostic package failed: %s\n", e.c_str());
+            return 1;
+        }
+        printf("%s\n", p.c_str());
+        return 0;
+    }
 #ifdef _WIN32
     // 托盘模式没有控制台：stdout/stderr 重定向到 logs\api-win-<时间戳>.log。
     // 放在 conf 探测之后：CWD 已是项目根，日志落在根的 logs\ 下。
@@ -4891,6 +5024,32 @@ int main(int argc, char** argv) {
         if (freopen(lp.c_str(), "ab", stdout)) setvbuf(stdout, nullptr, _IONBF, 0);
         if (freopen(lp.c_str(), "ab", stderr)) setvbuf(stderr, nullptr, _IONBF, 0);
     }
+#endif
+    // API 自己的崩溃报告（crash-api-*），与引擎同目录
+    crashdiag::install("api", QWENOX_VERSION_FULL);
+    crashdiag::append_env(crashdiag::env_report());
+    if (crashdiag::installed())
+        fprintf(stderr, "qwenox-api: crash reports: %s\n", crashdiag::dir());
+#ifdef _WIN32
+    // 引擎意外退出：自动打诊断包（监管线程调用，托盘气泡给出路径）
+    enginesup::set_crash_hook([](const enginesup::CrashInfo& ci) {
+        diagpack::Opts o;
+        o.root = g_conf_root;
+        o.conf_path = g_conf_path;
+        o.api_log = g_api_log_abs;
+        o.engine_log = ci.log;
+        o.engine_pid = ci.pid;
+        o.has_exit = true;
+        o.exit_code = ci.exit_code;
+        o.since_unix = ci.start_unix;
+        o.reason = "engine exited unexpectedly" + (ci.detail.empty() ? "" : " (" + ci.detail + ")");
+        std::string e;
+        const std::string p = diagpack::build(o, &e);
+        fprintf(stderr, "qwenox-api: engine exited unexpectedly (code 0x%08lX: %s); diagnostics: %s\n",
+                ci.exit_code, diagpack::exit_code_text(ci.exit_code).c_str(),
+                p.empty() ? ("FAILED: " + e).c_str() : p.c_str());
+        return p;
+    });
 #endif
     std::string rope_error;
     if (!rope_from_env(g_cfg.rope, rope_error) || !rope_config_valid(g_cfg.rope)) {
@@ -4987,6 +5146,8 @@ int main(int argc, char** argv) {
     srv.on("GET", "/admin/engine/status", handle_engine_status);
     srv.on("POST", "/admin/engine/start", handle_engine_start);
     srv.on("POST", "/admin/engine/stop", handle_engine_stop);
+    srv.on("POST", "/admin/diag", handle_diag_post);
+    srv.on("GET", "/admin/diag/file", handle_diag_file);
     srv.on("POST", "/v1/completions", handle_completions);
     srv.on("POST", "/v1/chat/completions", handle_chat);
     srv.on("POST", "/v1/responses", handle_responses);
@@ -5011,6 +5172,7 @@ int main(int argc, char** argv) {
         hooks.engine_endpoint = [] {
             return std::make_pair(eff_engine_host(), eff_engine_port());
         };
+        hooks.make_diag = [](std::string* err) { return make_diag("manual export from the tray menu", err); };
         return tray_run(srv, hooks);
     }
 #endif

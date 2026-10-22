@@ -732,6 +732,7 @@ static void writer() {
                       it.new_mt ? " + mtp" : "", it.new_b / 1048576.0, it.cap_s,
                       g_direct.load() ? "direct" : "buffered", pw > 0 ? pw : 0.0, ws,
                       e->mtp ? ", mtp" : "", g_total / 1073741824.0);
+          crashdiag::note("kvsnap saved %d tokens (%.1f MB)", e->n, len / 1048576.0);
           g_pw_on = false;
           evict_locked(e.get());
         }
@@ -815,6 +816,8 @@ struct Pending {
 static void capture_impl(GpuModel& m, const std::vector<int>& toks, bool mtp,
                          const rckpt::Ck* rc, std::vector<Pending>& out) {
   if (!g_on) return;
+  crashdiag::note("kvsnap capture %zu tokens (mtp %d, from rckpt %d)", toks.size(), (int)mtp,
+                  (int)(rc != nullptr));
   const int n = (int)toks.size();
   if (n <= 0 || (rc ? (n >= m.pos || rc->pos != n) : n != m.pos)) {
     fprintf(stderr, "kvsnap: save skipped: %d tokens but live pos %d\n", n, m.pos);
@@ -1453,6 +1456,7 @@ static bool restore(GpuModel& m, const std::shared_ptr<CkEnt>& e,
                     const std::vector<int>& prompt, std::vector<int>& hist,
                     bool* mtp_out) {
   *mtp_out = false;
+  crashdiag::note("kvsnap restore %d tokens from %.60s", e->n, e->name.c_str());
   const auto t0 = std::chrono::steady_clock::now();
   uint64_t bad = 0;
   int npages = 0;
@@ -1497,6 +1501,7 @@ static bool restore(GpuModel& m, const std::shared_ptr<CkEnt>& e,
           log_ts(), e->n, e->name.c_str(), s, npages, tm.bytes / 1048576.0,
           g_direct.load() ? "direct" : "buffered", tm.ck_s, tm.rd_s, tm.sum_s, tm.wait_s,
           tm.h2d_s, *mtp_out ? " (mtp live)" : "");
+  crashdiag::note("kvsnap restored %d tokens in %.2fs", e->n, s);
   return true;
 }
 
@@ -3260,6 +3265,9 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
   if (m.nslots > 1)
     fprintf(stderr, "%s req %lld -> slot %d (%zu live tokens)\n", log_ts(),
             (long long)g.req, s, hist.size());
+  crashdiag::note("req %lld -> slot %d (live %zu, prompt %zu, max %d, %s)", (long long)g.req, s,
+                  hist.size(), g.ids.size(), g.max_tokens, g.sample ? "sampled" : "greedy");
+  crash_test_point("gen");
   try {
     // KV reuse: longest common prefix of live state and this prompt.
     // Continue only when hist is a STRICT prefix (mcp == hist.size() and
@@ -3338,6 +3346,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
                         .count();
         fprintf(stderr, "%s rckpt: restored %zu tokens in %.2fs%s\n",
                 log_ts(), mcp, rs, ck_mtp ? " (mtp live)" : "");
+        crashdiag::note("req %lld rckpt restored %zu tokens", (long long)g.req, mcp);
       }
     }
     if (ssd_ck && cont) {  // the RAM tier won: drop the SSD match
@@ -3559,6 +3568,9 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     m.prog_last_est = 0;
     m.prog_req = g.req;
     m.prog_t0 = m.prog_last = std::chrono::steady_clock::now();
+    crashdiag::note("req %lld prefill %zu..%zu (cached %d, %s, spec %d chain %d df2 %d, cuts %zu)",
+                    (long long)g.req, done_upto, g.ids.size(), n_cached, cont ? "cont" : "fresh",
+                    (int)use_spec, (int)chain_mtp, (int)use_df2, cuts.size());
     // live spec counters reset per request, or a serial decode after a
     // speculative one would report the previous request's acceptance
     m.live_spec_rounds = m.live_spec_commits = m.live_spec_proposed = 0;
@@ -3693,6 +3705,8 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
                                  : -1.0);
       dl_last = now;
       dl_last_ngen = ngen;
+      crashdiag::note("req %lld decode n=%d pos=%d rounds=%d", (long long)g.req, ngen, m.pos,
+                      m.live_spec_rounds);
     };
     // Token line; the X verb (reader thread) raises `cancel`.
     auto send_tok = [&](int tok, bool with_lp, float lp) -> bool {
@@ -4001,6 +4015,8 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
         fprintf(stderr, "%s req %lld | decode eval = no tokens | %s\n",
                 log_ts(), (long long)g.req,
                 cancel ? "cancel" : reason.c_str());
+      crashdiag::note("req %lld done gen=%d (%s)", (long long)g.req, ngen,
+                      cancel ? "cancel" : reason.c_str());
       if ((use_spec || use_ngram || use_chain) && m.last_spec_rounds > 0) {
         int acc_n = m.live_spec_commits - m.live_spec_rounds;
         fprintf(stderr,
@@ -4070,6 +4086,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // drop it (returning the slot's pages to the pool) and fail the request
     fprintf(stderr, "%s serve: req %lld failed: %s\n", log_ts(),
             (long long)g.req, e.what());
+    crashdiag::note("req %lld failed: %.80s", (long long)g.req, e.what());
     m.abort_flag = nullptr;
     m.prog_total = 0;
     m.mtp_tap_capture = m.spec_snap = m.ngram_verify_active = false;
@@ -4109,6 +4126,7 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
       announced = true;
       fprintf(stderr, "%s serve: conn %llu: client connected (first verb %.16s)\n",
               log_ts(), (unsigned long long)c.id, verb.c_str());
+      crashdiag::note("conn %llu connected (%.16s)", (unsigned long long)c.id, verb.c_str());
     }
     if (verb == "PING") {
       alive = c.send("PONG\n");
@@ -4167,6 +4185,9 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
                (unsigned long long)ps.prompt_total, ps.tg_inst, ps.tg_avg,
                ps.accept_pct);
       alive = c.send(pb);
+    } else if (verb == "DIAG") {
+      // 在线诊断快照（API 诊断包用）：多行文本，以单独一行 "." 结束
+      alive = c.send(crashdiag::live_text() + "\n.\n");
     } else if (verb == "VIZ") {
       // QWENOX_VIZ runtime taps (19_viz.inc), one JSON line:
       //   VIZ                    -> V {"on":..,"slots":[..]}
@@ -4306,9 +4327,11 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
       if (s.owner == c.id) s.owner = 0;
   }
   sock_close(cfd);
-  if (announced)
+  if (announced) {
     fprintf(stderr, "%s serve: conn %llu: client disconnected\n", log_ts(),
             (unsigned long long)c.id);
+    crashdiag::note("conn %llu disconnected", (unsigned long long)c.id);
+  }
   else if (!any_line)
     fprintf(stderr, "%s serve: conn %llu: client connected and closed without "
             "sending anything\n", log_ts(), (unsigned long long)c.id);

@@ -240,12 +240,25 @@ serve_run() {
   echo "服务已就绪：http://${API_HOST}:${API_PORT}/v1（0.0.0.0 表示监听所有网卡）"
   echo "日志：$RUN_LOG_DIR；Ctrl+C 同时停止 API 和引擎。"
   if wait -n "$engine_pid" "$api_pid"; then
-    fail '服务进程意外结束'
+    result=0
   else
     result=$?
-    echo "服务进程退出（$result），查看 $RUN_LOG_DIR" >&2
-    exit "$result"
   fi
+  # 引擎先退出：打诊断包（崩溃报告在 logs/crash，日志在本次运行目录）
+  if ! kill -0 "$engine_pid" 2>/dev/null; then collect_diag "引擎意外退出（退出码 $result）" "$result"; fi
+  (( result != 0 )) || fail '服务进程意外结束'
+  echo "服务进程退出（$result），查看 $RUN_LOG_DIR" >&2
+  exit "$result"
+}
+
+# 诊断包：build/qwenox-api --collect-diag（不监听端口），路径打印给用户
+collect_diag() {  # $1 = 原因  $2 = 退出码
+  [[ -x "$ROOT/build/qwenox-api" ]] || return 0
+  local p
+  p="$(timeout 120 "$ROOT/build/qwenox-api" --collect-diag --diag-engine-log "$ENGINE_LOG" \
+        --diag-api-log "$API_LOG" --diag-reason "$1" --diag-exit-code "$2" 2>/dev/null)" || return 0
+  [[ -n "$p" ]] && echo "诊断包：$p（出问题时把这个 zip 发给开发者）" >&2
+  return 0
 }
 
 cleanup() {

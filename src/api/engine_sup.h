@@ -4,6 +4,8 @@
 // Linux 不提供启停（start/stop 返回不支持），status 仍可探测外部引擎。
 #pragma once
 
+#include <cstdint>
+#include <functional>
 #include <string>
 
 #include "../service_conf.h"
@@ -18,7 +20,25 @@ struct Status {
     bool external = false;          // 端口在听但不是本进程拉起的（如 start_win.exe）
     std::string detail;             // 附加说明（启动超时、端口被占用等）
     bool port_foreign = false;      // 未运行，但引擎端口被不说引擎协议的程序占着
+    int64_t start_unix = 0;         // 本进程拉起引擎的时间（Unix 秒）
+    std::string diag;               // 意外退出后自动生成的诊断包路径（空 = 没有）
 };
+
+// 引擎意外退出（非 stop()）时，监管线程在把状态翻成 exited 之前调用：返回
+// 诊断包路径（空 = 没生成）。最多等 90 s，超时则不等结果直接翻状态。
+struct CrashInfo {
+    unsigned long exit_code = 0;
+    int pid = 0;
+    std::string log;         // 引擎日志
+    int64_t start_unix = 0;  // 引擎启动时间
+    std::string detail;      // 如 "start timeout (1800s)"
+};
+using CrashHook = std::function<std::string(const CrashInfo&)>;
+void set_crash_hook(CrashHook hook);
+
+// Windows：对本进程拉起且仍在运行的引擎写一份在线 minidump（线程栈 + 模块，
+// 几 MB，引擎会暂停不到一秒）。其它情况返回 false。
+bool write_live_dump(const std::string& path, std::string* err);
 
 bool supported();  // 仅 Windows 为 true
 

@@ -173,11 +173,27 @@ run_parallel() {
     (( fail == 0 ))
 }
 
+# 调试符号（PDB）：崩溃时的 minidump / 崩溃报告里的 "模块+偏移" 要靠同一次编译的
+# PDB 才能还原成函数名和源码行。只给主机代码加 -g（-Xarch_host；GPU kernel 不受
+# 影响，主机代码生成也不变），链接时 /DEBUG 生成 build/<exe 名>.pdb，并显式保留
+# /OPT:REF,ICF（/DEBUG 默认会关掉它们）。PDB 不进用户分发包，发版时用
+# tools/pack_symbols_win.sh 另存。QWENOX_PDB=0 不生成。
+PDB_ON=1
+[[ "${QWENOX_PDB:-1}" == 0 ]] && PDB_ON=0
+pdb_link() {  # $1 = pdb 路径；输出链接器参数（逐行）
+    (( PDB_ON )) || return 0
+    printf '%s\n' -Xlinker -debug -Xlinker "-pdb:$1" -Xlinker -opt:ref -Xlinker -opt:icf
+}
+
 build_engine() {
     echo "[编译] build/qwenox-engine-win.exe"
+    local dbg=()
+    (( PDB_ON )) && dbg=(-Xarch_host -g -Xarch_host -gcodeview)
+    local pdbl=()
+    mapfile -t pdbl < <(pdb_link build/qwenox-engine-win.pdb)
     # 先编到临时文件再原子替换，编译失败保留上次成功的二进制（对齐 Linux build.sh）
-    "$HIPCC" "${FLAGS[@]}" ${NPU_FLAGS[@]+"${NPU_FLAGS[@]}"} src/gpu/qwenox.cpp \
-      -o build/qwenox-engine-win.exe.tmp ${NPU_LINK[@]+"${NPU_LINK[@]}"} \
+    "$HIPCC" "${FLAGS[@]}" ${dbg[@]+"${dbg[@]}"} ${NPU_FLAGS[@]+"${NPU_FLAGS[@]}"} src/gpu/qwenox.cpp \
+      -o build/qwenox-engine-win.exe.tmp ${NPU_LINK[@]+"${NPU_LINK[@]}"} ${pdbl[@]+"${pdbl[@]}"} \
       && mv -f build/qwenox-engine-win.exe.tmp build/qwenox-engine-win.exe
 }
 
@@ -223,9 +239,14 @@ build_api() {
     [[ -x "$CXX" ]] || { echo "找不到 TheRock clang++: $CXX" >&2; exit 1; }
     gen_static_inc
     gui_ldflags
-    echo "[编译] build/qwenox-win.exe（15 个 TU 并行）"
+    echo "[编译] build/qwenox-win.exe（16 个 TU 并行）"
     local srcs=(http engine_client tokenizer chat_template json_py toolparse vision
-                reqstat reqstat_read power engine_sup tray_win snap_cuts reqlog main)
+                reqstat reqstat_read power engine_sup tray_win snap_cuts reqlog diagpack main)
+    local dbg=() pdbl=()
+    if (( PDB_ON )); then
+      dbg=(-g)
+      "$CXX" -dumpmachine | grep -q msvc && { dbg+=(-gcodeview); mapfile -t pdbl < <(pdb_link build/qwenox-win.pdb); }
+    fi
     local objdir=build/.api-obj
     mkdir -p "$objdir"
     # miniz 是 C：单独按 C 编译，别让 clang++ 按 C++ 语义处理。
@@ -240,7 +261,7 @@ build_api() {
     done
     local pids=() s i fail=0
     for s in "${srcs[@]}"; do
-        "$CXX" -O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS "${VER_FLAGS[@]}" \
+        "$CXX" -O2 -std=c++17 ${dbg[@]+"${dbg[@]}"} -D_CRT_SECURE_NO_WARNINGS "${VER_FLAGS[@]}" \
           -Isrc/api -Ithird_party -Ithird_party/miniz -I"$TR/include" \
           -c "src/api/$s.cpp" -o "$objdir/$s.o" >"$objdir/$s.log" 2>&1 &
         pids+=($!)
@@ -249,8 +270,9 @@ build_api() {
         wait "${pids[$i]}" || { fail=1; echo "  [失败] ${srcs[$i]}.cpp：" >&2; tail -15 "$objdir/${srcs[$i]}.log" >&2; }
     done
     [[ $fail == 0 ]] || exit 1
-    "$CXX" "$objdir"/*.o -lws2_32 -lshell32 -luser32 -lgdi32 -ladvapi32 \
-      "${GUI_LDFLAGS[@]}" -o build/qwenox-win.exe
+    # wevtapi：诊断包读 Windows 事件日志（diagpack.cpp）
+    "$CXX" "$objdir"/*.o -lws2_32 -lshell32 -luser32 -lgdi32 -ladvapi32 -lwevtapi \
+      "${GUI_LDFLAGS[@]}" ${pdbl[@]+"${pdbl[@]}"} -o build/qwenox-win.exe
 }
 
 # exe 文件图标（可选）：优先 TheRock 的 llvm-rc，没有则退回 Windows SDK 的

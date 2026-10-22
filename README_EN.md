@@ -366,6 +366,15 @@ columns are Task Manager readings in GB):
   pool, 1/2/4 slots, ~5 minutes per configuration; `PARS="1 2" POOL=0 SHORT=1` measures a 256K pool, startup and
   one 8K request only). The summary goes to `logs/vram_conc/summary.txt`.
 
+## Crash diagnostics
+
+When the engine exits unexpectedly, the API bundles the logs, crash reports (with a small minidump on Windows), system and
+driver information and the Windows event log into one diagnostic package under `logs/diag/`. On Windows the tray shows a
+notification; click it to select the zip in Explorer. If nothing crashed but the service hangs or misbehaves, right-click
+the tray icon → "Export diagnostics…". On Linux the start script collects the package automatically, or run
+`build/qwenox-api --collect-diag`. Send the zip to the developers; it contains no request content. See
+[CRASHDIAG.md](docs/CRASHDIAG.md) (in Chinese).
+
 ## Documentation
 
 - [QUICKSTART_EN.md](docs/QUICKSTART_EN.md) — build, start, configure
@@ -381,6 +390,7 @@ columns are Task Manager readings in GB):
 - [bench/README.md](bench/README.md) — task-level evaluation (long-context code-needle A/B, in Chinese)
 - [PORTING-WINDOWS_EN.md](docs/PORTING-WINDOWS_EN.md) — Windows port and measurements
 - [POWER.md](docs/POWER.md) — power/temperature reading accuracy by platform, and why per-CPU watts is unavailable on APUs (in Chinese)
+- [CRASHDIAG.md](docs/CRASHDIAG.md) — crash reports, diagnostic packages, minidump symbolization, self-test (in Chinese)
 
 Tests: `bash build.sh test` runs the kernel unit tests (no model loaded, expect ALL PASS);
 `python3 tools/bpw.py` reports the bpw of each weight file under `models/`.

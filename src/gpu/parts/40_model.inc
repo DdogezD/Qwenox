@@ -4231,6 +4231,7 @@ struct GpuModel {
             "[kvpage] FATAL: %s (%d tokens; pool %d pages, %d free, table %d "
             "pages, mapped %d)\n",
             what, end, kv_pool_pages, kv_pool.nfree(), kv_lpages, mapped);
+    crashdiag::report_fatal("fatal", what);
     exit(1);
   }
   void kv_reserve(int end) { kv_reserve_seq(kv_seq, d_ptab, end); }
@@ -7011,6 +7012,7 @@ struct GpuModel {
             el > 0 ? est / el : 0.0);
     perfsnap::write_prefill((uint64_t)prog_req, (est - prog_last_est) / iv,
                             (uint64_t)est, (uint64_t)prog_total);
+    crashdiag::note("req %lld prefill %lld/%d", (long long)prog_req, (long long)est, prog_total);
     prog_last = now;
     prog_last_est = est;
   }
@@ -11445,6 +11447,7 @@ struct GpuModel {
     CK(hipStreamDestroy(cap));
     graphs_ok = true;
     fprintf(stderr, "decode graphs captured (ple=%d)\n", (int)ple_on);
+    crashdiag::note("decode graphs captured");
   }
 
   // ==================== P3-B: spec-verify segment graphs ====================
@@ -11758,6 +11761,7 @@ struct GpuModel {
         return false;
       }
       fprintf(stderr, "verify graphs captured (P=%d, %d segments)\n", P, G.nseg);
+      crashdiag::note("verify graphs captured P=%d base=%d", P, base);
       // QWENOX_VGRAPH_NOLAUNCH (debug): capture once, then stay eager forever —
       // isolates capture-time side effects from replay effects.
       if (getenv("QWENOX_VGRAPH_NOLAUNCH")) {

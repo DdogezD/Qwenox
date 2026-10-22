@@ -147,6 +147,7 @@
 #include "../kv_admission.h"
 #include "../perfsnap.h"
 #include "../version.h"
+#include "../crashdiag.h"  // 崩溃报告 / 飞行记录（CK 记录调用点，见 00_platform.inc）
 
 #include "parts/00_platform.inc"
 #include "parts/01_syncprof.inc"

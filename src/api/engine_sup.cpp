@@ -8,10 +8,17 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
+#include <future>
+#include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include "../engine_net.h"
+#ifdef _WIN32
+#include "../crashdiag.h"  // MiniDumpWriteDump（dbghelp 动态加载）
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -27,6 +34,7 @@ namespace {
 
 std::mutex g_mtx;
 Status g_st;
+CrashHook g_crash_hook;  // 由 main 设置；监管线程在锁外调用
 #ifdef _WIN32  // 仅 Windows 监管线程/stop() 使用；Linux 下未用会触发 -Werror=unused-variable
 bool g_stopping = false;  // stop() 主动停止：监管线程把退出记为 stopped 而非 exited
 #endif
@@ -171,10 +179,41 @@ DWORD WINAPI monitor_thread(LPVOID) {
     WaitForSingleObject(g_proc, INFINITE);
     DWORD code = 1;
     GetExitCodeProcess(g_proc, &code);
+    // 意外退出：先打诊断包（日志 tee 线程可能还在写最后几行，稍等一下），
+    // 再翻状态，托盘/网页看到 exited 时诊断包路径已就绪。
+    std::string diag;
+    CrashInfo ci;
+    CrashHook hook;
+    bool unexpected = false;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        unexpected = !g_stopping;
+        ci.exit_code = code;
+        ci.pid = g_st.pid;
+        ci.log = g_st.log;
+        ci.start_unix = g_st.start_unix;
+        ci.detail = g_st.detail;
+        hook = g_crash_hook;
+    }
+    if (unexpected && hook) {
+        Sleep(500);
+        auto pr = std::make_shared<std::promise<std::string>>();
+        std::future<std::string> fu = pr->get_future();
+        std::thread([pr, hook, ci] {
+            std::string p;
+            try {
+                p = hook(ci);
+            } catch (...) {
+            }
+            pr->set_value(p);
+        }).detach();
+        if (fu.wait_for(std::chrono::seconds(90)) == std::future_status::ready) diag = fu.get();
+    }
     {
         std::lock_guard<std::mutex> lk(g_mtx);
         g_st.exit_code = code;
         g_st.pid = 0;
+        g_st.diag = diag;
         // 主动 stop() → stopped；提前退出 / 超时杀掉 / 运行中意外退出 → exited
         g_st.state = g_stopping ? "stopped" : "exited";
         g_stopping = false;
@@ -192,6 +231,49 @@ bool supported() {
 #ifdef _WIN32
     return true;
 #else
+    return false;
+#endif
+}
+
+void set_crash_hook(CrashHook hook) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    g_crash_hook = std::move(hook);
+}
+
+bool write_live_dump(const std::string& path, std::string* err) {
+#ifdef _WIN32
+    std::lock_guard<std::mutex> lk(g_mtx);
+    if (!g_proc || g_st.state != "running") {
+        if (err) *err = "engine not running under this API process";
+        return false;
+    }
+    if (!crashdiag::g_fn.mini_dump) crashdiag::win_load_fns();
+    if (!crashdiag::g_fn.mini_dump) {
+        if (err) *err = "dbghelp.dll unavailable";
+        return false;
+    }
+    HANDLE f = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) {
+        if (err) *err = "cannot create " + path;
+        return false;
+    }
+    const MINIDUMP_TYPE t = MINIDUMP_TYPE(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules |
+                                          MiniDumpWithHandleData | MiniDumpWithProcessThreadData |
+                                          MiniDumpWithIndirectlyReferencedMemory);
+    const BOOL ok = crashdiag::g_fn.mini_dump(g_proc, GetProcessId(g_proc), f, t, nullptr,
+                                              nullptr, nullptr);
+    const DWORD e = GetLastError();
+    CloseHandle(f);
+    if (!ok) {
+        DeleteFileA(path.c_str());
+        if (err) *err = "MiniDumpWriteDump failed, error " + std::to_string(e);
+        return false;
+    }
+    return true;
+#else
+    (void)path;
+    if (err) *err = "live dumps are only supported on Windows";
     return false;
 #endif
 }
@@ -400,6 +482,11 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
     SetEnvironmentVariableA("QWENOX_ROPE_ATTN_SCALE", rope_attn_s.c_str());
     if (prefill_chunk)
         SetEnvironmentVariableA("QWENOX_PREFILL_CHUNK", std::to_string(prefill_chunk).c_str());
+    // 崩溃诊断（引擎写 <root>\logs\crash）：CRASH_DUMP=0（手改 service.conf，与 REQLOG
+    // 一样不进设置面板）关掉 .dmp；环境变量 QWENOX_CRASH_DUMP 优先。
+    if (!getenv("QWENOX_CRASH_DUMP"))
+        SetEnvironmentVariableA("QWENOX_CRASH_DUMP",
+                                svcconf::cfg(conf, "CRASH_DUMP", "1") == "0" ? "0" : nullptr);
     // GGUF：MTP sidecar 不是位置参数而是 QWENOX_GGUF_MTP。conf 里没有
     // GGUF_MTP_FILE 键 = 不设（引擎在分片目录自动找唯一的 mtp-*.gguf）；键显式
     // 置空 = "none"（引擎不投机；Windows 环境变量无法可靠地传空串）。
@@ -492,6 +579,7 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
     g_st.state = "starting";
     g_st.pid = static_cast<int>(pi.dwProcessId);
     g_st.log = log_path;
+    g_st.start_unix = static_cast<int64_t>(time(nullptr));
     g_stopping = false;
     HANDLE m = CreateThread(nullptr, 0, monitor_thread, nullptr, 0, nullptr);
     if (m) CloseHandle(m);

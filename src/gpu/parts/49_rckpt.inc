@@ -229,6 +229,7 @@ void prune(const std::vector<int64_t>& chist) {
 bool save(GpuModel& m, const std::vector<int>& toks, bool mtp = false) {
   if (!g_on || toks.size() < g_min_tokens || toks.size() != (size_t)m.pos)
     return false;
+  crashdiag::note("rckpt save %zu tokens (mtp %d)", toks.size(), (int)mtp);
   if (!g_m) {
     g_m = &m;
     g_pin = m.kv_paged;
@@ -349,6 +350,7 @@ size_t lcp(const std::vector<int>& prompt) {
 bool restore(GpuModel& m, int idx, std::vector<int>* toks_out,
              bool* mtp_out) {
   Ck& ck = g_list[(size_t)idx];
+  crashdiag::note("rckpt restore #%d", idx);
   *mtp_out = false;
   bool ok =
       hipMemcpy(m.d_S, ck.s.data(), ck.s.size() * 4,

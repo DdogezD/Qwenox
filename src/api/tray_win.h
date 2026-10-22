@@ -21,6 +21,8 @@ struct TrayHooks {
     std::function<svcconf::Conf()> conf_snapshot;
     // ENGINE_HOST/ENGINE_PORT 当前有效值（状态探测 / SNAP 用）
     std::function<std::pair<std::string, int>()> engine_endpoint;
+    // 生成诊断包（托盘菜单"导出诊断包"，在 worker 线程调用）：返回 zip 路径，失败空串 + err
+    std::function<std::string(std::string*)> make_diag;
 };
 
 // 进入托盘主循环：worker 线程跑 srv.run()，主线程消息循环，"退出"菜单

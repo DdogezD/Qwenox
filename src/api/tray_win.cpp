@@ -121,13 +121,20 @@ enginesup::Status g_eng;  // 最近一次轮询的引擎状态（仅 UI 线程�
 std::wstring g_perf;      // 最近一次 running 时的 SNAP 文本（仅 UI 线程）
 
 const UINT WM_PROBE_DONE = WM_APP + 2;
+const UINT WM_DIAG_DONE = WM_APP + 3;  // 诊断包 worker 完成
+
+// 诊断包：点气泡时在资源管理器里选中的文件（空 = 普通气泡，点了不做事）
+std::string g_balloon_select;
+std::mutex g_diag_mtx;
+bool g_diag_busy = false;
+std::string g_diag_path, g_diag_err;
 
 constexpr UINT_PTR kTimerStatus = 1;
 constexpr uint64_t kPerfTtlMs = 6000;  // 三个 2s 轮询周期：数据必须会过期
 
 enum MenuId : UINT {
     kIdConsole = 1, kIdCopyUrl, kIdAutoStart, kIdNotify, kIdEngStart, kIdEngStop,
-    kIdEngineLog, kIdApiLog, kIdLogDir, kIdQuit
+    kIdEngineLog, kIdApiLog, kIdLogDir, kIdQuit, kIdDiag
 };
 
 std::wstring state_text() {
@@ -253,12 +260,23 @@ void apply_probe() {
                                 L"right-click for more"));
     }
     if (g_eng.state == "exited" && (prev == "running" || prev == "starting")) {
-        const std::string code = std::to_string(g_eng.exit_code);
-        tray_balloon(TR(L"引擎已退出", L"Engine exited"),
-                     to_w(TR("退出码 " , "exit code ") + code +
-                          (g_eng.detail.empty() ? "" : " · " + g_eng.detail) +
-                          TR("\n右键图标查看引擎日志",
-                             "\nRight-click the icon to view the engine log")));
+        char hex[16];
+        snprintf(hex, sizeof hex, "0x%08lX", g_eng.exit_code);
+        if (!g_eng.diag.empty()) {
+            // 意外退出且已自动打好诊断包：点气泡在资源管理器里选中它
+            tray_balloon(TR(L"引擎意外退出，已生成诊断包", L"Engine crashed - diagnostics saved"),
+                         to_w(TR("退出码 ", "exit code ") + std::string(hex) +
+                              TR("\n点这里打开所在文件夹，把 zip 发给开发者",
+                                 "\nClick to open its folder and send the zip to the developers")));
+            g_balloon_select = g_eng.diag;
+        } else {
+            const std::string code = std::to_string(g_eng.exit_code);
+            tray_balloon(TR(L"引擎已退出", L"Engine exited"),
+                         to_w(TR("退出码 " , "exit code ") + code +
+                              (g_eng.detail.empty() ? "" : " · " + g_eng.detail) +
+                              TR("\n右键图标查看引擎日志",
+                                 "\nRight-click the icon to view the engine log")));
+        }
     }
     tray_update_tip();
 }
@@ -349,6 +367,7 @@ std::string autostart_set(bool on) {  // 空串 = 成功，否则为错误描述
 }
 
 void tray_balloon(const std::wstring& title, const std::wstring& text) {
+    g_balloon_select.clear();  // 普通气泡；需要"点了选中文件"的调用方在之后设置
     if (!g_notify || !g_tray_added) return;  // 单点闸门：关闭时所有气泡静默
     g_nid.uFlags = NIF_INFO;
     lstrcpynW(g_nid.szInfoTitle, title.c_str(), ARRAYSIZE(g_nid.szInfoTitle));
@@ -373,6 +392,57 @@ void copy_text(const std::wstring& s) {
         }
     }
     CloseClipboard();
+}
+
+// 资源管理器里选中文件（诊断包）
+void select_in_explorer(std::string path) {
+    for (char& ch : path)
+        if (ch == '/') ch = '\\';
+    ShellExecuteA(nullptr, "open", "explorer.exe", ("/select,\"" + path + "\"").c_str(), nullptr,
+                  SW_SHOWNORMAL);
+}
+
+// 菜单"导出诊断包"：worker 线程打包（事件日志查询 + 压缩要几秒），完成后回 UI 线程
+void diag_start() {
+    if (!g_hooks.make_diag) return;
+    {
+        std::lock_guard<std::mutex> lk(g_diag_mtx);
+        if (g_diag_busy) return;
+        g_diag_busy = true;
+    }
+    tray_balloon(TR(L"正在生成诊断包…", L"Collecting diagnostics…"),
+                 TR(L"几秒后完成，会自动打开所在文件夹。",
+                    L"This takes a few seconds; the folder opens when done."));
+    std::thread([] {
+        std::string err;
+        const std::string p = g_hooks.make_diag(&err);
+        {
+            std::lock_guard<std::mutex> lk(g_diag_mtx);
+            g_diag_path = p;
+            g_diag_err = err;
+        }
+        PostMessageW(g_hwnd, WM_DIAG_DONE, 0, 0);
+    }).detach();
+}
+
+void diag_done() {
+    std::string p, err;
+    {
+        std::lock_guard<std::mutex> lk(g_diag_mtx);
+        p = g_diag_path;
+        err = g_diag_err;
+        g_diag_busy = false;
+    }
+    if (p.empty()) {
+        msgbox(TR("生成诊断包失败：", "Failed to collect diagnostics: ") + err,
+               MB_OK | MB_ICONERROR);
+        return;
+    }
+    select_in_explorer(p);
+    tray_balloon(TR(L"诊断包已生成", L"Diagnostics saved"),
+                 TR(L"已在资源管理器中选中，把这个 zip 发给开发者即可。",
+                    L"Selected in Explorer - send this zip to the developers."));
+    g_balloon_select = p;
 }
 
 // ---- 引擎启停（菜单动作） -----------------------------------------------------
@@ -458,6 +528,7 @@ void on_menu(UINT id) {
             if (!g_hooks.api_log.empty()) shell_open(g_hooks.api_log);
             break;
         case kIdLogDir: shell_open(g_root + "\\logs"); break;
+        case kIdDiag: diag_start(); break;
         case kIdQuit: {
             const bool ours_running =
                 g_eng.state == "running" && !g_eng.external || g_eng.state == "starting";
@@ -499,6 +570,7 @@ void show_menu() {
     AppendMenuW(m, MF_STRING | (g_hooks.api_log.empty() ? MF_GRAYED : 0), kIdApiLog,
                 TR(L"查看 API 日志", L"View API log"));
     AppendMenuW(m, MF_STRING, kIdLogDir, TR(L"打开日志文件夹", L"Open logs folder"));
+    AppendMenuW(m, MF_STRING, kIdDiag, TR(L"导出诊断包…", L"Export diagnostics…"));
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, kIdQuit, TR(L"退出", L"Quit"));
     POINT pt;
@@ -520,6 +592,9 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             case WM_RBUTTONUP:
             case WM_CONTEXTMENU: show_menu(); break;
             case WM_LBUTTONDBLCLK: on_menu(kIdConsole); break;
+            case NIN_BALLOONUSERCLICK:
+                if (!g_balloon_select.empty()) select_in_explorer(g_balloon_select);
+                break;
             default: break;
         }
         return 0;
@@ -530,6 +605,10 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     if (msg == WM_PROBE_DONE) {
         apply_probe();
+        return 0;
+    }
+    if (msg == WM_DIAG_DONE) {
+        diag_done();
         return 0;
     }
     if (g_wm_taskbar_created && msg == g_wm_taskbar_created) {

@@ -123,15 +123,42 @@ static inline void sock_rcvtimeo(sockfd_t fd, int sec) {
 using hgn::Checkpoint;
 using hgn::Tensor;
 
+// CK：每次调用前把调用点（文件:行 + 表达式，编译期字面量）记进
+// crashdiag 的 HIP 调用点环（崩溃报告里的 "last HIP calls"，开销 ~几十 ns）；
+// 失败时 stderr 打同一行原因，再写一份 kind=fatal 的崩溃报告后 exit(1)。
+#define CK_STR2_(x) #x
+#define CK_STR_(x) CK_STR2_(x)
 #define CK(x)                                                          \
   do {                                                                 \
+    crashdiag::site(__FILE__ ":" CK_STR_(__LINE__) " " #x);            \
     hipError_t e_ = (x);                                               \
-    if (e_ != hipSuccess) {                                            \
-      fprintf(stderr, "HIP error %s at %s:%d\n", hipGetErrorString(e_), \
-              __FILE__, __LINE__);                                     \
-      exit(1);                                                         \
-    }                                                                  \
+    if (e_ != hipSuccess)                                              \
+      crashdiag::fatal("HIP error %s at %s:%d", hipGetErrorString(e_), \
+                       __FILE__, __LINE__);                            \
   } while (0)
+
+// 崩溃链路自测（分发后验证报告/诊断包是否生成）：
+//   QWENOX_CRASH_TEST=<kind>   kind 见 crashdiag::self_test_kinds()，另有
+//                              hipfatal（走一次 CK 失败路径）
+//   QWENOX_CRASH_TEST_AT=start|ready|gen   在哪个时刻崩（默认 start：装好
+//                              处理器、打印环境后立刻崩，不加载模型）
+// 也可直接运行 qwenox-engine --crash-test <kind>（同 start）。
+[[maybe_unused]] static void crash_test_now(const char* kind) {
+  if (!strcmp(kind, "hipfatal")) {
+    CK(hipSetDevice(9999));
+    return;
+  }
+  if (!crashdiag::self_test(kind))
+    fprintf(stderr, "crash test: unknown kind '%s' (known: %s hipfatal)\n", kind,
+            crashdiag::self_test_kinds());
+}
+[[maybe_unused]] static void crash_test_point(const char* at) {
+  static const char* kind = getenv("QWENOX_CRASH_TEST");
+  if (!kind || !*kind) return;
+  const char* want = getenv("QWENOX_CRASH_TEST_AT");
+  if (!want || !*want) want = "start";
+  if (strcmp(want, at) == 0) crash_test_now(kind);
+}
 
 // "[2026-09-18 11:25:03.123]" — wall-clock prefix for human-facing logs.
 // thread_local so concurrent loader/decode threads never share the buffer.

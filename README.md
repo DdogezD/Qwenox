@@ -327,6 +327,13 @@ MTP 开、视觉塔开、prefill chunk 8192）：
 - 复测：停掉生产服务后在 Git Bash 里运行 `bash tools/vram_conc_win.sh`（默认 512K 页池 1/2/4 路，约 5 分钟/配置；
   `PARS="1 2" POOL=0 SHORT=1` 测 256K 页池且只测启动和一条 8K），汇总在 `logs/vram_conc/summary.txt`。
 
+## 崩溃诊断
+
+引擎意外退出时，API 自动把日志、崩溃报告（Windows 附小 minidump）、系统与驱动信息、Windows 事件日志打成一个诊断包，
+放在 `logs/diag/`。Windows 托盘会弹提示，点一下就在资源管理器里选中这个 zip；没崩溃但卡住或输出异常时，右键托盘图标
+→"导出诊断包…"。Linux 下由启动脚本自动打包，也可以手动运行 `build/qwenox-api --collect-diag`。遇到问题时把 zip 发给开发者即可，
+包里不含请求内容。详见 [CRASHDIAG.md](docs/CRASHDIAG.md)。
+
 ## 文档
 
 - [QUICKSTART.md](docs/QUICKSTART.md) — 编译、启动、配置
@@ -342,6 +349,7 @@ MTP 开、视觉塔开、prefill chunk 8192）：
 - [bench/README.md](bench/README.md) — 任务级评测（长上下文代码捞针 A/B）
 - [PORTING-WINDOWS.md](docs/PORTING-WINDOWS.md) — Windows 移植与实测
 - [POWER.md](docs/POWER.md) — 功耗/温度读数的可信度与平台差异（为什么 APU 上没有单独的 CPU 功耗）
+- [CRASHDIAG.md](docs/CRASHDIAG.md) — 崩溃报告、诊断包、minidump 符号化与自测
 
 测试：`bash build.sh test` 跑 kernel 单测（不加载模型，预期 ALL PASS）；`python3 tools/bpw.py` 统计
 `models/` 下各权重的 bpw。
