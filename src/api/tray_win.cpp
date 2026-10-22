@@ -18,6 +18,7 @@
 #include "../launch_win_icon.inc"  // kIconIco：托盘图标（tools/win_icon.py 生成）
 #include "../service_conf.h"
 #include "../version.h"
+#include "../win_dpi.h"  // PerMonitorV2 / GetDpiForWindow 动态封装
 #include "engine_sup.h"
 #include "http.h"
 #include "tray_win.h"
@@ -287,8 +288,11 @@ void tray_add() {
     g_nid.uID = 1;
     g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY;
-    static HICON small_icon = app_icon(GetSystemMetrics(SM_CXSMICON));
-    static HICON big_icon = app_icon(GetSystemMetrics(SM_CXICON));  // 通知气泡用
+    // 托盘/气泡图标按任务栏所在屏的 DPI 取尺寸：PMv2 下 GetSystemMetrics
+    // 不保证给出当前屏的值，直接按 g_hwnd 的 DPI 换算（16/32 是 96-DPI 基准）。
+    const UINT dpi = windpi::dpi_for_window(g_hwnd);
+    static HICON small_icon = app_icon(windpi::scale(16, dpi));
+    static HICON big_icon = app_icon(windpi::scale(32, dpi));  // 通知气泡用
     g_nid.hIcon = small_icon ? small_icon : LoadIconA(nullptr, IDI_APPLICATION);
     g_nid.hBalloonIcon = big_icon;
     const std::wstring tip = L"Qwenox · " + state_text();
@@ -575,6 +579,10 @@ void show_menu() {
     AppendMenuW(m, MF_STRING, kIdQuit, TR(L"退出", L"Quit"));
     POINT pt;
     GetCursorPos(&pt);
+    // PMv2 下弹出菜单按 owner 窗口所在显示器取 DPI。消息窗平时藏在 0,0，
+    // 挪到光标处再弹，副屏（不同缩放）上右键也不会按主屏 DPI 画小。
+    SetWindowPos(g_hwnd, nullptr, pt.x, pt.y, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     SetForegroundWindow(g_hwnd);  // 否则点菜单外面菜单不消失
     const UINT id = static_cast<UINT>(TrackPopupMenu(
         m, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_hwnd, nullptr));
@@ -636,7 +644,8 @@ int tray_run(http::Server& srv, const TrayHooks& hooks) {
     const std::string local = h.empty() || h == "0.0.0.0" || h == "::" ? "127.0.0.1" : h;
     g_base_url = "http://" + local + ":" + std::to_string(g_hooks.api_port);
 
-    SetProcessDPIAware();
+    // 托盘菜单/气泡按所在显示器 DPI 由系统缩放（manifest 已声明时这里是兜底）
+    windpi::enable_per_monitor_v2();
     HINSTANCE hi = GetModuleHandleW(nullptr);
     WNDCLASSW wc{};
     wc.lpfnWndProc = wnd_proc;

@@ -1145,17 +1145,59 @@ const int kBrX = 564, kBrW = 72;      // 浏览按钮
 const int kHintX = 328, kHintW = 308; // 第 2 页行尾提示（edit 202+120=322 右侧）
 const int kListBottom = 452;          // 各页检查区下缘（底部按钮行在其下）
 
+// ---- DPI ---------------------------------------------------------------------
+// 上面所有布局常量都按 96-DPI 像素书写；建窗口/控件、GDI+ 绘制时经 sc()
+// 换算成当前窗口 DPI 的物理像素。进程按 PerMonitorV2 声明（manifest 或
+// main() 里的运行时兜底），窗口跨屏时由 WM_DPICHANGED 更新 g_dpi 并重排。
+int g_dpi = 96;
+int sc(int v) { return MulDiv(v, g_dpi, 96); }
+
+// 控件在 96-DPI 坐标系里的基准位置（含立绘条偏移）：WM_DPICHANGED 时
+// 不重建窗口、不丢用户输入，按这张表把所有控件重排到新 DPI。
+struct CtlBase {
+    HWND h;
+    RECT r;
+};
+std::vector<CtlBase> g_ctl_base;
+
+void remember_ctl(HWND h, int x, int y, int w, int ht) {
+    if (!h) return;
+    const RECT r{x, y, x + w, y + ht};
+    for (CtlBase& b : g_ctl_base)
+        if (b.h == h) {
+            b.r = r;
+            return;
+        }
+    g_ctl_base.push_back({h, r});
+}
+
+// 摆放控件并记录基准位置。flags 里的显示/隐藏标志原样保留；统一补
+// SWP_NOZORDER/NOACTIVATE，控件层不需要改 z 序。
+void place(HWND h, int x, int y, int w, int ht, UINT flags) {
+    if (!h) return;
+    remember_ctl(h, x, y, w, ht);
+    SetWindowPos(h, nullptr, sc(x), sc(y), sc(w), sc(ht),
+                 flags | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
 // 统一字体：不用 DEFAULT_GUI_FONT（MS Shell Dlg 在不同机器上替换表不同，
 // 有的落到宋体，西文更宽会溢出固定宽度布局）。YaHei UI 自 Vista 起全版本自带。
+// 字高 14 是 96-DPI 基准，按当前 DPI 换算（200% → 28px，物理字号不变）。
+HFONT g_panel_font = nullptr;
+int g_panel_font_dpi = 0;
+
 HFONT panel_font() {
-    static HFONT f = [] {
-        HFONT h = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                              CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-                              L"Microsoft YaHei UI");
-        return h ? h : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-    }();
-    return f;
+    if (!g_panel_font || g_panel_font_dpi != g_dpi) {
+        // 旧 HFONT 不 DeleteObject：WM_DPICHANGED 里控件还短暂持有它；
+        // 每次切换多一个字体对象，量级可忽略。
+        g_panel_font = CreateFontW(-sc(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                   CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                                   L"Microsoft YaHei UI");
+        if (!g_panel_font) g_panel_font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        g_panel_font_dpi = g_dpi;
+    }
+    return g_panel_font;
 }
 
 HWND add_ctrl(HWND parent, const wchar_t* cls, DWORD style, int x, int y, int w, int h,
@@ -1167,8 +1209,10 @@ HWND add_ctrl(HWND parent, const wchar_t* cls, DWORD style, int x, int y, int w,
         if (ty == BS_PUSHBUTTON || ty == BS_DEFPUSHBUTTON || (style & BS_PUSHLIKE))
             style = (style & ~(BS_TYPEMASK | BS_PUSHLIKE)) | BS_OWNERDRAW;
     }
-    HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, x + g_art_w, y, w, h,
-                             parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+    const int bx = x + g_art_w;  // 立绘条偏移保持在 96-DPI 坐标里，由 sc() 统一放大
+    HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style,
+                             sc(bx), sc(y), sc(w), sc(h), parent,
+                             reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                              GetModuleHandleW(nullptr), nullptr);
     // 勾选框/单选钮：去主题退回经典绘制，由 WM_CTLCOLORSTATIC 的浅色文字 +
     // 透明底接管（主题样式的文字是深色，夜空背景上看不清）
@@ -1179,7 +1223,10 @@ HWND add_ctrl(HWND parent, const wchar_t* cls, DWORD style, int x, int y, int w,
     // 编辑框滚动条深色化（DarkMode_Explorer 主题类，Win10 1809+；失败则保持默认）
     if (g_panel_bg && wcscmp(cls, L"Edit") == 0)
         SetWindowTheme(c, L"DarkMode_Explorer", nullptr);
-    SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(panel_font()), TRUE);
+    if (c) {
+        remember_ctl(c, bx, y, w, h);
+        SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(panel_font()), TRUE);
+    }
     return c;
 }
 
@@ -1418,13 +1465,13 @@ bool panel_browse_dir(HWND edit) {
 
 // 把一个文件行排到指定 y（SWP_SHOWWINDOW），或整行隐藏
 void place_row(const FileRow& r, int y, bool visible) {
-    const UINT flags = SWP_NOZORDER | (visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW);
+    const UINT flags = visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW;
     const int ex = (r.off ? kEdX + kOffW + 8 : kEdX) + g_art_w;
     const int ew = 556 + g_art_w - ex;
-    SetWindowPos(r.label, nullptr, kLblX + g_art_w, y + 3, kLblW, 18, flags);
-    if (r.off) SetWindowPos(r.off, nullptr, kEdX + g_art_w, y, kOffW, 20, flags);
-    SetWindowPos(r.edit, nullptr, ex, y, ew, 22, flags);
-    if (r.browse) SetWindowPos(r.browse, nullptr, kBrX + g_art_w, y - 1, kBrW, 24, flags);
+    place(r.label, kLblX + g_art_w, y + 3, kLblW, 18, flags);
+    if (r.off) place(r.off, kEdX + g_art_w, y, kOffW, 20, flags);
+    place(r.edit, ex, y, ew, 22, flags);
+    if (r.browse) place(r.browse, kBrX + g_art_w, y - 1, kBrW, 24, flags);
 }
 
 // 第 1 页布局：按版本只显示相关文件行，顺序重排，隐藏其余
@@ -1481,17 +1528,17 @@ void layout_page1(int ver) {
     UnionRect(&dirty, &dirty, &tmp);
     tmp = rect_in_parent(g_pc.out1);
     UnionRect(&dirty, &dirty, &tmp);
-    SetWindowPos(g_pc.tok_hint, nullptr, kEdX + g_art_w, y + 2, 434, 18,
-                 SWP_NOZORDER | SWP_SHOWWINDOW | SWP_NOCOPYBITS);
-    SetWindowPos(g_pc.ver_note, nullptr, kEdX + g_art_w, y + 24, 434, 18,
-                 SWP_NOZORDER | SWP_SHOWWINDOW | SWP_NOCOPYBITS);
+    place(g_pc.tok_hint, kEdX + g_art_w, y + 2, 434, 18,
+          SWP_SHOWWINDOW | SWP_NOCOPYBITS);
+    place(g_pc.ver_note, kEdX + g_art_w, y + 24, 434, 18,
+          SWP_SHOWWINDOW | SWP_NOCOPYBITS);
     // V2 专属：prefill 4-bit 加速勾选框排在版本说明下一行，检查区随之下移一行
     const bool a4_row = ver == kVerV2;
-    SetWindowPos(g_pc.moe_a4, nullptr, kEdX + g_art_w, y + 46, 434, 20,
-                 SWP_NOZORDER | SWP_NOCOPYBITS | (a4_row ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
+    place(g_pc.moe_a4, kEdX + g_art_w, y + 46, 434, 20,
+          SWP_NOCOPYBITS | (a4_row ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
     const int out_y = a4_row ? y + 72 : 254;
-    SetWindowPos(g_pc.out1, nullptr, 12 + g_art_w, out_y, 624, kListBottom - out_y,
-                 SWP_NOZORDER | SWP_SHOWWINDOW | SWP_NOCOPYBITS);
+    place(g_pc.out1, 12 + g_art_w, out_y, 624, kListBottom - out_y,
+          SWP_SHOWWINDOW | SWP_NOCOPYBITS);
     SetWindowTextW(g_pc.ver_note, ver == kVerGguf
                                       ? TR(L"GGUF：填第 1 个分片；MTP/视觉塔可留空不用",
                                            L"GGUF: enter the first shard; MTP/vision may be left off")
@@ -1522,11 +1569,51 @@ void show_page(int idx) {
     if (idx == 0) layout_page1(g_weights_ver);  // 重新隐藏非当前版本的文件行
 }
 
+// 把「背景 + 立绘」按当前 g_dpi 烘焙成一张全客户区缓存位图：WM_ERASEBKGND
+// 直接 BitBlt 它来完成擦除 —— 透明文字标签下方永远是真实背景像素，
+// 既不闪烁也不会残影。WM_DPICHANGED 只重烘焙，不重读图片（g_art_w 不变，
+// 已记录的控件基准坐标仍然有效）。
+void bake_panel_bg() {
+    if (g_bg_dc) { DeleteDC(g_bg_dc); g_bg_dc = nullptr; }
+    if (g_bg_bmp) { DeleteObject(g_bg_bmp); g_bg_bmp = nullptr; }
+    if (!g_bg_img) return;
+    // 以实际客户区为准：WM_DPICHANGED 的系统建议矩形按比例算出，非客户区
+    // 的取整可能让客户区与 sc() 理想值差 1–2 像素，缓存位图必须严格等大。
+    RECT client{0, 0, sc(kCliW + g_art_w), sc(kCliH)};
+    if (g_panel) GetClientRect(g_panel, &client);
+    const int cw = client.right, ch = client.bottom;
+    if (cw <= 0 || ch <= 0) return;
+    HDC scr = GetDC(nullptr);
+    g_bg_dc = CreateCompatibleDC(scr);
+    g_bg_bmp = CreateCompatibleBitmap(scr, cw, ch);
+    ReleaseDC(nullptr, scr);
+    HGDIOBJ old = SelectObject(g_bg_dc, g_bg_bmp);
+    Gdiplus::Graphics g(g_bg_dc);
+    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+    // 按高度等比铺满，横向平移让月亮落到立绘条中央（源图月心约 x=390/1915），
+    // 控件区不被亮部压字
+    const double bg_scale = (double)ch / g_bg_img->GetHeight();
+    const int bw = static_cast<int>(g_bg_img->GetWidth() * bg_scale);
+    const int moon_x = static_cast<int>(390.0 / g_bg_img->GetWidth() * bw);
+    g.DrawImage(g_bg_img, sc(g_art_w) / 2 - moon_x, 0, bw, ch);
+    // 控件区压一层半透明深色，浅色文字在任何云纹上都可读
+    Gdiplus::SolidBrush dim(Gdiplus::Color(115, 8, 10, 22));
+    g.FillRectangle(&dim, sc(g_art_w), 0, cw - sc(g_art_w), ch);
+    if (g_art) {  // 立绘居中烘焙进背景
+        const int iw = static_cast<int>(g_art->GetWidth()),
+                  ih = static_cast<int>(g_art->GetHeight());
+        int dw = sc(g_art_w) - sc(8), dh = static_cast<int>((double)dw * ih / iw);
+        if (dh > ch) {
+            dh = ch;
+            dw = static_cast<int>((double)dh * iw / ih);
+        }
+        g.DrawImage(g_art, (sc(g_art_w) - dw) / 2, (ch - dh) / 2, dw, dh);
+    }
+    SelectObject(g_bg_dc, old);
+}
+
 // 立绘/背景加载：GDI+ 惰性初始化（进程一次）。立绘缺失时 g_art_w=0，
 // 窗口退回经典 644 宽紧凑布局，功能不受影响。
-// 背景图存在时把「背景 + 立绘」烘焙成一张全客户区缓存位图：WM_ERASEBKGND
-// 直接 BitBlt 它来完成擦除 —— 透明文字标签下方永远是真实背景像素，
-// 既不闪烁也不会残影。
 void load_panel_art() {
     static ULONG_PTR gdip_token = 0;
     if (!gdip_token) {
@@ -1548,37 +1635,6 @@ void load_panel_art() {
         delete g_bg_img;
         g_bg_img = nullptr;
     }
-    if (g_bg_dc) { DeleteDC(g_bg_dc); g_bg_dc = nullptr; }
-    if (g_bg_bmp) { DeleteObject(g_bg_bmp); g_bg_bmp = nullptr; }
-    if (!g_bg_img) return;
-    const int cw = kCliW + g_art_w;
-    HDC scr = GetDC(nullptr);
-    g_bg_dc = CreateCompatibleDC(scr);
-    g_bg_bmp = CreateCompatibleBitmap(scr, cw, kCliH);
-    ReleaseDC(nullptr, scr);
-    HGDIOBJ old = SelectObject(g_bg_dc, g_bg_bmp);
-    Gdiplus::Graphics g(g_bg_dc);
-    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-    // 按高度等比铺满，横向平移让月亮落到立绘条中央（源图月心约 x=390/1915），
-    // 控件区不被亮部压字
-    const double scale = (double)kCliH / g_bg_img->GetHeight();
-    const int bw = static_cast<int>(g_bg_img->GetWidth() * scale);
-    const int moon_x = static_cast<int>(390.0 / g_bg_img->GetWidth() * bw);
-    g.DrawImage(g_bg_img, g_art_w / 2 - moon_x, 0, bw, kCliH);
-    // 控件区压一层半透明深色，浅色文字在任何云纹上都可读
-    Gdiplus::SolidBrush dim(Gdiplus::Color(115, 8, 10, 22));
-    g.FillRectangle(&dim, g_art_w, 0, kCliW, kCliH);
-    if (g_art) {  // 立绘居中烘焙进背景
-        const int iw = static_cast<int>(g_art->GetWidth()),
-                  ih = static_cast<int>(g_art->GetHeight());
-        int dw = g_art_w - 8, dh = static_cast<int>((double)dw * ih / iw);
-        if (dh > kCliH) {
-            dh = kCliH;
-            dw = static_cast<int>((double)dh * iw / ih);
-        }
-        g.DrawImage(g_art, (g_art_w - dw) / 2, (kCliH - dh) / 2, dw, dh);
-    }
-    SelectObject(g_bg_dc, old);
 }
 
 // owner-draw 按钮：深色圆角卡片。先贴回烘焙背景（圆角外不残留旧像素），
@@ -1606,7 +1662,7 @@ void draw_panel_button(const DRAWITEMSTRUCT* d) {
     Gdiplus::Color edge = checked ? Gdiplus::Color(255, 130, 160, 220)
                                   : Gdiplus::Color(255, 96, 110, 150);
     Gdiplus::GraphicsPath path;
-    const int r = 5, x0 = 1, y0 = 1, x1 = w - 2, y1 = hh - 2;
+    const int r = sc(5), x0 = sc(1), y0 = sc(1), x1 = w - sc(2), y1 = hh - sc(2);
     path.AddArc(x0, y0, r * 2, r * 2, 180, 90);
     path.AddArc(x1 - r * 2, y0, r * 2, r * 2, 270, 90);
     path.AddArc(x1 - r * 2, y1 - r * 2, r * 2, r * 2, 0, 90);
@@ -1614,7 +1670,7 @@ void draw_panel_button(const DRAWITEMSTRUCT* d) {
     path.CloseFigure();
     Gdiplus::SolidBrush fb(fill);
     g.FillPath(&fb, &path);
-    Gdiplus::Pen pen(edge, 1.0f);
+    Gdiplus::Pen pen(edge, static_cast<Gdiplus::REAL>(g_dpi) / 96.0f);
     g.DrawPath(&pen, &path);
     wchar_t txt[128];
     GetWindowTextW(d->hwndItem, txt, 128);
@@ -1631,6 +1687,32 @@ void draw_panel_button(const DRAWITEMSTRUCT* d) {
 }
 
 LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_DPICHANGED) {
+        // 系统建议的新窗口矩形（物理像素）已按新旧 DPI 比例算好，直接采用；
+        // 再按记录的 96-DPI 基准重排全部控件，字体/背景缓存一起重建。
+        const int dpi = static_cast<int>(HIWORD(wp));
+        if (dpi > 0 && dpi != g_dpi) {
+            g_dpi = dpi;
+            const RECT* want = reinterpret_cast<const RECT*>(lp);
+            SetWindowPos(h, nullptr, want->left, want->top, want->right - want->left,
+                         want->bottom - want->top, SWP_NOZORDER | SWP_NOACTIVATE);
+            bake_panel_bg();  // 背景位图按新客户区尺寸重烘焙（不重读图片）
+            HFONT font = panel_font();
+            for (const CtlBase& b : g_ctl_base) {
+                SetWindowPos(b.h, nullptr, sc(b.r.left), sc(b.r.top),
+                             sc(b.r.right - b.r.left), sc(b.r.bottom - b.r.top),
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+                SendMessageW(b.h, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            }
+            SendMessageW(h, WM_SETICON, ICON_BIG,
+                         reinterpret_cast<LPARAM>(app_icon(sc(32))));
+            SendMessageW(h, WM_SETICON, ICON_SMALL,
+                         reinterpret_cast<LPARAM>(app_icon(sc(16))));
+            RedrawWindow(h, nullptr, nullptr,
+                         RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        }
+        return 0;
+    }
     if (msg == WM_DRAWITEM) {
         const DRAWITEMSTRUCT* d = reinterpret_cast<const DRAWITEMSTRUCT*>(lp);
         if (d->CtlType == ODT_BUTTON && g_panel_bg) {
@@ -1671,16 +1753,16 @@ LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return reinterpret_cast<LRESULT>(g_edit_bg);
     }
     if (msg == WM_ERASEBKGND) {
+        RECT client;
+        GetClientRect(h, &client);
         if (g_bg_dc) {  // 擦除 = 贴回烘焙背景（透明标签下方永远是真实背景像素）
             HDC dc = reinterpret_cast<HDC>(wp);
-            BitBlt(dc, 0, 0, kCliW + g_art_w, kCliH, g_bg_dc, 0, 0, SRCCOPY);
+            BitBlt(dc, 0, 0, client.right, client.bottom, g_bg_dc, 0, 0, SRCCOPY);
             return 1;
         }
         if (g_art_w > 0) {  // 无背景图只有立绘：只擦控件区，立绘条由 WM_PAINT 画
             HDC dc = reinterpret_cast<HDC>(wp);
-            RECT rc;
-            GetClientRect(h, &rc);
-            RECT r{g_art_w, 0, rc.right, rc.bottom};
+            RECT r{sc(g_art_w), 0, client.right, client.bottom};
             FillRect(dc, &r, g_panel_bg);
             return 1;
         }
@@ -1689,21 +1771,25 @@ LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
         if (g_bg_dc) {
-            BitBlt(dc, 0, 0, kCliW + g_art_w, kCliH, g_bg_dc, 0, 0, SRCCOPY);
+            RECT client;
+            GetClientRect(h, &client);
+            BitBlt(dc, 0, 0, client.right, client.bottom, g_bg_dc, 0, 0, SRCCOPY);
         } else if (g_art && g_art_w > 0) {
+            RECT client;
+            GetClientRect(h, &client);
             Gdiplus::Graphics g(dc);
             g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
             Gdiplus::SolidBrush bg(Gdiplus::Color(255, GetRValue(kPanelBg), GetGValue(kPanelBg),
                                                   GetBValue(kPanelBg)));
-            g.FillRectangle(&bg, 0, 0, g_art_w, kCliH);
+            g.FillRectangle(&bg, 0, 0, sc(g_art_w), client.bottom);
             const int iw = static_cast<int>(g_art->GetWidth()),
                       ih = static_cast<int>(g_art->GetHeight());
-            int dw = g_art_w - 8, dh = static_cast<int>((double)dw * ih / iw);
-            if (dh > kCliH) {  // 超高则按高度等比收
-                dh = kCliH;
+            int dw = sc(g_art_w) - sc(8), dh = static_cast<int>((double)dw * ih / iw);
+            if (dh > client.bottom) {  // 超高则按高度等比收
+                dh = client.bottom;
                 dw = static_cast<int>((double)dh * iw / ih);
             }
-            g.DrawImage(g_art, (g_art_w - dw) / 2, (kCliH - dh) / 2, dw, dh);  // 居中
+            g.DrawImage(g_art, (sc(g_art_w) - dw) / 2, (client.bottom - dh) / 2, dw, dh);
         }
         EndPaint(h, &ps);
         return 0;
@@ -1881,6 +1967,7 @@ PanelResult panel_run() {
     g_panel_done = false;
     g_panel_result = kPanelClose;
     for (auto& v : g_page_ctls) v.clear();
+    g_ctl_base.clear();  // 上一轮（语言切换重开）的句柄已随窗口销毁
     HINSTANCE hi = GetModuleHandleW(nullptr);
     static bool registered = false;
     if (!registered) {
@@ -1893,26 +1980,27 @@ PanelResult panel_run() {
         wc.lpszClassName = L"Qwenox_setup_panel";
         wc.hbrBackground = g_panel_bg;
         wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));  // IDC_ARROW
-        // 窗口图标（任务栏按钮用）：内嵌 ICO，否则任务栏是空白默认图标
-        static HICON cls_big = app_icon(GetSystemMetrics(SM_CXICON));
-        static HICON cls_small = app_icon(GetSystemMetrics(SM_CXSMICON));
+        // 窗口图标（任务栏按钮用）：内嵌 ICO，否则任务栏是空白默认图标。
+        // 类图标按 96-DPI 基准注册，窗口建好后再按实际 DPI 覆盖。
+        static HICON cls_big = app_icon(32);
+        static HICON cls_small = app_icon(16);
         wc.hIcon = cls_big;
         wc.hIconSm = cls_small;
         RegisterClassExW(&wc);
         registered = true;
     }
-    load_panel_art();  // 决定 g_art_w，窗口宽度随之确定
-    RECT rc{0, 0, kCliW + g_art_w, kCliH};
-    AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
-    const int win_w = rc.right - rc.left, win_h = rc.bottom - rc.top;
-    RECT work{};
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-    const int wx = work.left + (work.right - work.left - win_w) / 2;
-    const int wy = work.top + (work.bottom - work.top - win_h) / 2;
+    // 先在光标所在显示器上建隐藏窗口，取得该屏 DPI 后再定尺寸、装背景、建控件。
+    // PMv2 下窗口的 DPI 跟随所在显示器；这样副屏打开也不会按主屏 DPI 排版。
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof mi;
+    GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY), &mi);
     HWND h = CreateWindowExW(0, L"Qwenox_setup_panel",
                              TR(L"Qwenox 设置", L"Qwenox Settings"),
-                             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, wx, wy, win_w, win_h,
-                             nullptr, nullptr, hi, nullptr);
+                             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+                             mi.rcWork.left, mi.rcWork.top, 100, 100, nullptr, nullptr, hi,
+                             nullptr);
     if (!h) {
         msgbox(std::string(TR("无法创建设置窗口，错误码 ", "Cannot create the setup window, error code ")) +
                    std::to_string(GetLastError()),
@@ -1920,6 +2008,22 @@ PanelResult panel_run() {
         return kPanelClose;
     }
     g_panel = h;
+    g_dpi = static_cast<int>(windpi::dpi_for_window(h));
+
+    load_panel_art();  // 按 g_dpi 决定背景缓存尺寸；立绘缺失时 g_art_w=0
+    RECT rc{0, 0, sc(kCliW + g_art_w), sc(kCliH)};
+    const DWORD frame = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+    windpi::adjust_window_rect_ex_for_dpi(&rc, frame, FALSE, 0, static_cast<UINT>(g_dpi));
+    const int win_w = rc.right - rc.left, win_h = rc.bottom - rc.top;
+    MONITORINFO area{};
+    area.cbSize = sizeof area;
+    GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &area);
+    const int wx = area.rcWork.left + (area.rcWork.right - area.rcWork.left - win_w) / 2;
+    const int wy = area.rcWork.top + (area.rcWork.bottom - area.rcWork.top - win_h) / 2;
+    SetWindowPos(h, nullptr, wx, wy, win_w, win_h, SWP_NOZORDER | SWP_NOACTIVATE);
+    SendMessageW(h, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(app_icon(sc(32))));
+    SendMessageW(h, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(app_icon(sc(16))));
+    bake_panel_bg();  // 窗口尺寸已定，按实际客户区烘焙背景缓存
     // 深色标题栏（Win10 1809+/Win11；不支持的平台静默失败保持默认）
     if (g_panel_bg) {
         const BOOL dark = TRUE;

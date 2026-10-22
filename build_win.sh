@@ -240,6 +240,7 @@ build_api() {
     [[ -x "$CXX" ]] || { echo "找不到 TheRock clang++: $CXX" >&2; exit 1; }
     gen_static_inc
     gui_ldflags
+    mkiconres src/qwenox_win.rc build/qwenox_win.res qwenox-win.exe
     echo "[编译] build/qwenox-win.exe（16 个 TU 并行）"
     local srcs=(http engine_client tokenizer chat_template json_py toolparse vision
                 reqstat reqstat_read power engine_sup tray_win snap_cuts reqlog diagpack main)
@@ -273,12 +274,13 @@ build_api() {
     [[ $fail == 0 ]] || exit 1
     # wevtapi：诊断包读 Windows 事件日志（diagpack.cpp）
     "$CXX" "$objdir"/*.o -lws2_32 -lshell32 -luser32 -lgdi32 -ladvapi32 -lwevtapi \
-      "${GUI_LDFLAGS[@]}" ${pdbl[@]+"${pdbl[@]}"} -o build/qwenox-win.exe
+      "${GUI_LDFLAGS[@]}" ${RES[@]+"${RES[@]}"} ${pdbl[@]+"${pdbl[@]}"} -o build/qwenox-win.exe
 }
 
-# exe 文件图标（可选）：优先 TheRock 的 llvm-rc，没有则退回 Windows SDK 的
-# rc.exe（取最新版本目录）；都没有时 RES 为空，调用方退化为无图标编译
-# （程序内图标不受影响，那是内嵌 ICO）。结果写入 RES 数组。
+# exe 资源（可选）：文件图标 + PerMonitorV2 manifest。优先 TheRock 的 llvm-rc，
+# 没有则退回 Windows SDK 的 rc.exe（取最新版本目录）；都没有时 RES 为空，
+# 调用方退化为无资源编译（程序内图标不受影响；DPI 由运行时 API 兜底）。
+# 结果写入 RES 数组。
 mkiconres() {  # $1=rc 源文件  $2=res 输出  $3=exe 名（提示用）
     RES=()
     "$CXX" -dumpmachine | grep -q msvc || return 0
@@ -291,7 +293,7 @@ mkiconres() {  # $1=rc 源文件  $2=res 输出  $3=exe 名（提示用）
     if [[ -n "$RC" && -x "$RC" ]] && "$RC" "${RCFLAGS[@]}" -fo "$2" "$1"; then
       RES=("$2")
     else
-      echo "提示：llvm-rc 不可用，$3 文件不带图标（程序内图标不受影响）" >&2
+      echo "提示：llvm-rc 不可用，$3 不带文件图标/manifest（DPI 由运行时 API 兜底）" >&2
     fi
 }
 

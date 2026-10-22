@@ -28,6 +28,7 @@
 
 #include "launch_win_icon.inc"  // kIconIco：窗口图标（tools/win_icon.py 生成）
 #include "service_conf.h"       // svcconf：service.conf 共享读写层（与 gdec-api 共用）
+#include "win_dpi.h"            // PerMonitorV2 / GetDpiForWindow 动态封装
 
 // 配置面板在文件末尾以 settings_panel.inc 并入同一匿名命名空间。
 namespace {
@@ -164,8 +165,9 @@ HICON app_icon(int px) {
 #include "settings_panel.inc"
 
 int main() {
-    // 高 DPI 屏上面板图标取对应尺寸、弹框文字不发糊
-    SetProcessDPIAware();
+    // PerMonitorV2：manifest 已声明时这次调用失败也无害；rc 不可用（没嵌
+    // manifest）时靠它在第一个窗口创建前兜底，否则窗口会被系统位图拉伸。
+    windpi::enable_per_monitor_v2();
 
     char exe_path[MAX_PATH];
     GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
