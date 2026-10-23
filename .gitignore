@@ -4,6 +4,7 @@ logs/
 models/
 dev-docs/
 web/
+hipfire-master/
 *.tmp.*
 start_win.exe
 settings_win.exe
