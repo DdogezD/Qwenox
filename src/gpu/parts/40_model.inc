@@ -189,6 +189,18 @@ struct GpuModel {
   int dpf_cur_ = -1;     // layer whose slot gemm_wbf16 may read (main waited its ready event)
   bool dpf_busy_ = false;  // a chunk's pipeline owns the slots (nested borrower chunks skip dpf)
   size_t dpf_bytes_ = 0;   // slot size
+  // Opt-in dense bf16 shadow (QWENOX_DENSE_SHADOW=1): all ht/q6g64 dense
+  // weights dequantized once at load into pinned host memory; gemm_wbf16 then
+  // returns the shadow instead of re-running the dequant every chunk. Same
+  // kernels, same bytes -> bit-identical. Cost: ~7 GiB locked host RAM, and
+  // the dense GEMMs read the shadow over the CPU/GPU fabric instead of VRAM.
+  // Measured 128K (Windows, paged 512K, c6144): 1709.5 vs 1779-1791 tok/s
+  // without it (-4%) -- the host read costs more than the 46 ms/chunk dequant.
+  // Kept as a documented negative result; production stays off.
+  uint8_t* dense_shadow_host_ = nullptr;
+  uint8_t* dense_shadow_dev_ = nullptr;
+  size_t dense_shadow_bytes_ = 0;
+  std::unordered_map<const uint8_t*, size_t> dense_shadow_off_;
   // Measured 10-14 (Windows, v2, 64K): ON is SLOWER -- c4096 1522 -> 1488,
   // c8192 1603 -> 1524, single-chunk 8K 1430 -> 1359, 2K 1241 -> 1205: the
   // side-stream dequant kernels steal CUs / bandwidth from the main GEMMs
@@ -699,14 +711,29 @@ struct GpuModel {
   int pad_id = 248044;
 
   // PLE chunk-ahead prefetch: row addresses are pure functions of the last
-  // two token ids, so the next chunk's disk gather runs on host threads while
+  // two token ids, so the next chunks' disk gathers run on host threads while
   // this chunk's layers occupy the GPU (the gather otherwise leaves the GPU
-  // idle behind embed+L0). One inflight flight, double pinned staging.
+  // idle behind embed+L0). Two flights (N+1, N+2) with three pinned staging
+  // buffers: a multi-second disk stall is hidden behind two chunks of layer
+  // compute instead of one. Same rows, same bytes, same consumers.
   float* ple_eb2 = nullptr;        // second pinned staging [maxbatch_cap, 2560]
   uint8_t* ple_eb_dev2 = nullptr;  // its device alias
-  hipEvent_t ple_stg_ev[2] = {};   // recorded after each staging consume
-  bool ple_stg_ev_ok[2] = {};
-  int ple_par = 0;                 // staging buffer the next gather writes
+  float* ple_eb3 = nullptr;        // third pinned staging (lookahead)
+  uint8_t* ple_eb_dev3 = nullptr;
+  hipEvent_t ple_stg_ev[3] = {};   // recorded after each staging consume
+  bool ple_stg_ev_ok[3] = {};
+  int ple_par = 0;                 // next staging index (rotates 0..2)
+  uint8_t* ple_stgbuf(int b) const {
+    return (uint8_t*)(b == 0 ? ple_eb : b == 1 ? ple_eb2 : ple_eb3);
+  }
+  uint8_t* ple_stgdev(int b) const {
+    return b == 0 ? ple_eb_dev : b == 1 ? ple_eb_dev2 : ple_eb_dev3;
+  }
+  int ple_take_buf() {
+    const int b = ple_par;
+    ple_par = (ple_par + 1) % 3;
+    return b;
+  }
   struct PleFlight {
     std::vector<std::thread> pool;
     std::vector<uint64_t> addrs, keys;
@@ -731,7 +758,18 @@ struct GpuModel {
     int nseg = 0;
     int seg_start[9] = {};
     int64_t seg_pre0[8] = {}, seg_pre1[8] = {};
-  } ple_fl;
+  } ple_fls[2];
+  int ple_cur_i = 0;
+  PleFlight& ple_cur() { return ple_fls[ple_cur_i]; }
+  PleFlight& ple_next() { return ple_fls[ple_cur_i ^ 1]; }
+  void ple_drop_one(PleFlight& fl) {
+    if (fl.valid || fl.inline_io || !fl.pool.empty()) ple_join(fl);
+    fl.valid = false;
+  }
+  void ple_drop_all() {
+    ple_drop_one(ple_fls[0]);
+    ple_drop_one(ple_fls[1]);
+  }
   struct PleSegs {  // ple_spawn argument for a multi-segment flight
     int n = 0;
     int start[9] = {};
@@ -961,6 +999,26 @@ struct GpuModel {
   }
   QWENOX_SLOT_FIELDS(QWENOX_SLOT_ACC)
 #undef QWENOX_SLOT_ACC
+  // Paged-KV fast path for large prefill chunks: when the live sequence's
+  // pages are the identity map, the kernels' legacy ptab==nullptr addressing
+  // reads/writes the same bytes and skips the per-block lookup. Decode,
+  // verify and graph-captured paths (P < 256) keep the real table so baked
+  // pointers stay valid; the scrambled self-test (kv_mode==2) also keeps it.
+  const int* slot_ptab_eff(int s, int P) {
+    if (!kv_paged) return nullptr;
+    if (kv_mode == 2 || P < 256) return slot_d_ptab(s);
+    if (env_zero("QWENOX_KV_IDENTITY")) return slot_d_ptab(s);  // A/B escape
+    const bool id = slot_kv_seq(s).identity;
+    if (id) {
+      static bool logged = false;
+      if (!logged && getenv("QWENOX_KV_DEBUG")) {
+        logged = true;
+        fprintf(stderr, "[kvpage] identity ptab fast path on (P=%d)\n", P);
+      }
+      return nullptr;
+    }
+    return slot_d_ptab(s);
+  }
   // Greedy draft chain without per-step D2H: step j reads step j-1's argmax
   // via D2D, one blocking D2H collects the chain. 0 restores per-step sync.
   const bool draft_desync =
@@ -1072,8 +1130,11 @@ struct GpuModel {
       CK(hipHostGetDevicePointer((void**)&ple_eb_dev, ple_eb, 0));
       CK(hipHostMalloc((void**)&ple_eb2, BP * 2560 * 4, hipHostMallocDefault));
       CK(hipHostGetDevicePointer((void**)&ple_eb_dev2, ple_eb2, 0));
+      CK(hipHostMalloc((void**)&ple_eb3, BP * 2560 * 4, hipHostMallocDefault));
+      CK(hipHostGetDevicePointer((void**)&ple_eb_dev3, ple_eb3, 0));
       CK(hipEventCreateWithFlags(&ple_stg_ev[0], hipEventDisableTiming));
       CK(hipEventCreateWithFlags(&ple_stg_ev[1], hipEventDisableTiming));
+      CK(hipEventCreateWithFlags(&ple_stg_ev[2], hipEventDisableTiming));
       DALLOC(&d_wbf16, (size_t)64 << 20);  // fits q_proj 12288x2560 bf16
       DALLOC(&d_xbf16, BP * 10240 * 2);
       DALLOC(&d_xbf16b, BP * 6144 * 2);  // largest non-cacheable K = 6144
@@ -1554,10 +1615,19 @@ struct GpuModel {
       }
     }
     df2_init();  // no-op unless QWENOX_DFLASH2 is set
+    dense_shadow_init();  // no-op unless QWENOX_DENSE_SHADOW=1
     fprintf(stderr, "qwenox: state allocated (maxctx=%d)\n", maxctx);
   }
 
   ~GpuModel() {
+    ple_drop_all();  // no joinable PLE worker may outlive the model
+    if (dense_shadow_host_) {
+      CK(hipDeviceSynchronize());  // no GEMM may still read the shadow
+      CK(hipHostFree(dense_shadow_host_));
+      dense_shadow_host_ = nullptr;
+      dense_shadow_dev_ = nullptr;
+      dense_shadow_off_.clear();
+    }
     if (rbh) rocblas_destroy_handle(rbh);
     if (lth) hipblasLtDestroy(lth);
 #ifndef _WIN32
@@ -2722,6 +2792,53 @@ struct GpuModel {
   // A = W (transa=T, lda=K), B = X (transb=N, ldb=K), C = Y (ldc=N).
   // W -> bf16 for the LT / WMMA paths: dense bf16 is used in place, the
   // quantized dtypes dequant into the shared d_wbf16 scratch (<= 64 MiB).
+  // QWENOX_DENSE_SHADOW=1: one-time dequant of every ht/q6g64 dense weight into
+  // a pinned host shadow. gemm_wbf16 returns the shadow entry, so the per-chunk
+  // dequant (ht_deq) disappears. Bit-identical (same dequant kernels/bytes).
+  void dense_shadow_init() {
+    if (!getenv("QWENOX_DENSE_SHADOW")) return;
+    if (!g_hgn_v2) {
+      fprintf(stderr, "dense shadow: only hgn v2; off\n");
+      return;
+    }
+    struct Item {
+      const uint8_t* data;
+      WView w;
+      size_t off;
+    };
+    std::vector<Item> items;
+    size_t total = 0;
+    for (const auto& kv : ckpt.tensors()) {
+      const Tensor& t = kv.second;
+      if (t.dtype != 16 && t.dtype != 24) continue;
+      if (kv.first.rfind("layers.", 0) != 0) continue;
+      const WView w = wview(t);
+      const size_t b = (size_t)w.rows * w.cols * 2;
+      if (b > ((size_t)64 << 20) || w.rows < 2) continue;  // gemm_wbf16 would throw
+      items.push_back({w.data, w, total});
+      total += (b + 255) & ~(size_t)255;
+    }
+    if (items.empty() || total == 0) return;
+    void* host = nullptr;
+    if (hipHostMalloc(&host, total, hipHostMallocDefault) != hipSuccess) {
+      fprintf(stderr, "dense shadow: hipHostMalloc %.2f GiB failed; off\n",
+              total / 1073741824.0);
+      return;
+    }
+    void* dev = nullptr;
+    CK(hipHostGetDevicePointer(&dev, host, 0));
+    for (const Item& e : items) {
+      v2_deq_bf16(e.w, (uint16_t*)((char*)dev + e.off), g_str);
+      dense_shadow_off_[e.data] = e.off;
+    }
+    CK(hipStreamSynchronize(g_str));
+    dense_shadow_host_ = (uint8_t*)host;
+    dense_shadow_dev_ = (uint8_t*)dev;
+    dense_shadow_bytes_ = total;
+    fprintf(stderr, "dense shadow: %zu weights, %.2f GiB pinned host\n",
+            items.size(), total / 1073741824.0);
+  }
+
   const uint16_t* gemm_wbf16(const WView& w) {
     uint64_t N = w.rows, K = w.cols;
     const uint16_t* wp = nullptr;
@@ -2729,6 +2846,11 @@ struct GpuModel {
       const uint16_t* p = wpre_override_;
       wpre_override_ = nullptr;
       return p;
+    }
+    if (w.dtype != 0 && dense_shadow_dev_) {
+      auto it = dense_shadow_off_.find(w.data);
+      if (it != dense_shadow_off_.end())
+        return (const uint16_t*)(dense_shadow_dev_ + it->second);
     }
     if (w.dtype != 0)
       if (const uint16_t* pre = dpf_lookup(w)) return pre;  // dequantized ahead (dpf)
@@ -4559,7 +4681,7 @@ struct GpuModel {
     int* const iselb = d_iselected + (size_t)r0 * 512;
     float2* const ropecs = d_ropecs + (size_t)r0 * 32;
     float* const iraw = slot_d_iraw(bs);
-    const int* const ptabc = kv_paged ? slot_d_ptab(bs) : nullptr;
+    const int* const ptabc = slot_ptab_eff(bs, P);
     const bool usnap = slot_spec_snap(bs);
     const int vrow0 = slot_vsnap_row0_(bs);
     const int cutr = slot_cut_r_(bs);
@@ -4637,7 +4759,7 @@ struct GpuModel {
       // scores and selections stay bit-identical to the unpaged layout).
       const float* skeys = keys;
       const uint16_t* skeys16 = keys16;
-      if (kv_paged && nb > 0 && std::max(2051, base) < base + P) {
+      if (kv_paged && ptabc && nb > 0 && std::max(2051, base) < base + P) {
         k_ik_gather<<<nb, 128, 0, g_str>>>(keys, ptabc, d_ikg, nb);
         skeys = d_ikg;
         if (keys16) {
@@ -4876,7 +4998,7 @@ struct GpuModel {
     int* const iselb = d_iselected + (size_t)r0 * 512;
     float2* const ropecs = d_ropecs + (size_t)r0 * 32;
     KvSeqTable& seq = slot_kv_seq(bs);
-    const int* const ptabc = kv_paged ? slot_d_ptab(bs) : nullptr;
+    const int* const ptabc = slot_ptab_eff(bs, P);
     const int sovr = vseg ? (slot_spec_snap(bs) ? 1 : 0) : -1;
     const uint16_t* attn_bf = nullptr;  // gated o_proj input already in bf16
     if (!state_only) {
@@ -7087,9 +7209,8 @@ struct GpuModel {
   // Same three pipelines as the old inline gather (IOCP/io_uring, madvise
   // two-phase, NOSORT per-token); the flight owns all worker-visible state so
   // it can be joined from a later prefill_chunk call.
-  void ple_spawn(std::vector<int>&& toks, int base, int64_t pre0, int64_t pre1,
+  void ple_spawn(PleFlight& fl, std::vector<int>&& toks, int base, int64_t pre0, int64_t pre1,
                  uint8_t* fp8, int buf, const PleSegs* segs = nullptr) {
-    PleFlight& fl = ple_fl;
     fl.toks = std::move(toks);
     fl.slot = bound_;
     fl.base = base;
@@ -7175,6 +7296,14 @@ struct GpuModel {
               std::this_thread::yield();
             const size_t nrow = (size_t)f->P * 16;
             const size_t r0 = nrow * w / npump, r1 = nrow * (w + 1) / npump;
+            // Diagnostic: emulate a slow disk (QWENOX_PLE_DELAY_MS) to verify
+            // that the two-chunk lookahead hides multi-second gather stalls.
+            static const int ple_delay_ms = [] {
+              const char* e = getenv("QWENOX_PLE_DELAY_MS");
+              return e ? std::max(0, atoi(e)) : 0;
+            }();
+            if (ple_delay_ms > 0)
+              std::this_thread::sleep_for(std::chrono::milliseconds(ple_delay_ms));
             PLE_PUMP_I(w).run(f->addrs.data() + r0, f->fp8 + r0 * g_ple_rb,
                               (uint64_t)(uintptr_t)ple_table->data, r1 - r0);
             if (f->workers.fetch_sub(1) == 1)
@@ -7240,8 +7369,7 @@ struct GpuModel {
   }
   // The in-flight gather is exactly this chunk's rows: same owner slot, window,
   // tokens and the two history tokens the cat() window reads before it.
-  bool ple_flight_hit(const std::vector<int>& tokens, int base) const {
-    const PleFlight& fl = ple_fl;
+  bool ple_flight_hit(const PleFlight& fl, const std::vector<int>& tokens, int base) const {
     if (!fl.valid || fl.nseg != 0 || fl.slot != bound_ || fl.base != base ||
         fl.P != (int)tokens.size() || fl.toks != tokens)
       return false;
@@ -7249,16 +7377,16 @@ struct GpuModel {
     ple_pre01(chist, pre0, pre1);
     return fl.pre0 == pre0 && fl.pre1 == pre1;
   }
-  void ple_join() {
+  void ple_join(PleFlight& fl) {
 #ifdef _WIN32
-    if (ple_fl.inline_io) {
+    if (fl.inline_io) {
       PLE_PUMP.wait_all();
-      ple_fl.done = std::chrono::steady_clock::now();
-      ple_fl.inline_io = false;
+      fl.done = std::chrono::steady_clock::now();
+      fl.inline_io = false;
     }
 #endif
-    for (auto& th : ple_fl.pool) th.join();
-    ple_fl.pool.clear();
+    for (auto& th : fl.pool) th.join();
+    fl.pool.clear();
   }
 
   // QWENOX_VGDUMP (debug): sync + D2H an arbitrary device buffer, FNV-1a hash.
@@ -7340,7 +7468,7 @@ struct GpuModel {
   // add. Under verify graph capture (P3-B) the staging-free event is skipped:
   // the round's closing blocking D2H fences the staging reuse instead.
   void enq_ple_device_b(int P, int base, int buf) {
-    uint8_t* stg_dev = buf ? ple_eb_dev2 : ple_eb_dev;
+    uint8_t* stg_dev = ple_stgdev(buf);
     // dequant staging -> f32 d_eb on GPU (zero-copy read of pinned staging)
     if (ple_iq4) {
       size_t nb = (size_t)P * 2560 / 32;
@@ -7360,7 +7488,6 @@ struct GpuModel {
       CK(hipEventRecord(ple_stg_ev[buf], g_str));
       ple_stg_ev_ok[buf] = true;
     }
-    ple_par = buf ^ 1;  // this buffer consumed; the next gather writes the other
     float* hc_storage = d_Rb;
     if (gr_bf16) {
       uint64_t n = (uint64_t)P * 10240;
@@ -7400,17 +7527,24 @@ struct GpuModel {
           borrow_skip_fn(*this);
         }
       }
-      // Next chunk (same sizing rule) feeds the PLE prefetch flight: its
-      // gather runs on host threads under this chunk's layer compute.
-      std::vector<int> nxt;
+      // Next chunks (same sizing rule) feed the two-flight PLE prefetch:
+      // their gathers run on host threads under this chunk's layer compute.
+      std::vector<int> nxt, nxt2;
       if (off + n < N) {
         int rem2 = N - (off + n);
         int n2 = ple_prefetch::chunk_size(rem2, maxbatch, maxbatch_cap);
         nxt.assign(tokens.begin() + off + n, tokens.begin() + off + n + n2);
+        if (off + n + n2 < N) {
+          int rem3 = N - (off + n + n2);
+          int n3 = ple_prefetch::chunk_size(rem3, maxbatch, maxbatch_cap);
+          nxt2.assign(tokens.begin() + off + n + n2,
+                      tokens.begin() + off + n + n2 + n3);
+        }
       }
       id = prefill_chunk(
           std::vector<int>(tokens.begin() + off, tokens.begin() + off + n),
-          base + off, final, quiet, nxt.empty() ? nullptr : &nxt);
+          base + off, final, quiet, nxt.empty() ? nullptr : &nxt,
+          nxt2.empty() ? nullptr : &nxt2);
       // DFlash2: build the draft context K/V for this chunk's (last <= 2048)
       // positions before the next chunk overwrites the tap ring.
       if (df2.on && df2.cap_mode == 1) df2_inject_chunk(base + off, n);
@@ -7450,7 +7584,8 @@ struct GpuModel {
   }
 
   int prefill_chunk(const std::vector<int>& tokens, int base = 0, bool final = true,
-                    bool quiet = false, const std::vector<int>* nxt = nullptr) {
+                    bool quiet = false, const std::vector<int>* nxt = nullptr,
+                    const std::vector<int>* nxt2 = nullptr) {
     int P = (int)tokens.size();
     if (P < 1 || base + P > maxctx || base < 0 || P > maxbatch_cap) {
       fprintf(stderr, "prefill_chunk: base=%d P=%d out of range "
@@ -7488,24 +7623,26 @@ struct GpuModel {
     auto T0 = std::chrono::steady_clock::now();
     auto TP = T0;
     // PLE rows depend only on token history. This chunk's gather may already
-    // be inflight — prefetched at the end of the previous chunk so the disk
-    // pump overlaps that chunk's layer compute; otherwise gather now (first
-    // chunk, quiet re-ingest, or a flight mismatch). Either way the gather
-    // fills staging buffer ple_par and its GPU consumer stays ordered after L0.
+    // be inflight — prefetched one or two chunks ahead so the disk pump
+    // overlaps layer compute; otherwise gather now (first chunk, quiet
+    // re-ingest, or a flight mismatch). Either way the gather fills a
+    // rotating staging buffer and its GPU consumer stays ordered after L0.
+    const bool ple_lookahead = ple_on && P >= 64 && !quiet;
     if (ple_on) {
-      if (!ple_flight_hit(tokens, base)) {
-        if (ple_fl.valid) {  // stale flight (another chunk or slot): finish and drop
+      if (!ple_lookahead) ple_drop_one(ple_next());  // small/quiet: one flight only
+      if (!ple_flight_hit(ple_cur(), tokens, base)) {
+        if (ple_cur().valid) {  // stale flight (another chunk or slot): finish and drop
           static const bool miss_log = getenv("QWENOX_PLE_MISS_LOG") != nullptr;
           if (miss_log)
             fprintf(stderr, "%s ple: drop flight slot %d base %d P %d (chunk slot %d base %d P %d)\n",
-                    log_ts(), ple_fl.slot, ple_fl.base, ple_fl.P, bound_, base, P);
-          ple_join();
-          ple_fl.valid = false;
+                    log_ts(), ple_cur().slot, ple_cur().base, ple_cur().P, bound_, base, P);
         }
+        ple_drop_all();
         int64_t pre0, pre1;
         ple_pre01(chist, pre0, pre1);
-        ple_spawn(std::vector<int>(tokens), base, pre0, pre1,
-                  (uint8_t*)(ple_par ? ple_eb2 : ple_eb), ple_par);
+        const int b = ple_take_buf();
+        ple_spawn(ple_cur(), std::vector<int>(tokens), base, pre0, pre1,
+                  ple_stgbuf(b), b);
       }
       for (int t = 0; t < P; t++) chist.push_back(tokens[t]);
     }
@@ -7542,16 +7679,16 @@ struct GpuModel {
     if (ple_on) {
       KP("ple_wait");  // 否则 join 的磁盘等待会落进上一个分段（hc3）
       auto wait_start = std::chrono::steady_clock::now();
-      ple_join();
+      ple_join(ple_cur());
       auto wait_done = std::chrono::steady_clock::now();
       if (prof) {
-        p_pleh += std::chrono::duration<double, std::milli>(ple_fl.done - ple_fl.start)
+        p_pleh += std::chrono::duration<double, std::milli>(ple_cur().done - ple_cur().start)
                       .count();
         p_ple_wait +=
             std::chrono::duration<double, std::milli>(wait_done - wait_start).count();
       }
-      const int buf = ple_fl.buf;
-      ple_fl.valid = false;
+      const int buf = ple_cur().buf;
+      ple_cur().valid = false;
       KP("ple_dev");
       enq_ple_device_b(P, base, buf);
       vg_dump_row("vgp", P, base);
@@ -7579,16 +7716,46 @@ struct GpuModel {
       }
     }
     phase("L25-47", TP);
-    // PLE chunk-ahead prefetch: gather the next chunk's rows on host threads
-    // while the GPU drains this chunk's layer queue below (row addresses are
-    // pure functions of token ids, all known now; staging is double-buffered).
+    // PLE chunk-ahead prefetch: keep two flights in the air (N+1, N+2) while
+    // the GPU drains this chunk's layer queue below (row addresses are pure
+    // functions of token ids, all known now; staging rotates over 3 buffers).
     // QWENOX_PLE_NOPREFETCH disables for A/B.
     static const bool ple_noprefetch = getenv("QWENOX_PLE_NOPREFETCH") != nullptr;
-    if (ple_on && nxt && !nxt->empty() && !ple_fl.valid && !ple_noprefetch) {
+    if (ple_on && !ple_noprefetch) {
       int64_t pre0, pre1;
       ple_pre01(chist, pre0, pre1);
-      ple_spawn(std::vector<int>(*nxt), base + P, pre0, pre1,
-                (uint8_t*)(ple_par ? ple_eb2 : ple_eb), ple_par);
+      if (ple_lookahead) {
+        // N+1: normally already in flight (spawned two chunks ago). Re-validate
+        // it against the actual next chunk before trusting it (slot switch,
+        // tail absorption or a cancelled request can leave a stale flight).
+        if (nxt && !nxt->empty()) {
+          if (ple_next().valid && !ple_flight_hit(ple_next(), *nxt, base + P))
+            ple_drop_one(ple_next());
+          if (!ple_next().valid) {
+            const int b = ple_take_buf();
+            ple_spawn(ple_next(), std::vector<int>(*nxt), base + P, pre0, pre1,
+                      ple_stgbuf(b), b);
+          }
+        }
+        // N+2 into the flight object just consumed.
+        if (nxt2 && !nxt2->empty()) {
+          if (ple_cur().valid) ple_drop_one(ple_cur());
+          int64_t p0 = pre0, p1 = pre1;
+          if (nxt && !nxt->empty()) {
+            p0 = nxt->back();
+            p1 = nxt->size() >= 2 ? (*nxt)[nxt->size() - 2] : pre0;
+          }
+          const int nb = base + P + (nxt ? (int)nxt->size() : 0);
+          const int b = ple_take_buf();
+          ple_spawn(ple_cur(), std::vector<int>(*nxt2), nb, p0, p1,
+                    ple_stgbuf(b), b);
+        }
+        ple_cur_i ^= 1;  // next chunk consumes the object holding N+1
+      } else if (nxt && !nxt->empty() && !ple_cur().valid) {
+        const int b = ple_take_buf();
+        ple_spawn(ple_cur(), std::vector<int>(*nxt), base + P, pre0, pre1,
+                  ple_stgbuf(b), b);
+      }
     }
     KP("tail");
     // MTP tap capture: d_Rb now holds the final 48-layer stream for every row.
@@ -7760,10 +7927,7 @@ struct GpuModel {
     g_vseg_calls++;
     int ple_buf = 0;
     if (ple_on) {
-      if (ple_fl.valid) {  // stale flight for another chunk: finish and drop
-        ple_join();
-        ple_fl.valid = false;
-      }
+      ple_drop_all();  // verify uses one flight; no two-chunk lookahead here
       PleSegs ps;
       ps.n = nseg;
       std::vector<int> cat;
@@ -7776,9 +7940,9 @@ struct GpuModel {
           slot_chist(sl[s]).push_back((*segs[s].toks)[(size_t)t]);
       }
       ps.start[nseg] = R;
-      ple_buf = ple_par;
-      ple_spawn(std::move(cat), bases[0], 0, 0,
-                (uint8_t*)(ple_buf ? ple_eb2 : ple_eb), ple_buf, &ps);
+      ple_buf = ple_take_buf();
+      ple_spawn(ple_cur(), std::move(cat), bases[0], 0, 0,
+                ple_stgbuf(ple_buf), ple_buf, &ps);
     }
     // embed: one gather pass over the concatenated rows (row-independent)
     int all[8 * 8];
@@ -7788,14 +7952,14 @@ struct GpuModel {
     enq_layer_vseg(0, Ps, bases, sl, voffs, nseg, R, false, true);
     if (ple_on) {
       const auto ple_t0 = std::chrono::steady_clock::now();
-      ple_join();
+      ple_join(ple_cur());
       g_vseg_ple_ms += std::chrono::duration<double, std::milli>(
                            std::chrono::steady_clock::now() - ple_t0).count();
       g_vseg_pleh_ms +=
-          std::chrono::duration<double, std::milli>(ple_fl.done - ple_fl.start).count();
-      ple_fl.valid = false;
-      ple_fl.nseg = 0;  // later single-window flights must not see segments
-      uint8_t* stg_dev = ple_buf ? ple_eb_dev2 : ple_eb_dev;
+          std::chrono::duration<double, std::milli>(ple_cur().done - ple_cur().start).count();
+      ple_cur().valid = false;
+      ple_cur().nseg = 0;  // later single-window flights must not see segments
+      uint8_t* stg_dev = ple_stgdev(ple_buf);
       if (ple_iq4) {
         size_t nb = (size_t)R * 2560 / 32;
         k_ple_iq4nl_dequant<<<(unsigned)((nb + 255) / 256), 256, 0, g_str>>>(
@@ -7812,7 +7976,6 @@ struct GpuModel {
       // staging is free once the dequant ran; gates the next gather into buf
       CK(hipEventRecord(ple_stg_ev[ple_buf], g_str));
       ple_stg_ev_ok[ple_buf] = true;
-      ple_par = ple_buf ^ 1;
     }
     if (ple_on) {  // device phase, same shape as enq_ple_device_b over R rows
       float* hc_storage = d_Rb;
@@ -11651,19 +11814,16 @@ struct GpuModel {
     vz_rows_ = true;
     xf16_src = nullptr;  // a new batch invalidates the bf16 conversion cache
     if (ple_on) {
-      if (ple_fl.valid) {  // stale flight for another chunk: finish and drop
-        ple_join();
-        ple_fl.valid = false;
-      }
+      ple_drop_all();  // graph verify: one flight, fixed staging buffer 0
       int64_t pre0, pre1;
       ple_pre01(chist, pre0, pre1);
       // fixed staging buffer 0: seg 0's dequant reads ple_eb_dev
-      ple_spawn(std::vector<int>(tokens), base, pre0, pre1, (uint8_t*)ple_eb, 0);
+      ple_spawn(ple_cur(), std::vector<int>(tokens), base, pre0, pre1,
+                (uint8_t*)ple_eb, 0);
       for (int t : tokens) chist.push_back(t);
-      ple_join();
-      ple_fl.valid = false;
-      // mirror the host-side buffer flip enq_ple_device_b does outside
-      // capture: replay consumed staging buffer 0, the next gather writes 1
+      ple_join(ple_cur());
+      ple_cur().valid = false;
+      // replay consumed staging buffer 0, the next gather writes 1
       ple_par = 1;
     }
     memcpy(p_vgtok, tokens.data(), P * 4);
@@ -12085,6 +12245,7 @@ struct GpuModel {
   // process (the constructor memsets d_S/d_convst; hipMalloc's fresh zero
   // pages cover d_ring — reproduce both here).
   void reset_state() {
+    ple_drop_all();  // prefetches belong to the sequence being reset
     pos = 0;
     ple_ringpos = 0;
     chist.clear();

@@ -532,9 +532,14 @@ struct KvPagePool {
 struct KvSeqTable {
   std::vector<int> tab;
   int mapped = 0;
+  // True while tab[i] == i for every mapped page: the physical layout is the
+  // legacy contiguous one, so kernels may use their ptab==nullptr fast path.
+  // Cleared by any non-identity allocation / COW, recomputed on adopt.
+  bool identity = true;
   void init(int lpages, int guard) {
     tab.assign((size_t)lpages, guard);
     mapped = 0;
+    identity = true;
   }
   int rows() const { return mapped * KV_PAGE; }
   // Back rows [0, end). false: end beyond the table or pool exhausted (pages
@@ -545,6 +550,7 @@ struct KvSeqTable {
     while (mapped < need) {
       const int p = pool.alloc();
       if (p < 0) return false;
+      if (p != mapped) identity = false;
       tab[(size_t)mapped++] = p;
     }
     return true;
@@ -558,6 +564,7 @@ struct KvSeqTable {
       tab[(size_t)mapped] = pool.guard();
       n++;
     }
+    if (mapped == 0) identity = true;  // empty: the next alloc re-validates
     return n;
   }
   // A3: take a reference on the pages holding rows [0, pos) (a checkpoint).
@@ -578,12 +585,19 @@ struct KvSeqTable {
     trim(pool, 0);
     for (size_t i = 0; i < pages.size(); i++) tab[i] = pages[i];
     mapped = (int)pages.size();
+    identity = true;
+    for (size_t i = 0; i < pages.size(); i++)
+      if (pages[i] != (int)i) {
+        identity = false;
+        break;
+      }
   }
-  // A3 copy-on-write: logical page lp now maps fresh page p (already holding
-  // a copy); the shared original loses the live reference.
+  // A3 copy-on-write: logical page lp now maps fresh page p (already holding a
+  // copy); the shared original loses the live reference.
   void replace(KvPagePool& pool, int lp, int p) {
     const int old = tab[(size_t)lp];
     tab[(size_t)lp] = p;
+    identity = false;  // a fresh page is never the identity target
     pool.unref(old);
   }
 };
