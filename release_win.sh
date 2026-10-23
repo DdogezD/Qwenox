@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# release_win.sh — Windows 发行包：根目录编译 + 组装 dist/ + 符号包（可选 zip）。
+# release_win.sh — Windows 发行包：根目录编译 + 组装 dist/（含 PDB 与 bench token，可选 zip）。
 #
 # 编译调用 build_win.sh all（引擎、bench、API 托盘程序、start_win、settings），
-# 然后把运行所需文件复制到 dist/<包名>/。发行包不含模型权重和 PDB；PDB 由
-# tools/pack_symbols_win.sh 另存。用法见 --help。
+# 然后把运行所需文件复制到 dist/<包名>/。发行包不含模型权重；PDB 调试符号默认
+# 随包放进 build/，用户崩溃时用同版本的 PDB 还原 minidump。用法见 --help。
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,7 +13,7 @@ usage() {
     cat <<'EOF'
 用法: bash release_win.sh [选项]
 
-编译（build_win.sh all）后组装 Windows 发行文件夹，并生成调试符号包。
+编译（build_win.sh all）后组装 Windows 发行文件夹；PDB 调试符号默认随包分发。
 
 选项:
   --release          正式包名：去掉 -preview（默认带 -preview）
@@ -23,18 +23,19 @@ usage() {
                      （只停止，不会自动重启服务）
   --skip-build       跳过编译，直接用 build/ 现有产物打包
   --force            目标文件夹已存在时覆盖
-  --no-symbols       不生成 PDB 符号包
+  --no-symbols       不包含 PDB 调试符号（包更小；正式发布不推荐）
   -h, --help         显示本帮助
 
 产物:
   dist/<包名>/                          可直接拷到同架构 Windows 机器运行
-  dist/qwenox-symbols-<版本>-<git>.zip  调试符号（崩溃 minidump 还原用）
-  dist/<包名>.zip                       --zip 时
+  dist/<包名>/build/*.pdb               调试符号（崩溃 minidump 还原用，随包）
+  dist/<包名>.zip                       --zip 时（含 PDB）
 
 说明:
   - 编译在项目根目录进行；运行中的服务会锁住 build/ 下的 exe，脚本默认报错退出，
     加 --stop 可先结束服务（先停 API，再停引擎）。
-  - 发行包不含模型权重和 PDB。models/ 只有 README 占位；data/tokenizer 随包分发。
+  - 发行包不含模型权重，但默认包含 PDB 调试符号和 benchmark 的
+    data/qsa-oracle/*.tokens。models/ 只有 README 占位；data/tokenizer 随包分发。
   - 包内 service.conf 原样复制（含 PARALLEL / KV_POOL_TOKENS / MOE_A4 等当前值）；
     BUILD-INFO.txt 会记录本次构建的关键配置与时间。
 EOF
@@ -71,7 +72,11 @@ done
 
 VER="$(tr -d ' \r\n' < VERSION 2>/dev/null || true)"
 [[ "$VER" =~ ^[0-9A-Za-z.-]+$ ]] || die "VERSION 文件缺失或格式不对（应形如 0.0.8）"
-[[ -n "$NAME" ]] || NAME="qwenox-$VER-win64$([[ $PREVIEW == 1 ]] && echo -preview)"
+if [[ -z "$NAME" ]]; then
+    NAME="qwenox-$VER-win64"
+    # set -e: keep this branch's status 0 when PREVIEW=0
+    if (( PREVIEW )); then NAME+="-preview"; fi
+fi
 [[ "$NAME" =~ ^[0-9A-Za-z._-]+$ ]] || die "包名只允许字母、数字、点、下划线、连字符"
 OUT="dist/$NAME"
 case "$OUT" in
@@ -155,7 +160,7 @@ fi
 mkdir -p "$OUT/build/rocblas/library" "$OUT/build/hipblaslt/library" \
          "$OUT/data/tokenizer" "$OUT/models"
 
-# ---- 运行文件（不含 PDB / 中间产物 / winlibs） ------------------------------
+# ---- 运行文件（不含中间产物 / winlibs） ------------------------------------
 RUNTIME_FILES=(
     qwenox-engine-win.exe qwenox-win.exe qwenox-bench.exe
     amdhip64_7.dll rocm_kpack.dll amd_comgr.dll rocblas.dll libhipblaslt.dll origami.dll
@@ -182,6 +187,15 @@ done
 [[ -d media ]] && cp -a media "$OUT/"
 
 cp -a "$TOK_DIR/tokenizer.json" "$OUT/data/tokenizer/"
+# qwenox-bench 的 prefill 基准直接读取 data/qsa-oracle/*.tokens；随包分发，
+# 否则发行包里的 bench 会在 "no .tokens files found" 处失败。
+if compgen -G "data/qsa-oracle/*.tokens" >/dev/null; then
+    mkdir -p "$OUT/data/qsa-oracle"
+    cp -a data/qsa-oracle/*.tokens "$OUT/data/qsa-oracle/"
+    echo "[bench] 包含 $(ls -1 data/qsa-oracle/*.tokens | wc -l) 个 token 文件"
+else
+    die "缺少 data/qsa-oracle/*.tokens（qwenox-bench 的 prefill 基准输入）"
+fi
 if [[ -f data/tokenizer/README.md ]]; then
     cp -a data/tokenizer/README.md "$OUT/data/tokenizer/"
 else
@@ -216,18 +230,18 @@ cat > "$OUT/models/README.txt" <<'EOF'
 缺少文件时托盘/启动器会列出具体缺哪一项，不会带着半套权重启动。
 EOF
 
-# ---- 调试符号（不进发行包） -------------------------------------------------
-SYMBOLS_FILE="qwenox-symbols-$VER-$GITREV.zip"
-SYMBOLS_NOTE="未生成"
+# ---- PDB 调试符号（默认随包；--no-symbols 排除） ---------------------------
 if (( SYMBOLS )); then
-    echo "[符号] tools/pack_symbols_win.sh"
-    if bash tools/pack_symbols_win.sh; then
-        [[ -f "dist/$SYMBOLS_FILE" ]] && SYMBOLS_NOTE="dist/$SYMBOLS_FILE"
-    else
-        echo "警告：符号包生成失败（不影响发行包；可能有目标用 QWENOX_PDB=0 编译）" >&2
-    fi
+    pdb_n=0
+    for f in build/*.pdb; do
+        [[ -f "$f" ]] || continue
+        cp -a "$f" "$OUT/build/"
+        pdb_n=$((pdb_n + 1))
+    done
+    (( pdb_n )) || die "build/ 下没有 PDB（编译时设了 QWENOX_PDB=0？）。正式发布需要调试符号；如确定不要，加 --no-symbols"
+    echo "[符号] 随包包含 $pdb_n 个 PDB"
 else
-    echo "[符号] --no-symbols，跳过"
+    echo "[符号] --no-symbols，不包含 PDB"
 fi
 
 # ---- BUILD-INFO -------------------------------------------------------------
@@ -287,6 +301,11 @@ else
     LABEL="正式发行版"
     PREVIEW_LINE="本包为正式发行文件夹，不含模型权重（体积原因）。"
 fi
+if (( SYMBOLS )); then
+    PDB_LINE="build\\ 内含 PDB 调试符号（qwenox-engine-win.pdb / qwenox-win.pdb），与 exe 同一次编译；收到崩溃 minidump 时用它还原函数名和源码行。"
+else
+    PDB_LINE="本包不含 PDB 调试符号（--no-symbols）；正式发布不推荐这样打包。"
+fi
 
 cat > "$OUT/BUILD-INFO.txt" <<EOF
 Qwenox $VER — Windows x64 $LABEL
@@ -316,8 +335,10 @@ start_win.sh              Git Bash 命令行启动（行为同 Linux 启动器�
 service.conf              部署配置（同上表；环境变量可临时覆盖）
 build\                    引擎 qwenox-engine-win.exe、API qwenox-win.exe、
                           benchmark qwenox-bench.exe、HIP/rocBLAS 运行库、
-                          gfx1151 kernel db（自包含，无需安装 ROCm/TheRock）
+                          gfx1151 kernel db（自包含，无需安装 ROCm/TheRock）；
+                          默认含 *.pdb 调试符号
 data\tokenizer\           兜底词表 tokenizer.json（API 前端使用）
+data\qsa-oracle\          benchmark 的 prefill token 文件（qwenox-bench 使用）
 models\                   空目录，模型权重需自行放入（见 models\README.txt）
 docs\、README.md          使用、配置、并发、YaRN、GGUF 等文档
 media\                    README 引用的配图
@@ -337,8 +358,7 @@ SHA256SUMS.txt            包内主要文件的校验和
 说明
 ----
 - $PREVIEW_LINE
-- 不含 PDB 调试符号；同一次编译的符号另存为 ${SYMBOLS_NOTE}，
-  收到崩溃 minidump 时配合使用。
+- $PDB_LINE
 - MOE_A4 只影响 prefill（prompt/长输入），生成阶段不经过该路径；
   精度取舍与实测数字见 README.md「prefill 4-bit 加速」一节。
 EOF
@@ -347,9 +367,12 @@ EOF
 if command -v sha256sum >/dev/null 2>&1; then
     (
         cd "$OUT"
-        sha256sum build/qwenox-engine-win.exe build/qwenox-win.exe build/qwenox-bench.exe \
-                  start_win.exe settings_win.exe service.conf \
-                  data/tokenizer/tokenizer.json BUILD-INFO.txt > SHA256SUMS.txt
+        files=(build/qwenox-engine-win.exe build/qwenox-win.exe build/qwenox-bench.exe
+               start_win.exe settings_win.exe service.conf
+               data/tokenizer/tokenizer.json BUILD-INFO.txt)
+        for f in build/*.pdb; do [[ -f "$f" ]] && files+=("$f"); done
+        for f in data/qsa-oracle/*.tokens; do [[ -f "$f" ]] && files+=("$f"); done
+        sha256sum "${files[@]}" > SHA256SUMS.txt
     )
 else
     echo "提示：找不到 sha256sum，跳过 SHA256SUMS.txt" >&2
@@ -373,6 +396,15 @@ for d in "build/rocblas/library/$GPU_ARCH" "build/hipblaslt/library/$GPU_ARCH"; 
         miss=1
     fi
 done
+if [[ -z "$(ls -A "$OUT/data/qsa-oracle" 2>/dev/null)" ]]; then
+    echo "  [缺失] data/qsa-oracle/*.tokens" >&2
+    miss=1
+fi
+if (( SYMBOLS )); then
+    pdb_ok=0
+    for f in "$OUT"/build/*.pdb; do [[ -s "$f" ]] && pdb_ok=1; done
+    (( pdb_ok )) || { echo "  [缺失] build/*.pdb" >&2; miss=1; }
+fi
 (( miss == 0 )) || die "发行包不完整：$OUT"
 
 # ---- 可选 zip ---------------------------------------------------------------
@@ -397,6 +429,10 @@ echo
 echo "[完成] $OUT（$SIZE）"
 echo "  配置：PARALLEL=$PARALLEL_V  KV_POOL_TOKENS=$KVPOOL_V  MAX_CONTEXT=$MAXCTX_V  MOE_A4=$MOEA4_V"
 (( SKIP_BUILD )) || echo "  日志：$BUILD_LOG"
-[[ "$SYMBOLS_NOTE" != "未生成" ]] && echo "  符号：$SYMBOLS_NOTE"
+if (( SYMBOLS )); then
+    echo "  PDB ：$OUT/build/*.pdb（随包）"
+else
+    echo "  PDB ：未包含（--no-symbols）"
+fi
 (( MAKE_ZIP )) && echo "  ZIP ：dist/$NAME.zip"
 echo "  使用：把权重放进 $OUT/models/，双击 start_win.exe"

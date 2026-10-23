@@ -73,16 +73,17 @@ API 把排查需要的东西打成一个**诊断包**（zip），对方只要把
 ## 开发者：把 minidump 还原成源码行（Windows）
 
 `build_win.sh` 默认给引擎和 API 生成 PDB（`build/qwenox-engine-win.pdb`、`build/qwenox-win.pdb`）。PDB 只对应**同一次编译**
-的 exe，用户分发包里不带，所以每次发版后都要把它另存下来：
+的 exe。`release_win.sh` 默认把 PDB 一起放进发行包的 `build/`（`--no-symbols`
+可排除），所以用户拿到的包本身就带符号，不需要再单独发符号包；发版时确认
+`dist/<包名>/build/qwenox-engine-win.pdb` 和 `qwenox-win.pdb` 存在即可。
 
-```bash
-bash tools/pack_symbols_win.sh   # → dist/qwenox-symbols-<版本>-<git>.zip（PDB + exe + GPU 运行库 DLL + BUILD-INFO.txt）
+如果不想让用户拿到 PDB，可在打包时加 `--no-symbols`，然后用
+`bash tools/pack_symbols_win.sh` 另存一份自己留档。
+
+收到 `.dmp` 后，用发行包 `build/` 里的 PDB（或自己另存的符号包），用 WinDbg 或 cdb 打开：
+
 ```
-
-收到 `.dmp` 后，解开对应版本的符号包，用 WinDbg 或 cdb 打开：
-
-```
-cdb -z crash-engine-1234-20261022-103433.dmp -y "<符号包目录>;srv*%LOCALAPPDATA%\symbols*https://msdl.microsoft.com/download/symbols" -c ".ecxr; kv; ~*k; q"
+cdb -z crash-engine-1234-20261022-103433.dmp -y "<发行包>\build;srv*%LOCALAPPDATA%\symbols*https://msdl.microsoft.com/download/symbols" -c ".ecxr; kv; ~*k; q"
 ```
 
 `.ecxr` 切到出错现场，`kv` 是出错线程的栈，`~*k` 是所有线程的栈。崩溃报告也已经嵌在 dump 的注释流里（WinDbg 的 `.dumpdebug` 可以看到）。

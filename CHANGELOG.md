@@ -2,6 +2,46 @@
 
 版本号记在根目录 `VERSION` 文件里，编译时写进程序。查看当前版本有三种方式：托盘菜单第一行、控制台总览页"版本"、`GET /health` 返回的 `version` 字段。引擎本身可以运行 `qwenox-engine-win.exe --version`。
 
+## v0.0.9 — 2026-10-23
+
+### 新功能
+
+- **崩溃诊断**：崩溃报告、Windows minidump、飞行记录、系统/驱动/事件日志诊断包；托盘可一键导出，详见 [CRASHDIAG.md](docs/CRASHDIAG.md)。
+- **DFlash2 投机解码**：新增 drafter 2，支持 greedy 和采样，单槽。
+- **KV 快照增强**：新会话在系统提示中段分叉时，下一次从分叉点恢复；RAM/SSD 按耗时选层、两段淘汰、暂停点落盘；网络盘文件多时不再卡推理。
+- **PLE n-gram 大表可选 bf16 无损版**：dtype 0，引擎按行宽自动识别。
+- **GGUF**：专家权重支持 IQ3_XXS / IQ2_S / Q2_0；dense 权重保留原格式（decode 不再读 q8g32 重量化）；新增 GGUF → i4r 专家补丁生成器和启动器开关 `GGUF_I4R_PATCH`；down f16 pairs 和 LUT prefill 合并 tile 默认开。
+- **API**：新增 `/v1/tokenize`、`/v1/detokenize`；按请求生成 ZIP 日志（`REQLOG`）；用量统计改为全历史小时聚合；请求体上限提升到 128 MiB。
+- **控制台/设置**：新增"构成主义"界面风格；用量柱状图悬浮显示当天请求/token/缓存命中；单请求上限新增 64K–512K 预设，超过 256K 自动开 YaRN。
+- **Benchmark**：新增增量 prefill 测试段（KV 延续阶梯，`BENCH_INCREMENT_*`）；Summary 去重；正确转发 `MOE_A4`。
+- **Windows**：设置面板/托盘改 PerMonitorV2 + 全量 DPI 缩放；新增 `release_win.sh` / `release_win.bat` 发行打包脚本。
+
+### 性能
+
+- **Windows 128K prefill**：PLE 两 chunk 预取（逐 bit 不变，稳态 +0.4%，6 s 级磁盘停顿从第 3 块起完全隐藏）+ paged KV 恒等页表快路径（逐 bit 不变，稳态 +0.86%，`qsa:flash` −5.5%）。
+- Windows PLE gather 默认 8 路多泵（`QWENOX_PLE_RINGS` 可调）。
+- decode 融合减少 kernel 启动；采样草稿接入合批草稿池（默认开）；采样 MTP 轮按草稿置信度逐轮定长（`QWENOX_SPEC_CONF`，默认 0.9）。
+- GGUF prefill MoE 尾部优化；dense 原格式减少 decode 重量化；LUT 合并 tile 默认开。
+- hipBLASLt 算法按 P 分桶（A1），改善 agent 短增量 prefill。
+- KVSNAP 按耗时选层，减少快照开销。
+
+### 修复
+
+- Windows 崩溃诊断实机修正：访问冲突报告、C++ 异常原因、PDB 链接参数、engine 链接 advapi32。
+- 客户端文本里的字面控制串按普通文本编码，避免 F1 特殊 token 注入。
+- 未声明可调用工具的请求禁止输出 `<tool_call>`。
+- 客户端断连立即中断 prompt 预填。
+- 修复 GCC dangling-reference 误报；托盘版本与状态标题合并。
+- 修正 kprof 的 PLE 归属（`ple_wait`/`ple_dev` 分段）。
+- gfx1151 只采信整封装功耗，残桩传感器不再上报。
+
+### 其他
+
+- NPU 卸载移出主线存档到 `attic/`；Linux NPU 路径因 amdxdna 强制 IOMMU SVA 与 prefill 带宽需求冲突而封死。
+- `QWENOX_GG_A4` 标记为废弃、禁止使用，仅留档。
+- README 正文标点统一为中文全角；Linux prefill 实测数据更新为 hgn v2、`MOE_A4=3`。
+- 版本号 0.0.9。
+
 ## v0.0.8 — 2026-10-15
 
 ### 新功能
