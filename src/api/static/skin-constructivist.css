@@ -589,7 +589,8 @@
 }
 [data-style="constructivist"] .style-knob[data-pos="cassette"] .sk-a,
 [data-style="constructivist"] .style-knob[data-pos="punch"] .sk-b,
-[data-style="constructivist"] .style-knob[data-pos="constructivist"] .sk-c { color: var(--slab-ink); }
+[data-style="constructivist"] .style-knob[data-pos="constructivist"] .sk-c,
+[data-style="constructivist"] .style-knob[data-pos="aero"] .sk-d { color: var(--slab-ink); }
 [data-style="constructivist"] .sk-dial {
   position: relative;
   width: 36px; height: 36px;
@@ -604,9 +605,10 @@
   margin-left: -2px;
   background: var(--red);
 }
-[data-style="constructivist"] .style-knob[data-pos="cassette"] .sk-dial { transform: rotate(-45deg); }
-[data-style="constructivist"] .style-knob[data-pos="punch"] .sk-dial { transform: rotate(0deg); }
-[data-style="constructivist"] .style-knob[data-pos="constructivist"] .sk-dial { transform: rotate(45deg); }
+[data-style="constructivist"] .style-knob[data-pos="cassette"] .sk-dial { transform: rotate(-67.5deg); }
+[data-style="constructivist"] .style-knob[data-pos="punch"] .sk-dial { transform: rotate(-22.5deg); }
+[data-style="constructivist"] .style-knob[data-pos="constructivist"] .sk-dial { transform: rotate(22.5deg); }
+[data-style="constructivist"] .style-knob[data-pos="aero"] .sk-dial { transform: rotate(67.5deg); }
 
 /* ================= 铭牌：红色斜切块 + 渐细黑线 ================= */
 [data-style="constructivist"] .plate { grid-area: plate; display: flex; align-items: center; }
@@ -628,7 +630,7 @@
 }
 
 /* ================= 其它 ================= */
-[data-style="constructivist"] .deco-cassette, [data-style="constructivist"] .deco-punch { display: none !important; }
+[data-style="constructivist"] .deco-cassette, [data-style="constructivist"] .deco-punch, [data-style="constructivist"] .deco-aero { display: none !important; }
 [data-style="constructivist"] #ovr-key, [data-style="constructivist"] #cfg-key { width: 260px; }
 [data-style="constructivist"] .cfg-ver-row select { width: 100%; }
 

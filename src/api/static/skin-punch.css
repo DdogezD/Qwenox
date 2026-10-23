@@ -776,7 +776,8 @@
 }
 [data-style="punch"] .style-knob[data-pos="punch"] .sk-b,
 [data-style="punch"] .style-knob[data-pos="cassette"] .sk-a,
-[data-style="punch"] .style-knob[data-pos="constructivist"] .sk-c { color: #ffd98a; }
+[data-style="punch"] .style-knob[data-pos="constructivist"] .sk-c,
+[data-style="punch"] .style-knob[data-pos="aero"] .sk-d { color: #ffd98a; }
 [data-style="punch"] .sk-dial {
   position: relative;
   width: 40px; height: 40px;
@@ -795,9 +796,10 @@
   border-radius: 1px;
   background: #f0ece2;
 }
-[data-style="punch"] .style-knob[data-pos="cassette"] .sk-dial { transform: rotate(-45deg); }
-[data-style="punch"] .style-knob[data-pos="punch"] .sk-dial { transform: rotate(0deg); }
-[data-style="punch"] .style-knob[data-pos="constructivist"] .sk-dial { transform: rotate(45deg); }
+[data-style="punch"] .style-knob[data-pos="cassette"] .sk-dial { transform: rotate(-67.5deg); }
+[data-style="punch"] .style-knob[data-pos="punch"] .sk-dial { transform: rotate(-22.5deg); }
+[data-style="punch"] .style-knob[data-pos="constructivist"] .sk-dial { transform: rotate(22.5deg); }
+[data-style="punch"] .style-knob[data-pos="aero"] .sk-dial { transform: rotate(67.5deg); }
 
 /* ================= 铭牌 ================= */
 [data-style="punch"] .plate { grid-area: plate; display: flex; align-items: center; gap: 18px; }
@@ -819,7 +821,7 @@
 
 
 /* ================= 其它 ================= */
-[data-style="punch"] .deco-cassette, [data-style="punch"] .deco-constructivist { display: none !important; }
+[data-style="punch"] .deco-cassette, [data-style="punch"] .deco-constructivist, [data-style="punch"] .deco-aero { display: none !important; }
 [data-style="punch"] #ovr-key, [data-style="punch"] #cfg-key { width: 260px; }
 [data-style="punch"] .cfg-ver-row select { width: 100%; }
 

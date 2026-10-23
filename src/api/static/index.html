@@ -9,12 +9,13 @@
 <link rel="stylesheet" href="/skin-cassette.css">
 <link rel="stylesheet" href="/skin-punch.css">
 <link rel="stylesheet" href="/skin-constructivist.css">
+<link rel="stylesheet" href="/skin-aero.css">
 <script>
   // 首帧前定好风格与明暗，避免先按默认皮肤画一帧再跳；按钮状态由 app.js initStyle/initTheme 同步
   (function () {
     var d = document.documentElement, s = null, t = null;
     try { s = localStorage.getItem("qwenox-style"); t = localStorage.getItem("qwenox-theme"); } catch (e) { /* 隐私模式 */ }
-    if (s === "cassette" || s === "punch" || s === "constructivist") d.dataset.style = s;
+    if (s === "cassette" || s === "punch" || s === "constructivist" || s === "aero") d.dataset.style = s;
     d.dataset.theme = t || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
   })();
 </script>
@@ -22,7 +23,8 @@
 <body>
 <!-- 整页是一台机器：左屏（全部页面内容）、右侧模块、底部按键/指示灯条、铭牌。
      卡带风格 = CRT 绿屏 + 走带模块；打孔机风格 = 连续打印纸 + 读卡机/寄存器灯板；
-     构成主义风格 = 红黑新闻纸印刷页 + 海报构图（红楔刺入白圆）。
+     构成主义风格 = 红黑新闻纸印刷页 + 海报构图（红楔刺入白圆）；
+     Frutiger Aero = 蓝天绿地 + 玻璃面板 + 叶片和水泡。
      app.js 只按 id / class 取元素，外壳结构纯展示；某一风格专用的装饰件带 .deco-<风格名>，其它风格下隐藏。
      .card 上的 data-seq 是打孔机风格卡片右端序号区打的 8 个字符（app.js 生成孔位）。 -->
 <div class="chassis">
@@ -218,7 +220,8 @@
 
 <!-- 右侧模块（纯指示，不可点）。卡带：推理中磁带轮转动，▶ / ■ 键随忙闲自动按下。
      打孔机：推理中读卡机一张张吸卡、寄存器灯乱闪，空闲灯停在固定图案，未启动全灭；计数器 = 累计请求数（/reqstat/page total）。
-     构成主义：推理中红楔往复推进、小方块旋转，启动中红楔闪，未启动 / 断开时红色褪成灰；大号数字同为累计请求数。 -->
+     构成主义：推理中红楔往复推进、小方块旋转，启动中红楔闪，未启动 / 断开时红色褪成灰；大号数字同为累计请求数。
+     Frutiger Aero：推理中水泡上浮，启动中场景呼吸，未启动 / 断开时降低饱和度。 -->
 <aside class="sidebar">
   <div class="brand">
     <div class="reel-window deco-cassette" aria-hidden="true">
@@ -253,11 +256,18 @@
       <span class="pr-count" id="proun-count">000000</span>
       <span class="pr-count-label">requests</span>
     </div>
+    <div class="aero-scene deco-aero" aria-hidden="true">
+      <img class="aero-landscape" src="/aero-landscape.svg" alt="">
+      <span class="aero-bubble b1"></span>
+      <span class="aero-bubble b2"></span>
+      <span class="aero-bubble b3"></span>
+    </div>
     <div class="deck-label">
       <span class="brand-name">Qwen-Flash-Server</span>
       <span class="deck-sub deco-cassette" aria-hidden="true">qwenox-api / gfx1151</span>
       <span class="deck-sub deco-punch" aria-hidden="true">SYSTEM/1151</span>
       <span class="deck-sub deco-constructivist" aria-hidden="true">qwenox / gfx1151</span>
+      <span class="deck-sub deco-aero" aria-hidden="true">fresh intelligence / gfx1151</span>
     </div>
   </div>
 </aside>
@@ -281,7 +291,7 @@
   </div>
   <div class="sidebar-foot">
     <button class="style-knob" id="style-btn" data-pos="cassette" data-i18n-title="hint.style" title="切换界面风格">
-      <span class="sk-scale"><span class="sk-a">CASSETTE</span><span class="sk-b">PUNCH</span><span class="sk-c">CONSTRUCT</span></span>
+      <span class="sk-scale"><span class="sk-a">CASSETTE</span><span class="sk-b">PUNCH</span><span class="sk-c">CONSTRUCT</span><span class="sk-d">AERO</span></span>
       <span class="sk-dial"><span class="sk-pointer"></span></span>
     </button>
     <button class="hw-switch" id="lang-btn">
@@ -300,6 +310,7 @@
   <span class="plate-stripes deco-cassette"></span>
   <svg class="plate-tape deco-punch" id="plate-tape"></svg>
   <span class="plate-rule deco-constructivist"></span>
+  <span class="plate-aero deco-aero"></span>
 </div>
 
 </div>

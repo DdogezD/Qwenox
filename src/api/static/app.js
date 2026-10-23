@@ -7,7 +7,7 @@
  *   请求页无筛选条件时走 /reqstat/page 服务端分页（可翻阅全部历史）；
  *   设了筛选条件回退到 tail 最近 1000 条内存过滤。用量页走 /reqstat/usage
  *   的小时聚合（后端进程内缓存，已结束的小时只扫描一次），前端再按本地日汇总。
- * - 界面风格（卡带 / 打孔机 / 构成主义）存 localStorage，<html data-style> 切换皮肤，见"界面风格"一节。
+ * - 界面风格（卡带 / 打孔机 / 构成主义 / Frutiger Aero）存 localStorage，<html data-style> 切换皮肤，见"界面风格"一节。
  */
 
 // ---------------- 多语言 ----------------
@@ -16,7 +16,7 @@ const I18N = {
   zh: {
     "app.title": "Qwen-Flash-Server 控制台",
     "hint.theme": "切换明暗主题",
-    "hint.style": "切换界面风格（卡带 / 打孔机 / 构成主义）",
+    "hint.style": "切换界面风格（卡带 / 打孔机 / 构成主义 / Frutiger Aero）",
     "nav.overview": "总览", "nav.usage": "用量", "nav.requests": "请求",
     "common.loading": "加载中…",
     "common.refresh": "刷新", "common.all": "全部", "common.read_failed": "读取失败",
@@ -129,7 +129,7 @@ const I18N = {
   en: {
     "app.title": "Qwen-Flash-Server console",
     "hint.theme": "toggle light/dark theme",
-    "hint.style": "switch UI style (cassette / punch card / constructivist)",
+    "hint.style": "switch UI style (cassette / punch card / constructivist / Frutiger Aero)",
     "nav.overview": "Overview", "nav.usage": "Usage", "nav.requests": "Requests",
     "common.loading": "Loading…",
     "common.refresh": "Refresh", "common.all": "All", "common.read_failed": "read failed",
@@ -309,7 +309,7 @@ document.getElementById("theme-btn").addEventListener("click", () => {
 // 每种风格一份 skin-<名>.css，规则全部挂在 <html data-style="<名>"> 下，页面预加载全部皮肤，
 // 切换只改属性。旋钮按 STYLES 顺序轮换，data-pos 决定指针角度。
 // 新增风格：STYLES 加一项；index.html 加 link 与首帧脚本白名单；各皮肤的旋钮 CSS 加档位。
-const STYLES = ["cassette", "punch", "constructivist"];
+const STYLES = ["cassette", "punch", "constructivist", "aero"];
 // 显示累计请求数的风格（打孔机读卡计数器 / 构成主义海报大数字）
 const COUNT_STYLES = ["punch", "constructivist"];
 
