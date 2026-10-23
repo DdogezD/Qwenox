@@ -311,6 +311,37 @@ across all requests):
 Total throughput rises with the number of requests, but each request gets less: about 12 tok/s per request
 at 8. Configuration, scheduling and verification are in [CONCURRENCY.md](docs/CONCURRENCY.md).
 
+### Concurrency across workloads
+
+The table above is a same-prompt code comparison. MTP acceptance has a large effect on concurrent
+throughput, so here is a second set of measurements across workloads (2026-10-23, Qwenox API, gfx1151
+Windows, greedy, MTP on, prompt cache off, all requests started together, streaming; total throughput is
+measured over the window in which all requests are active, not by summing per-request speeds):
+
+| Workload | Concurrent | MTP acceptance | Per-request steady | Total |
+| --- | --- | --- | --- | --- |
+| Synthetic text (256 prompt / 512 output) | 2 | 47.4% | 30.0 tok/s | 58.4 tok/s |
+| HTML code (Tetris + Breakout, full generation) | 2 | 77–83% | 43.5 tok/s | 83.5 tok/s |
+| Creative writing (eight ~800-character stories) | 8 | 49.1% | 10.7 tok/s | 85.9 tok/s |
+| HTML code (eight pages, 1024-token cap each) | 8 | 69.4% | 13.7 tok/s | 109.7 tok/s |
+
+- Total throughput rises with concurrency but with diminishing returns: on the high-acceptance code
+  workload, going from 2 to 8 requests raises total throughput only from 83.5 to 109.7 tok/s (about
+  1.3×), while per-request speed falls from 43.5 to 13.7 tok/s. Eight slots suit throughput-oriented
+  background work; 2–4 are a better fit for interactive use.
+- MTP acceptance is what makes concurrency pay off: at 8 requests, creative writing at 49.1% reaches
+  85.9 tok/s, while HTML code at 69.4% reaches 109.7 tok/s. Higher acceptance means each verify round
+  advances more tokens and amortizes the weight reads over more requests.
+- With 8 requests arriving together, TTFT rises linearly from about 0.34 s to 2.47 s, roughly +300 ms per
+  request; prefill is time-sliced rather than run 8-way in parallel. Per-request ITL also rises from
+  about 22–24 ms on 2-way code to 62–97 ms, with a standard deviation of 82–145 ms, so generation is
+  less smooth.
+- Token counts come from server `usage`; acceptance comes from the chain drafter in `/reqstat`
+  (accepted/proposed). Two-way creative writing (43–50% acceptance) measured about 57 tok/s over the
+  overlap window and 28.5 tok/s per request, consistent with the synthetic run.
+- The 97.0 tok/s at 8 requests in the table above and the 109.7 tok/s here are not the same parameter
+  set (different prompts, output lengths and acceptance); do not compare them by subtraction.
+
 ## Windows VRAM limit
 
 On Windows, VRAM decides how much context you can open. A process can only reliably use one block of device
