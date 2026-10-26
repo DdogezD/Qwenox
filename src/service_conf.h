@@ -184,14 +184,16 @@ inline bool parse_double(const std::string& s, double* out) {
 }
 
 // AFFINITY（仅 Windows 生效；Linux 由 taskset 负责）：解析进程亲和性配置为
-// mask。空串或解析失败返回 0（调用方按需告警）。"upper-half" = 上半逻辑
-// 处理器（双 CCD 机型钉 CCD1）；其余按 strtoull base 0 解析（支持 0x 前缀）。
+// mask。空串或解析失败返回 0（调用方按需告警）。lower-half / upper-half =
+// 下半 / 上半逻辑处理器（双 CCD 机型对应 CCD0 / CCD1）；其余按 strtoull
+// base 0 解析（支持 0x 前缀）。
 inline unsigned long long parse_affinity(const std::string& s) {
     if (s.empty()) return 0;
-    if (s == "upper-half") {
+    if (s == "lower-half" || s == "upper-half") {
         const unsigned n = std::thread::hardware_concurrency();
         if (n < 2 || n > 64) return 0;
         const unsigned long long all = n == 64 ? ~0ull : ((1ull << n) - 1);
+        if (s == "lower-half") return (1ull << (n / 2)) - 1;
         return all & (~0ull << (n / 2));
     }
     char* end = nullptr;
@@ -357,7 +359,7 @@ inline bool validate_conf(const Conf& conf, std::string* err) {
     }
     const std::string affinity = cfg(conf, "AFFINITY", "");
     if (!affinity.empty() && !parse_affinity(affinity)) {
-        *err = "AFFINITY must be empty, \"upper-half\", or a non-zero integer mask"
+        *err = "AFFINITY must be empty, \"lower-half\", \"upper-half\", or a non-zero integer mask"
                " (got \"" + affinity + "\")";
         return false;
     }

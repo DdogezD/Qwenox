@@ -111,7 +111,7 @@ const I18N = {
     "cfg.title": "服务配置（service.conf）",
     "cfg.hint": "保存写入 service.conf（原内容备份为 .bak），下次启动引擎时生效；运行中的引擎与 API 端口不受影响。环境变量覆盖的键已置灰。",
     "cfg.grp_weights": "权重文件", "cfg.grp_ctx": "推理设置", "cfg.grp_net": "端口与监听",
-    "cfg.aff_off": "不限制", "cfg.aff_ccd1": "亲和到 CCD 1",
+    "cfg.aff_off": "不限制（默认）", "cfg.aff_ccd0": "钉到 CCD 0", "cfg.aff_ccd1": "钉到 CCD 1",
     "cfg.weights_ver": "权重版本",
     "cfg.ver_v1": "V1（单文件，n-gram 内嵌主权重）",
     "cfg.ver_v2": "V2（主权重 + 独立 n-gram 文件）",
@@ -232,7 +232,7 @@ const I18N = {
       "on the next engine start; the running engine and API port are unaffected. " +
       "Keys overridden by environment variables are disabled.",
     "cfg.grp_weights": "Weight files", "cfg.grp_ctx": "Inference", "cfg.grp_net": "Ports & listen",
-    "cfg.aff_off": "Unrestricted", "cfg.aff_ccd1": "Pin to CCD 1",
+    "cfg.aff_off": "Unrestricted (default)", "cfg.aff_ccd0": "Pin to CCD 0", "cfg.aff_ccd1": "Pin to CCD 1",
     "cfg.weights_ver": "Weights version",
     "cfg.ver_v1": "V1 (single file, n-gram embedded)",
     "cfg.ver_v2": "V2 (main weights + separate n-gram)",
@@ -1338,9 +1338,10 @@ function buildCfgForm() {
           inp.appendChild(o);
         }
       } else if (key === "AFFINITY") {
-        // 开关化：只暴露 不限制 / 亲和到 CCD 1（落盘值 "" / "upper-half"）
+        // 三态：不限制 / CCD 0 / CCD 1（落盘值 "" / "lower-half" / "upper-half"）
         inp = document.createElement("select");
-        for (const [v, k] of [["", "cfg.aff_off"], ["upper-half", "cfg.aff_ccd1"]]) {
+        for (const [v, k] of [["", "cfg.aff_off"], ["lower-half", "cfg.aff_ccd0"],
+                              ["upper-half", "cfg.aff_ccd1"]]) {
           const o = document.createElement("option");
           o.value = v;
           o.textContent = t(k);
@@ -1529,9 +1530,8 @@ async function loadConfig() {
     for (const key of Object.keys(cfgInputs)) {
       const inp = cfgInputs[key];
       let val = (j.values && j.values[key]) || "";
-      // AFFINITY 是开关化下拉：conf 里手写的任何非空 mask 都归为"亲和到 CCD 1"，
-      // 保存时规格化为 upper-half
-      if (key === "AFFINITY") val = val ? "upper-half" : "";
+      // 手写 mask 延续 PR 的兼容行为，归为 CCD 1；UI 写入的 lower-half 保留为 CCD 0
+      if (key === "AFFINITY") val = val === "lower-half" ? "lower-half" : val ? "upper-half" : "";
       inp.value = val;
       const envOvr = (j.env_overridden || []).includes(key);
       inp.disabled = envOvr;
@@ -1646,7 +1646,8 @@ function renderEngineAll() {
   const aff = cfgInputs["AFFINITY"];
   if (aff) {
     aff.options[0].textContent = t("cfg.aff_off");
-    aff.options[1].textContent = t("cfg.aff_ccd1");
+    aff.options[1].textContent = t("cfg.aff_ccd0");
+    aff.options[2].textContent = t("cfg.aff_ccd1");
   }
   for (const key of CFG_FILE_KEYS)
     if (cfgInputs[key]) cfgInputs[key].placeholder = t("cfg.pick_ph");

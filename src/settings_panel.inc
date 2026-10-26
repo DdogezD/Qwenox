@@ -12,7 +12,7 @@
 //   第 2 页 推理设置：MAX_CONTEXT / PARALLEL / 并发总池（KV_POOL_TOKENS）/
 //          KV_PAGED / PREFILL_CHUNK / QSA_INDEXER_BUDGET（默认 2048，可选 4096）/
 //          KV 快照（KVSNAP_MAX_GB + KVSNAP_DIR）/ YaRN 勾选（ROPE_FACTOR 自动推导）/
-//          处理器亲和性勾选（不限制 / 亲和到 CCD 1，落盘 AFFINITY ""/upper-half）。
+//          处理器亲和性三态（不限制 / CCD 0 / CCD 1，落盘 AFFINITY ""/lower-half/upper-half）。
 //          GGUF 仅保存（本机服务由 start_win.exe 启动，只支持 hgn；GGUF 配置供 Linux
 //          bash start_gguf.sh 使用）。
 //          ROPE_ORIGINAL_CTX 不做 UI 行（用户不该改）：校验仍从 g_conf/环境读，
@@ -1105,7 +1105,7 @@ enum PanelId : int {
     kBrGguf, kBrGgufMtp, kBrGgufVision,
     kOffOverlay, kOffMtp, kOffVision, kOffGgufMtp, kOffGgufVision,
     kEdMaxctx, kCbMaxctxPreset, kCbParallel, kEdKvPool, kCkKvPaged, kEdPrefill,
-    kCkYarn, kEdKvsnap, kEdKvsnapDir, kBrKvsnapDir, kCkAffinity,
+    kCkYarn, kEdKvsnap, kEdKvsnapDir, kBrKvsnapDir, kCbAffinity,
     kEdEHost, kEdEPort, kEdAHost, kEdAPort,
     kEdOut1, kEdOut2, kEdOut3, kEdReport, kEdSummary, kBtnLang,
     kCkMoeA4, kCkQsaBudget,
@@ -1336,9 +1336,9 @@ PanelVals panel_collect() {
         v.moe_a4 = get_check(g_pc.moe_a4) ? (a4_keep != "0" ? a4_keep : "3") : "0";
     else
         v.moe_a4 = a4_keep;
-    // 亲和性开关化：勾 = upper-half（CCD 1），不勾 = 不限制；conf 里手写的
-    // 任何非空 mask 在面板上都显示为勾，保存时规格化为 upper-half
-    v.affinity = get_check(g_pc.affinity) ? "upper-half" : "";
+    // 三态：不限制 / lower-half（CCD 0）/ upper-half（CCD 1）
+    const int affinity_sel = static_cast<int>(SendMessageW(g_pc.affinity, CB_GETCURSEL, 0, 0));
+    v.affinity = affinity_sel == 1 ? "lower-half" : affinity_sel == 2 ? "upper-half" : "";
     v.engine_host = get_edit(g_pc.ehost);
     v.engine_port = get_edit(g_pc.eport);
     v.api_host = get_edit(g_pc.ahost);
@@ -1944,7 +1944,7 @@ LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             case kCkKvPaged: panel_recheck(); return 0;
             case kCkYarn: panel_recheck(); return 0;
             case kCkMoeA4: panel_recheck(); return 0;
-            case kCkAffinity: panel_recheck(); return 0;
+            case kCbAffinity: panel_recheck(); return 0;
             default: break;
         }
     }
@@ -2206,11 +2206,14 @@ PanelResult panel_run() {
                               TR(L"浏览…", L"Browse"), kBrKvsnapDir);
     y2 += 26;
     plabel(1, h, kLblX, y2, TR(L"处理器亲和性", L"CPU affinity"));
-    g_pc.affinity = pctl(1, h, L"Button", BS_AUTOCHECKBOX | WS_TABSTOP, kEdX, y2, 400, 20,
-                         TR(L"亲和到 CCD 1（双 CCD 机型）", L"Pin to CCD 1 (dual-CCD systems)"),
-                         kCkAffinity);
-    SendMessageW(g_pc.affinity, BM_SETCHECK,
-                 init.affinity.empty() ? BST_UNCHECKED : BST_CHECKED, 0);
+    g_pc.affinity = pctl(1, h, L"ComboBox", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
+                         kEdX, y2, 300, 200, L"", kCbAffinity);
+    for (const wchar_t* s : {TR(L"不限制（默认）", L"Unrestricted (default)"),
+                             TR(L"钉到 CCD 0（双 CCD 机型）", L"Pin to CCD 0 (dual-CCD)"),
+                             TR(L"钉到 CCD 1（双 CCD 机型）", L"Pin to CCD 1 (dual-CCD)")})
+        SendMessageW(g_pc.affinity, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(s));
+    SendMessageW(g_pc.affinity, CB_SETCURSEL,
+                 init.affinity.empty() ? 0 : init.affinity == "lower-half" ? 1 : 2, 0);
     y2 += 26;
     g_pc.out2 = pctl(1, h, L"Edit",
                      WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
