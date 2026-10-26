@@ -5341,7 +5341,15 @@ struct GpuModel {
     pos = cut_abs;
     ple_ringpos = cut_abs % 9;
     if (mtp) mtp_pos = cut_abs - 1;
-    fn();
+    try {
+      fn();
+    } catch (...) {
+      swp();
+      pos = sv_pos;
+      ple_ringpos = sv_ring;
+      mtp_pos = sv_mpos;
+      throw;
+    }
     swp();
     pos = sv_pos;
     ple_ringpos = sv_ring;

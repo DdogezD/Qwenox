@@ -3269,6 +3269,16 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
                   hist.size(), g.ids.size(), g.max_tokens, g.sample ? "sampled" : "greedy");
   crashdiag::rearm();
   crash_test_point("gen");
+  bool owns_cut = false;
+  auto clear_cut = [&] {
+    m.cut_abs = -1;
+    m.cut_r_ = 0;
+    m.cut_hit = m.cut_mtp_hit = false;
+    if (owns_cut) {
+      m.cut_busy = false;
+      owns_cut = false;
+    }
+  };
   try {
     // KV reuse: longest common prefix of live state and this prompt.
     // Continue only when hist is a STRICT prefix (mcp == hist.size() and
@@ -3598,6 +3608,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       inpass_cc = cuts.back();
       cuts.pop_back();
       m.cut_busy = true;  // released after the save below
+      owns_cut = true;
     }
     for (size_t cc : cuts) {
       std::vector<int> seg(g.ids.begin() + done_upto, g.ids.begin() + cc);
@@ -3640,9 +3651,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
         fprintf(stderr, "%s cut: in-pass snapshot at %zu missed (req %lld)\n", log_ts(),
                 inpass_cc, (long long)g.req);
       }
-      m.cut_abs = -1;
-      m.cut_r_ = 0;
-      m.cut_busy = false;
+      clear_cut();
       cut_lap("cut-save");
     }
     m.prog_total = 0;
@@ -4069,9 +4078,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     m.abort_flag = nullptr;
     m.prog_total = 0;
     m.pf_end = 0;
-    m.cut_abs = -1;
-    m.cut_r_ = 0;
-    m.cut_busy = false;
+    clear_cut();
     m.mtp_tap_capture = m.spec_snap = m.ngram_verify_active = false;
     m.reset_state();
     hist.clear();
@@ -4090,6 +4097,8 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     crashdiag::note("req %lld failed: %.80s", (long long)g.req, e.what());
     m.abort_flag = nullptr;
     m.prog_total = 0;
+    m.pf_end = 0;
+    clear_cut();
     m.mtp_tap_capture = m.spec_snap = m.ngram_verify_active = false;
     m.reset_state();
     hist.clear();

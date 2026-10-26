@@ -194,12 +194,13 @@ static int ple_pump_count() { return g_ple_nrings; }
 // g_ple_foff + (addrs[i] - table_va) 读入 staging + i*g_ple_rb；任何失败/短读
 // 立即 fatal，不做半途回退。
 // 一个实例 = 一个文件句柄 + 一个 IOCP，完成包按 OVERLAPPED 地址回推槽位，
-// 因此同一实例同一时刻只能有一个读批次：run() 加锁串行；issue()/wait_all()
-// 由调用方保证独占（只给 PLE flight 用，见 g_ple_win_fl）。
+// 因此同一实例同一时刻只能有一个读批次：run() 加锁串行；issue() 也取得同一把锁，
+// 并持有到 wait_all() 取完全部完成包，覆盖 OVERLAPPED 的整个生命周期。
 struct PleWin {
   HANDLE fh = INVALID_HANDLE_VALUE;
   HANDLE iocp = nullptr;
   std::mutex run_mu;
+  std::unique_lock<std::mutex> batch_lk;
   static constexpr size_t DEPTH = 512;
   std::string path;
 
@@ -289,6 +290,7 @@ struct PleWin {
   std::vector<OVERLAPPED> b_ovs;
   size_t b_n = 0;
   void issue(const uint64_t* addrs, uint8_t* staging, uint64_t table_va, size_t n) {
+    std::unique_lock<std::mutex> lk(run_mu);
     b_ovs.assign(n, OVERLAPPED{});  // never reallocated while reads are pending
     for (size_t i = 0; i < n; i++) {
       OVERLAPPED* ov = &b_ovs[i];
@@ -302,6 +304,7 @@ struct PleWin {
       }
     }
     b_n = n;
+    batch_lk = std::move(lk);
   }
   void wait_all() {
     for (size_t done = 0; done < b_n; done++) {
@@ -317,6 +320,7 @@ struct PleWin {
       }
     }
     b_n = 0;
+    if (batch_lk.owns_lock()) batch_lk.unlock();
   }
 };
 
