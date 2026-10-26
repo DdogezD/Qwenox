@@ -991,7 +991,8 @@ static bool page_image(GpuModel& m, const Geo& G, bool mtp, int i, uint64_t key,
 // their pages: KV rows and MTP rows below each checkpoint are append-only.
 // All of `pend` shares `seed` (commit() groups them).
 static void commit_seed(GpuModel& m, const std::vector<int>& hist,
-                        std::vector<Pending>& pend, uint64_t seed) {
+                        std::vector<Pending>& pend, uint64_t seed,
+                        std::shared_ptr<CkEnt>* park_ck = nullptr) {
   if (!g_on || pend.empty() || (int)hist.size() != m.pos) {
     pend.clear();
     return;
@@ -1004,7 +1005,7 @@ static void commit_seed(GpuModel& m, const std::vector<int>& hist,
     std::lock_guard<std::mutex> lk(g_mtx);
     if (g_q_bytes >= g_qcap) behind = g_q_bytes;
   }
-  if (behind) {
+  if (behind && !park_ck) {
     fprintf(stderr, "%s kvsnap: writer behind (%.0f MB queued): not saving %zu state%s of "
             "%zu tokens\n", log_ts(), behind / 1048576.0, pend.size(),
             pend.size() == 1 ? "" : "s", hist.size());
@@ -1035,6 +1036,10 @@ static void commit_seed(GpuModel& m, const std::vector<int>& hist,
         if (o->name == e->name) old = o;
       if (old && (old->mtp || !e->mtp)) {  // already cached (or queued)
         if (old->pub) touch_locked(old);
+        if (park_ck) {
+          old->busy++;
+          *park_ck = old;
+        }
         continue;
       }
       bool bad = false;  // a failed page write whose references linger
@@ -1061,6 +1066,10 @@ static void commit_seed(GpuModel& m, const std::vector<int>& hist,
         if (r.second) need_mt[(size_t)i] = 1, owner_mt[(size_t)i] = (int)pi;
       }
       g_ck.push_back(e);  // pending (pub = false): dedupes the next commit
+      if (park_ck) {
+        e->busy++;
+        *park_ck = e;
+      }
       keep.push_back(pi);
     }
   }
@@ -2442,7 +2451,9 @@ static thread_local std::atomic<bool>* tl_park_flag = nullptr;
 // 收进快照）。park 推迟到下一回合顶的 acquire，会合等待有超时，推迟有界。
 struct ParkDisarm {
   std::atomic<bool>* saved;
-  ParkDisarm() : saved(tl_park_flag) { tl_park_flag = nullptr; }
+  explicit ParkDisarm(bool on = true) : saved(tl_park_flag) {
+    if (on) tl_park_flag = nullptr;
+  }
   ~ParkDisarm() { tl_park_flag = saved; }
 };
 
@@ -2818,6 +2829,8 @@ static void borrow_turn(GpuModel& m);
 // one round each (borrow_turn: heavy waiters requeue) and keep the GPU.
 static void yield_hook(GpuModel& m) {
   if (tl_slot < 0) return;
+  // 中间 prefill chunk 可能已将下一 token 配入 MTP，等待 lockstep 边界。
+  ParkDisarm pd(m.mtp_tap_capture && m.mtp_pos != m.pos - 1);
   // yield_point() is the first safe boundary after rendezvous/borrow work.
   // The victim may reach it while no other waiter remains on the turnstile;
   // checking park only inside acquire would then leave the victim owning the
@@ -3233,26 +3246,10 @@ struct DrActive {
 // released again.
 static void dr_execute(GpuModel& m) {
   tl_turn_tag = TT_DR;
-  // 同 vr_execute：executor 的 acquire 是 park 安全点（draft 尚未执行，
-  // 回合顶干净状态）；抛出前摘掉自己的 DrReq 并归还 executor 身份。
-  try {
-    tl_park_flag = &g_slot_park[tl_slot];
-    g_turn.acquire();
-    tl_park_flag = nullptr;
-  } catch (const ParkRequest&) {
-    tl_park_flag = nullptr;
-    {
-      std::lock_guard<std::mutex> lk(g_dr.mu);
-      for (size_t i = 0; i < g_dr.pend.size(); i++)
-        if (g_dr.pend[i]->slot == tl_slot) {
-          g_dr.pend.erase(g_dr.pend.begin() + (long)i);
-          break;
-        }
-      g_dr.executing = false;
-    }
-    g_dr.cv.notify_all();
-    throw;
-  }
+  // 本轮 host controller 已推进，不能在 draft 执行前挂起后重跑一遍；
+  // 完成 verify/commit 后，下一回合顶才同时满足 GPU 与 host 状态安全。
+  ParkDisarm pd;
+  g_turn.acquire();
   m.bind(tl_slot);
   std::vector<DrReq*> mine;
   {
@@ -3399,7 +3396,9 @@ static bool starve(GpuModel& m) {
   const uint64_t mine = g_slots[(size_t)cur].seq;
   for (int i = 0; i < n; i++) {
     const Slot& s = g_slots[(size_t)i];
-    if (i != cur && s.busy && !s.abort && s.seq > mine && m.slot_pages(i) > 0 &&
+    if (i != cur && s.busy && !s.abort && !s.park_busy &&
+        !g_slot_park[i].load(std::memory_order_acquire) &&
+        s.seq > mine && m.slot_pages(i) > 0 &&
         (v < 0 || s.seq > g_slots[(size_t)v].seq))
       v = i;
   }
@@ -3522,6 +3521,8 @@ struct GenResume {
   GpuModel::NgGate ng_gate;
   std::unique_ptr<GpuModel::GammaCtl> sample_gamma;
   std::unique_ptr<GpuModel::OccGamma> sample_occ;
+  std::shared_ptr<kvsnap::CkEnt> park_ck;
+  ~GenResume() { if (park_ck) kvsnap::release(park_ck); }
   int ng_cs = 0;
   bool ng_cs_fixed = false, ng_legacy = false;
   bool chain_state_ready = false;
@@ -3696,14 +3697,20 @@ static bool gen_one_pass(GpuModel& m, Conn& c, const GenReq& g,
     const bool is_mrope = !g.mrope_grids.empty();
     const uint64_t req_ih = is_mrope && !cont ? fnv1a_patches(vpatches) : 0;
     std::shared_ptr<kvsnap::CkEnt> ssd_ck;  // busy until restored or released
-    if (!cont && !kvs.dir.empty())
+    const bool restoring_park = rs.park_ck != nullptr;
+    if (restoring_park) {
+      // park backing state 必须精确恢复，不能由普通缓存的 tier 估价替换。
+      cont = false;
+      ssd_ck = std::move(rs.park_ck);
+    }
+    if (!restoring_park && !cont && !kvs.dir.empty())
       // M-RoPE requests: placeholder ids are pixel-agnostic, so the vision
       // tower, grids and patch-bytes hash are folded into the page-key seed;
       // a different image is simply a cache miss. + the text prefix of a
       // vision prompt (g_fp).
       ssd_ck = kvsnap::match(ids, kvsnap::seed_for(is_mrope, req_ih, g.mrope_grids),
                              kvsnap::g_fp);
-    if (!cont && rckpt::enabled()) {
+    if (!restoring_park && !cont && rckpt::enabled()) {
       // RAM checkpoint tier (llama.cpp-style PARTIAL_ONLY): only GDN
       // state is stored; validity requires the checkpoint tokens to be a
       // prefix of the live token stream (m.chist), which guarantees the
@@ -3748,6 +3755,8 @@ static bool gen_one_pass(GpuModel& m, Conn& c, const GenReq& g,
         mtp_live = ck_mtp;
       } else {
         hist.clear();  // live state undefined after a failed restore
+        if (restoring_park)
+          throw std::runtime_error("park checkpoint restore failed");
       }
     }
     if (!cont) m.reset_state();
@@ -4340,7 +4349,7 @@ static bool gen_one_pass(GpuModel& m, Conn& c, const GenReq& g,
               dl_tick();
               return !cancel;
             };
-            m.spec_loop_sample(cur, g.max_tokens - 1, spec_gamma, smp, emit,
+            m.spec_loop_sample(cur, g.max_tokens - ngen, spec_gamma, smp, emit,
                                rs.sample_gamma.get());
           } else {
             auto emit = [&](int tok) -> bool {
@@ -4360,7 +4369,7 @@ static bool gen_one_pass(GpuModel& m, Conn& c, const GenReq& g,
               // discipline. dr_worker_ok is the submit predicate too, so the
               // count never includes a worker that cannot submit.
               DrActive dr_act(m.dr_worker_ok());
-              m.spec_loop(cur, g.max_tokens - 1, spec_gamma, emit);
+              m.spec_loop(cur, g.max_tokens - ngen, spec_gamma, emit);
             }
           }
           spec_r += m.last_spec_rounds;
@@ -4386,7 +4395,7 @@ static bool gen_one_pass(GpuModel& m, Conn& c, const GenReq& g,
       g_slot_parkable[s].store(false, std::memory_order_release);
       // 恢复进入本路径只发生在 drafter 退化（kvsnap 没带 MTP）时；预算按
       // 累计 ngen 扣掉已发送的，cur 已发送过则第一轮只 ingest 不重发。
-      const int plain_budget = g.max_tokens - ngen;
+      const int plain_budget = g.max_tokens - ngen + (resume_pending ? 1 : 0);
       for (int i = 0; i < plain_budget; i++) {
         if (eos.count(cur)) {
           reason = "done";
@@ -4527,13 +4536,8 @@ static bool gen_one_pass(GpuModel& m, Conn& c, const GenReq& g,
     // ingest 的 pending token——与 SNAPS cut 的 capture 是同一类安全点。
     fprintf(stderr, "%s serve: req %lld %s\n", log_ts(), (long long)g.req,
             e.what());
-    m.abort_flag = nullptr;
-    m.prog_total = 0;
-    m.pf_end = 0;
-    m.cut_abs = -1;
-    m.cut_r_ = 0;
-    m.cut_busy = false;
-    m.mtp_tap_capture = m.spec_snap = m.ngram_verify_active = false;
+    lease.turn = false;
+    tl_park_flag = nullptr;
     // 与 starve 的超时收回互斥：只有 park 标志还在才动手 capture（否则页
     // 可能已经被 starve 的硬中断回收了）。park_busy 让 starve 在 capture
     // 期间放宽超时。
@@ -4548,17 +4552,23 @@ static bool gen_one_pass(GpuModel& m, Conn& c, const GenReq& g,
         busy_marked = true;
       }
     }
-    // 抛出点可能在会合批次边界：executor 的串行回退会把 m 留在别家槽位，而
-    // starve 的调用方还停在 kv_reserve 的重试循环里、引用的是成员
-    // kv_seq/d_ptab——绑定被换掉的话，它醒后会在清空的他槽表上重新分配（把
-    // 别家槽位踩烂）。handshake 期间 starve 持回合等 parked、GPU 静止，先
-    // 绑回本槽读状态/capture，做完恢复抛出时的绑定；标志已被超时收回时
-    // （starve 已硬中断、自己 reset 了本槽）完全不碰 m。
+    // starve 等待期间已交还 turn，其他请求仍可能运行。先取得独占执行权、
+    // 绑回本槽，再清理或 capture；park_busy 防止排队期间被超时收回。
+    g_turn.acquire();
+    lease.turn = true;
+    m.bind(s);
+    m.abort_flag = nullptr;
+    m.prog_total = 0;
+    m.pf_end = 0;
+    m.cut_abs = -1;
+    m.cut_r_ = 0;
+    m.cut_busy = false;
+    const bool park_mtp = park_phase == 1 ? m.mtp_tap_capture : mtp_live;
+    m.mtp_tap_capture = m.spec_snap = m.ngram_verify_active = false;
     std::vector<int> toks;
     bool captured = false;
     if (busy_marked) {
-      const int was_bound = m.bound_;
-      m.bind(s);
+      const int was_bound = s;
       // n-gram 表由 chist 重建，自适应控制器必须从本请求的槽位保存。
       if (g.drafter == 3 || g.drafter == 4) {
         rs.ng_gate = m.ng_gate;
@@ -4579,7 +4589,7 @@ static bool gen_one_pass(GpuModel& m, Conn& c, const GenReq& g,
         toks.assign(m.chist.begin(), m.chist.end());  // 已 ingest 的全部 token
                                                       // （pending 的不在内）
       }
-      const bool mtp_lockstep = !mtp_live || m.mtp_pos == m.pos - 1;
+      const bool mtp_lockstep = !park_mtp || m.mtp_pos == m.pos - 1;
       if ((int)toks.size() == m.pos &&
           (int)toks.size() >= kvs.park_min_tokens &&
           (park_phase == 1 || rs.last_sent >= 0) && mtp_lockstep) {
@@ -4587,10 +4597,23 @@ static bool gen_one_pass(GpuModel& m, Conn& c, const GenReq& g,
         // A live MTP request must park only at the round-top checkpoint. Do not
         // silently downgrade it to trunk-only: that would change the sampling
         // algorithm after resume and can change the token stream.
-        kvsnap::capture(m, toks, mtp_live, ppend);
+        kvsnap::capture(m, toks, park_mtp, ppend);
         if (!ppend.empty()) {
-          kvsnap::commit(m, toks, ppend);  // 页的 D2H 在此同步完成，之后即可释放
-          captured = true;
+          // park 不是可丢弃的缓存写入：注册时钉住，发布成功后才能释放 live 页。
+          kvsnap::commit_seed(m, toks, ppend, kvsnap::g_fp, &rs.park_ck);
+          if (rs.park_ck) {
+            std::unique_lock<std::mutex> lk(kvsnap::g_mtx);
+            kvsnap::g_cv.wait(lk, [&] {
+              return rs.park_ck->pub ||
+                  std::find(kvsnap::g_ck.begin(), kvsnap::g_ck.end(), rs.park_ck) ==
+                      kvsnap::g_ck.end();
+            });
+            captured = rs.park_ck->pub;
+            if (!captured) {
+              rs.park_ck->busy--;
+              rs.park_ck.reset();
+            }
+          }
         }
       } else if ((int)toks.size() == m.pos && mtp_live && !mtp_lockstep) {
         fprintf(stderr,
@@ -4644,7 +4667,6 @@ static bool gen_one_pass(GpuModel& m, Conn& c, const GenReq& g,
         fprintf(stderr, "%s serve: req %lld parked %zu tokens to kvsnap; "
                 "resumes when the pool has room\n", log_ts(), (long long)g.req,
                 rs.parked.size());
-        lease.turn = false;  // ParkRequest 抛出点不持有回合，租约析构不再 release
         perfsnap::write_idle();
         viz::finish(s);
         return false;
@@ -4667,7 +4689,6 @@ static bool gen_one_pass(GpuModel& m, Conn& c, const GenReq& g,
     finish(err_line());
     perfsnap::write_idle();
     viz::finish(s);
-    lease.turn = false;
     return true;
   } catch (const ReqCancelled& e) {
     // 客户端在 prompt 预填期间断连/取消：decode 取消的同款收尾，D cancel 行。

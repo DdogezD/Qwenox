@@ -9506,7 +9506,7 @@ struct GpuModel {
       // 回合顶预分配本回合的 KV 行（trunk+MTP 同表，ngram 回合最坏 ~72 行）：
       // 让池子干涸只在回合顶（持有回合、状态干净的安全点）触发 starve/park，
       // 不在会合批次执行中途。
-      if (kv_paged) kv_reserve(std::min(pos + 80, maxctx));
+      if (kv_paged) kv_reserve(pos + std::min({80, gen - (int)out.size() + 1, maxctx - pos}));
       if (chist.size() != (size_t)pos)
         throw std::runtime_error("ngram: token history and trunk position disagree");
       ngram.observe(chist);
@@ -9980,12 +9980,12 @@ struct GpuModel {
       return std::chrono::duration<double, std::milli>(b - a).count();
     };
     auto T0 = std::chrono::steady_clock::now();
-    while ((int)out.size() < gen) {
+    while ((int)out.size() < gen && pos < maxctx) {
       yield_point();  // round top: mtp_pos == pos-1, d_R == h_{pos-1}
-      if (kv_paged) kv_reserve(std::min(pos + 80, maxctx));  // 回合顶预分配（见 ngram 循环注释）
+      if (kv_paged) kv_reserve(pos + std::min({80, gen - (int)out.size() + 1, maxctx - pos}));  // 回合顶预分配（见 ngram 循环注释）
       int q = pos - 1;  // trunk processed through q
       if (d_iraw) vg_dump_buf("irT", 2, d_iraw, 512 * 4);  // P3-B bisect
-      int g = std::min(gctl.cur, gen - (int)out.size());
+      int g = std::min({gctl.cur, gen - (int)out.size(), maxctx - pos - 1});
       // D2-S2a row budget + D2 阶段 3 occupancy γ (round-top snapshot of the
       // rendezvous membership; may return 0 = batched AR round).
       g = occ.pick(g, vseg_active_fn ? vseg_active_fn() : 1, (int)kVSnapRows);
@@ -10263,7 +10263,7 @@ struct GpuModel {
     };
     while ((int)out.size() < gen && pos < maxctx) {
       yield_point();  // round top: only persistent slot state is live
-      if (kv_paged) kv_reserve(std::min(pos + 80, maxctx));  // 回合顶预分配
+      if (kv_paged) kv_reserve(pos + std::min({80, gen - (int)out.size() + 1, maxctx - pos}));  // 回合顶预分配
       if (chist.size() != (size_t)pos)
         throw std::runtime_error(
             "chain: token history and trunk position disagree");
@@ -10639,12 +10639,12 @@ struct GpuModel {
       return std::chrono::duration<double, std::milli>(b - a).count();
     };
     auto T0 = std::chrono::steady_clock::now();
-    while ((int)out.size() < gen) {
+    while ((int)out.size() < gen && pos < maxctx) {
       yield_point();  // round top: mtp_pos == pos-1, d_R == h_{pos-1}
-      if (kv_paged) kv_reserve(std::min(pos + 80, maxctx));  // 回合顶预分配
+      if (kv_paged) kv_reserve(pos + std::min({80, gen - (int)out.size() + 1, maxctx - pos}));  // 回合顶预分配
       int q = pos - 1;
-      int g = std::min(spec_conf() > 0 ? kSpecConfMax : gctl.cur,
-                       gen - (int)out.size());
+      int g = std::min({spec_conf() > 0 ? kSpecConfMax : gctl.cur,
+                        gen - (int)out.size(), maxctx - pos - 1});
       size_t chist_sz = chist.size();
       mtp_ckpt_save();
       Sampler draft_sampler = sampler.fork_stream(
@@ -10994,7 +10994,7 @@ struct GpuModel {
       rp_t = rp_top;
       yield_point();  // round top: only persistent slot state is live
       rp_lap(RP_YIELD);
-      if (kv_paged) kv_reserve(std::min(pos + 80, maxctx));  // 回合顶预分配
+      if (kv_paged) kv_reserve(pos + std::min({80, gen - (int)out.size() + 1, maxctx - pos}));  // 回合顶预分配
       if (chist.size() != (size_t)pos)
         throw std::runtime_error(
             "chain-sample: token history and trunk position disagree");
