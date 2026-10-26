@@ -1390,9 +1390,10 @@ __global__ void k_qsa_step(const float* __restrict__ q, const KVT* __restrict__ 
                            const int* selected = nullptr, bool skip_sparse = false,
                            const int* __restrict__ ptab = nullptr) {
   int visible = *d_pos + 1;
-  bool sparse = selected && visible >= 2052;
+  const int tokens = qsa_index_tokens();
+  bool sparse = selected && visible >= tokens + 4;
   if (sparse && skip_sparse) return;
-  int ntok = sparse ? 2048 + visible % 4 : visible;
+  int ntok = sparse ? tokens + visible % 4 : visible;
   int h = blockIdx.x;
   int kvh = h / (hq / hkv);
   const float* qh = q + h * dh;

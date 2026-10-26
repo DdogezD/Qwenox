@@ -476,7 +476,8 @@ struct GpuModel {
                       getenv("QWENOX_QSA_WMMA_BTV") != nullptr;
   // QWENOX_QSA_WMMA6=1: dim-split 128-thread rewrite (k_qsa_wmma6); layered on
   // the transposed-V path since it reads B fragments from that cache.
-  bool qsa_wmma6 = qsa_wmma_btv && getenv("QWENOX_QSA_WMMA6") != nullptr;
+  bool qsa_wmma6 = g_index_budget == 512 && qsa_wmma_btv &&
+                   getenv("QWENOX_QSA_WMMA6") != nullptr;
   // QWENOX_QSA_UNION=1: 4-query 块并集 WMMA prefill（k_qsa_union_merge +
   // k_qsa_wmma_u），叠加在转置 V 路径上；组边缘回退 k_qsa_wmma<true>。
   // aggr 10-05: default ON (paged support + tail-edge sel-offset fix added;
@@ -485,7 +486,8 @@ struct GpuModel {
   // D2-S1b: spec verify chunks (spec_snap) never take the union path — group
   // membership depends on (base+P)&~3, i.e. on gamma, breaking row invariance
   // (γ=2 vs γ=3 near-tie flip at pos 8193; d2s1b_vgd_* probes pcL3).
-  bool qsa_union = qsa_wmma_btv && !env_zero("QWENOX_QSA_UNION");
+  bool qsa_union = g_index_budget == 512 && qsa_wmma_btv &&
+                   !env_zero("QWENOX_QSA_UNION");
   uint16_t* d_ublk = nullptr;  // [ngroups][QSA_UCAP] 并集块号
   uint16_t* d_umask = nullptr; // [ngroups][QSA_UCAP] 4 query x 4 slot 掩码
   int* d_ucount = nullptr;     // [ngroups] 并集块数（含 pad，4 的倍数）
@@ -2100,7 +2102,7 @@ struct GpuModel {
 
   // One decode step of QSA attention over the KV cache: flash-decoding split
   // over QSA_DEC_NSPLIT position slices plus a merge, for every token. Dense
-  // tokens (< 2051) take the same path (ntok = token+1, identity source map);
+  // tokens (< g_index_first) take the same path (ntok = token+1, identity source map);
   // the old 3-pass k_qsa_step dense kernel cost ~0.7ms->5.4ms/layer growing
   // linearly with pos (rocprofv3: 55.8% of all decode kernel time), while the
   // flash split stays flat. QWENOX_QSA_DENSE takes the same split kernel with no
@@ -4095,7 +4097,7 @@ struct GpuModel {
     static unsigned long long* d_h = nullptr;
     if (!d_h) CK(hipMalloc(&d_h, 8 * sizeof(unsigned long long)));
     CK(hipMemsetAsync(d_h, 0, 8 * sizeof(unsigned long long), g_str));
-    const int r1 = base + P, r2 = (r1 + 3) & ~3, first = std::max(base, 2051);
+    const int r1 = base + P, r2 = (r1 + 3) & ~3, first = std::max(base, g_index_first);
     auto g = [](uint64_t n) { return (unsigned)((n + 255) / 256); };
     k_dbg_hash_rows<<<g((uint64_t)r1 * 512), 256, 0, g_str>>>(kc, nullptr, kvpt(), 0, r1, d_h + 0);
     k_dbg_hash_rows<<<g((uint64_t)r1 * 512), 256, 0, g_str>>>(vc, nullptr, kvpt(), 0, r1, d_h + 1);
@@ -4107,8 +4109,9 @@ struct GpuModel {
     }
     k_dbg_hash_f32<<<g((uint64_t)P * 6144), 256, 0, g_str>>>(d_qsb, (uint64_t)P * 6144, d_h + 4);
     if (base + P > first)
-      k_dbg_hash_i32<<<g((uint64_t)(base + P - first) * 512), 256, 0, g_str>>>(
-          d_iselected + (size_t)(first - base) * 512, (uint64_t)(base + P - first) * 512, d_h + 5);
+      k_dbg_hash_i32<<<g((uint64_t)(base + P - first) * g_index_budget), 256, 0, g_str>>>(
+          d_iselected + (size_t)(first - base) * g_index_budget,
+          (uint64_t)(base + P - first) * g_index_budget, d_h + 5);
     k_dbg_hash_f32<<<g((uint64_t)P * 6144), 256, 0, g_str>>>(d_attnb, (uint64_t)P * 6144, d_h + 6);
     unsigned long long h[8];
     CK(hipStreamSynchronize(g_str));
@@ -4122,7 +4125,7 @@ struct GpuModel {
   // QSA prefill flash over the KV cache: dense prefix plus the sparse tail.
   // base = absolute position of batch row 0 (0 for a fresh prefill; > 0 when
   // continuing from live KV/state). Dense rows are the batch-local prefix,
-  // sparse queries are the absolute positions >= 2051 within the batch.
+  // sparse queries are the absolute positions >= g_index_first within the batch.
   template <typename KVT>
   void qsa_flash_b(const KVT* kc, const KVT* vc, int P, int dense_P, int base = 0,
                    const uint16_t* vc_transposed = nullptr,
@@ -4135,10 +4138,10 @@ struct GpuModel {
     // the old single-segment behaviour exactly.
     float* const qsb = d_qsb + (size_t)row0 * 6144;
     float* const attnb = d_attnb + (size_t)row0 * 6144;
-    const int* const iselb = d_iselected + (size_t)row0 * 512;
+    const int* const iselb = d_iselected + (size_t)row0 * g_index_budget;
     const bool usnap = spec_ovr >= 0 ? spec_ovr != 0 : spec_snap;
     // dvb (P3-B graph capture): the kernels read base from *dvb and recompute
-    // first_abs / ga / ge on device. Requires base >= 2051 (the verify graph
+    // first_abs / ga / ge on device. Requires base >= g_index_first (the verify graph
     // gate), so first_abs == base, nsparse == P and sel is the batch-local
     // row-0 pointer; grids are baked worst-case (edges: 3 tokens, union
     // groups: max over base mod 4) and masked in-kernel.
@@ -4180,12 +4183,12 @@ struct GpuModel {
             qsb, kc, vc, attnb, dense_P, 256, 2, 24, nullptr, 0, nullptr, nullptr,
             nullptr, base, ptab, dvb);
     }
-    int first_abs = std::max(base, 2051), nsparse = base + P - first_abs;
-    if (dvb) nsparse = P;  // gate: base >= 2051 -> first_abs == base
+    int first_abs = std::max(base, g_index_first), nsparse = base + P - first_abs;
+    if (dvb) nsparse = P;  // gate: base >= g_index_first -> first_abs == base
     if (!qsa_dense && nsparse > 0) {
       // d_iselected rows are batch-local (row = abs - base; A1b)
       const int* sel = dvb ? iselb
-                           : iselb + (size_t)(first_abs - base) * 512;
+                           : iselb + (size_t)(first_abs - base) * g_index_budget;
       if (qsa_global_v)
         k_qsa_flash<true, false, KVT><<<dim3(nsparse, 2), 128, 0, g_str>>>(
             qsb, kc, vc, attnb, P, 256, 2, 24, sel, first_abs, nullptr, nullptr,
@@ -4223,7 +4226,7 @@ struct GpuModel {
           // ragged edges: per-token kernel (selected rows relative to its
           // own first token -> offset sel)
           auto edge = [&](int f, int n) {
-            const int* es = sel + (size_t)(f - first_abs) * 512;
+            const int* es = sel + (size_t)(f - first_abs) * g_index_budget;
             if (ptab)
               k_qsa_wmma<true, true><<<dim3(n, 2), 256, 0, g_str>>>(
                   qsb, kc, vc, vc_transposed, attnb, P, 256, 2, 24, es, f, base, ptab);
@@ -4678,7 +4681,7 @@ struct GpuModel {
     float* const iproj = d_iproj + (size_t)r0 * 640;
     float* const iq = d_iq + (size_t)r0 * 512;
     uint16_t* const iqh = d_iqh ? d_iqh + (size_t)r0 * 512 : nullptr;
-    int* const iselb = d_iselected + (size_t)r0 * 512;
+    int* const iselb = d_iselected + (size_t)r0 * g_index_budget;
     float2* const ropecs = d_ropecs + (size_t)r0 * 32;
     float* const iraw = slot_d_iraw(bs);
     const int* const ptabc = slot_ptab_eff(bs, P);
@@ -4759,7 +4762,7 @@ struct GpuModel {
       // scores and selections stay bit-identical to the unpaged layout).
       const float* skeys = keys;
       const uint16_t* skeys16 = keys16;
-      if (kv_paged && ptabc && nb > 0 && std::max(2051, base) < base + P) {
+      if (kv_paged && ptabc && nb > 0 && std::max(g_index_first, base) < base + P) {
         k_ik_gather<<<nb, 128, 0, g_str>>>(keys, ptabc, d_ikg, nb);
         skeys = d_ikg;
         if (keys16) {
@@ -4772,12 +4775,12 @@ struct GpuModel {
       // shape a from-scratch prefill of the same total length would use —
       // the sgemm shape stays numerically locked across request splits.
       // Chunk starts are additionally aligned to the from-scratch grid
-      // (2051 + k*INDEX_BATCH): with the same (m, n, k) every full chunk
+      // (g_index_first + k*INDEX_BATCH): with the same (m, n, k) every full chunk
       // replays bitwise-identical scores and selections, so a continuation
       // prefill can only diverge inside the leading ragged chunk [a0, grid).
-      const int a0 = std::max(2051, base);
+      const int a0 = std::max(g_index_first, base);
       const int grid =
-          2051 + (a0 - 2051 + INDEX_BATCH - 1) / INDEX_BATCH * INDEX_BATCH;
+          g_index_first + (a0 - g_index_first + INDEX_BATCH - 1) / INDEX_BATCH * INDEX_BATCH;
       if (getenv("QWENOX_VGDUMP")) {  // P3-B bisect: selection inputs
         char tag[12];
         // split keys hash: prefix blocks vs last two blocks (freshly pooled)
@@ -4818,7 +4821,7 @@ struct GpuModel {
                                : min(first + INDEX_BATCH, base + P);
         int count = nxt - first;
         if (index_fused2 && count >= 16 && getenv("QWENOX_INDEX_OLDSEL") == nullptr) {
-          int* const selrow = iselb + (size_t)(first - base) * 512;  // batch-local
+          int* const selrow = iselb + (size_t)(first - base) * g_index_budget;  // batch-local
           if (index_f16()) {
             // C1: f16 WMMA 打分 + f16 score（复用 d_iscores 内存）+ f16 select
             uint16_t* const sc16 = (uint16_t*)d_iscores;
@@ -4850,8 +4853,7 @@ struct GpuModel {
             k_index_select_stream<true><<<count, 256, 0, g_str>>>(
                 d_iscores, nb, selrow, first);
           else
-            k_index_select<16, true><<<count, 256, 0, g_str>>>(
-                d_iscores, nb, selrow, first);
+            index_select_rocprim<true>(d_iscores, nb, selrow, first, count);
           first = nxt;
           continue;
         }
@@ -4863,14 +4865,14 @@ struct GpuModel {
           fprintf(stderr, "indexer sgemm failed: %d\n", (int)status);
           exit(1);
         }
-        index_select(d_iscores, nb, iselb + (size_t)(first - base) * 512, first,
+        index_select(d_iscores, nb, iselb + (size_t)(first - base) * g_index_budget, first,
                      count);
         first = nxt;
       }
       if (getenv("QWENOX_VGDUMP")) {
         char tag[12];
         snprintf(tag, sizeof tag, "is%d", l);
-        vg_dump_buf(tag, P, iselb, (size_t)P * 512 * 4);
+        vg_dump_buf(tag, P, iselb, (size_t)P * g_index_budget * 4);
         snprintf(tag, sizeof tag, "iq%d", l);
         vg_dump_buf(tag, P, iq, (size_t)P * 512 * 4);
         snprintf(tag, sizeof tag, "rc%d", l);
@@ -4914,15 +4916,15 @@ struct GpuModel {
     for (int s = 0; s < nseg; s++) {
       const int P = Ps[s], base = bases[s];
       const int* ptab = slot_d_ptab(sl[s]);
-      const int* iselb = d_iselected + (size_t)voffs[s] * 512;
-      const int dense_P = std::min(P, std::max(0, 2051 - base));
-      const int first_abs = std::max(base, 2051), nsparse = base + P - first_abs;
+      const int* iselb = d_iselected + (size_t)voffs[s] * g_index_budget;
+      const int dense_P = std::min(P, std::max(0, g_index_first - base));
+      const int first_abs = std::max(base, g_index_first), nsparse = base + P - first_abs;
       dn.s[s] = QsaVSeg{ptab, nullptr, base, base, dense_P, voffs[s]};
       for (int b = 0; b < dense_P; b++, nd++) {
         dn.rowseg[nd] = (signed char)s;
         dn.rowbx[nd] = (signed char)b;
       }
-      sp.s[s] = QsaVSeg{ptab, iselb + (size_t)(first_abs - base) * 512, first_abs,
+      sp.s[s] = QsaVSeg{ptab, iselb + (size_t)(first_abs - base) * g_index_budget, first_abs,
                         base, P, voffs[s]};
       for (int b = 0; b < nsparse; b++, ns++) {
         sp.rowseg[ns] = (signed char)s;
@@ -4995,7 +4997,7 @@ struct GpuModel {
     float* const attnb = d_attnb + (size_t)r0 * 6144;
     float* const yb = d_yb + (size_t)r0 * 2560;
     uint16_t* const xbf16b = d_xbf16b + (size_t)r0 * 6144;
-    int* const iselb = d_iselected + (size_t)r0 * 512;
+    int* const iselb = d_iselected + (size_t)r0 * g_index_budget;
     float2* const ropecs = d_ropecs + (size_t)r0 * 32;
     KvSeqTable& seq = slot_kv_seq(bs);
     const int* const ptabc = slot_ptab_eff(bs, P);
@@ -5068,7 +5070,7 @@ struct GpuModel {
 #ifdef QWENOX_NPU
       npu_qg_submit_g(l, xb);  // M4：gate 半趁 qsa:flash（~200ms）跑
 #endif
-      int dense_P = qsa_dense ? P : min(P, std::max(0, 2051 - base));
+      int dense_P = qsa_dense ? P : min(P, std::max(0, g_index_first - base));
       if (qsa_kv_fp32) {
         float* kc = d_kc + qsa_off;
         float* vc = d_vc + qsa_off;
@@ -5259,7 +5261,7 @@ struct GpuModel {
                                            pabs, ptabc);
           k_qsa_step<float><<<24, 256, 0, g_str>>>(
               qs, d_kc + qsa_off, d_vc + qsa_off, att, pabs, 256, 2, 24,
-              qsa_dense ? nullptr : iselb + (size_t)t * 512, false,
+              qsa_dense ? nullptr : iselb + (size_t)t * g_index_budget, false,
               ptabc);
         } else {
           k_store_kv_bf16<<<2, 256, 0, g_str>>>(kb, vb, d_kcb + qsa_off,
@@ -5267,7 +5269,7 @@ struct GpuModel {
                                                 vct_layer(qi), ptabc);
           k_qsa_step<uint16_t><<<24, 256, 0, g_str>>>(
               qs, d_kcb + qsa_off, d_vcb + qsa_off, att, pabs, 256, 2, 24,
-              qsa_dense ? nullptr : iselb + (size_t)t * 512, false,
+              qsa_dense ? nullptr : iselb + (size_t)t * g_index_budget, false,
               ptabc);
         }
         k_sigmoid_gate<<<(6144 + 255) / 256, 256, 0, g_str>>>(att, gs, att, 6144);
@@ -8789,7 +8791,7 @@ struct GpuModel {
       // paged: gather the keys contiguous for the scores (as trunk qsa_b)
       const float* skeys = d_mik;
       const uint16_t* skeys16 = mikh;
-      if (!kv_only && kv_paged && nb > 0 && std::max(2051, base) < base + P) {
+      if (!kv_only && kv_paged && nb > 0 && std::max(g_index_first, base) < base + P) {
         k_ik_gather<<<nb, 128, 0, g_str>>>(d_mik, d_ptab, d_ikg, nb);
         skeys = d_ikg;
         if (mikh) {
@@ -8798,9 +8800,9 @@ struct GpuModel {
         }
       }
       const float one = 1.f, zero = 0.f;
-      const int a0 = std::max(2051, base);
+      const int a0 = std::max(g_index_first, base);
       const int grid =
-          2051 + (a0 - 2051 + INDEX_BATCH - 1) / INDEX_BATCH * INDEX_BATCH;
+          g_index_first + (a0 - g_index_first + INDEX_BATCH - 1) / INDEX_BATCH * INDEX_BATCH;
       for (int first = kv_only ? base + P : a0; first < base + P;) {
         int nxt = first < grid ? min(grid, base + P)
                                : min(first + INDEX_BATCH, base + P);
@@ -8812,7 +8814,7 @@ struct GpuModel {
         static const bool mtp_sgemm = getenv("QWENOX_MTP_INDEX_SGEMM") != nullptr;
         if (index_fused2 && !mtp_sgemm && count >= 16 &&
             getenv("QWENOX_INDEX_OLDSEL") == nullptr) {
-          int* const selrow = d_iselected + (size_t)(first - base) * 512;
+          int* const selrow = d_iselected + (size_t)(first - base) * g_index_budget;
           if (index_f16()) {
             uint16_t* const sc16 = (uint16_t*)d_iscores;
             k_index_scores_wmma16<false>
@@ -8843,8 +8845,7 @@ struct GpuModel {
             k_index_select_stream<true><<<count, 256, 0, g_str>>>(
                 d_iscores, nb, selrow, first);
           else
-            k_index_select<16, true><<<count, 256, 0, g_str>>>(
-                d_iscores, nb, selrow, first);
+            index_select_rocprim<true>(d_iscores, nb, selrow, first, count);
           first = nxt;
           continue;
         }
@@ -8857,7 +8858,7 @@ struct GpuModel {
           fprintf(stderr, "mtp indexer sgemm failed: %d\n", (int)status);
           exit(1);
         }
-        index_select(d_iscores, nb, d_iselected + (size_t)(first - base) * 512,
+        index_select(d_iscores, nb, d_iselected + (size_t)(first - base) * g_index_budget,
                      first, count);
         first = nxt;
       }
@@ -8881,7 +8882,7 @@ struct GpuModel {
     k_qsa_kprep<false><<<dim3(2, P), 256, 0, g_str>>>(d_kbb, knw, d_kbb,
                                                       nullptr, g_cfg.norm_eps,
                                                       base, d_ropecs);
-    int dense_P = qsa_dense ? P : min(P, std::max(0, 2051 - base));
+    int dense_P = qsa_dense ? P : min(P, std::max(0, g_index_first - base));
     // rows [base, base+P) of pool layer nqsa: one copy / convert per
     // physically contiguous page run (a single one unpaged)
     if (qsa_kv_fp32) {
@@ -11648,7 +11649,7 @@ struct GpuModel {
     if (off || !vbase_on()) return false;
     if ((dbg && !getenv("QWENOX_VGRAPH_DBG")) || perf || g_kprof_on)
       return false;
-    if (P < 2 || P > kVGMaxP || base < 2051 || base + P > maxctx) return false;
+    if (P < 2 || P > kVGMaxP || base < g_index_first || base + P > maxctx) return false;
     if (mrope_active_ || cut_abs >= 0 || qsa_dense || qsa_loop || qsa_wmma6)
       return false;
     if (ple_on && ple_loop) return false;
@@ -12308,7 +12309,7 @@ struct GpuModel {
               "QWENOX_KV_PAGED=1)\n", nseg);
       return false;
     }
-    // QWENOX_VSEG_SHORT=1: short prompts (bases < 2051 -> the dense attention
+    // QWENOX_VSEG_SHORT=1: short prompts (bases < g_index_first -> the dense attention
     // path that short chat prompts take; mixed base %4).
     static const int plens_long[8] = {2048, 4097, 6146, 2055, 3076, 4101, 6152, 2049};
     static const int plens_short[8] = {97, 130, 163, 99, 140, 171, 103, 152};

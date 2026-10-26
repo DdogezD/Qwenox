@@ -137,6 +137,22 @@ int main(int argc, char** argv) {
     printf("qwenox-engine %s\n", QWENOX_VERSION_FULL);
     return 0;
   }
+  const char* index_budget_env = getenv("QWENOX_INDEXER_BUDGET");
+  if (!index_budget_env || !strcmp(index_budget_env, "2048"))
+    g_index_budget = 512;
+  else if (!strcmp(index_budget_env, "4096"))
+    g_index_budget = 1024;
+  else {
+    fprintf(stderr, "QWENOX_INDEXER_BUDGET must be 2048 or 4096 (got '%s')\n",
+            index_budget_env);
+    return 2;
+  }
+  g_index_tokens = g_index_budget * 4;
+  g_index_first = g_index_tokens + 3;
+  g_index_sparse = g_index_tokens + 4;
+  fprintf(stderr, "qsa: indexer budget = %d tokens (%d blocks)\n",
+          g_index_tokens, g_index_budget);
+  CK(hipMemcpyToSymbol(g_index_budget_d, &g_index_budget, sizeof(g_index_budget)));
   fprintf(stderr, "qwenox-engine %s\n", QWENOX_VERSION_FULL);
   // 崩溃诊断：处理器 + 启动环境快照（进引擎日志，崩溃报告末尾也附一份）
   crashdiag::install("engine", QWENOX_VERSION_FULL);

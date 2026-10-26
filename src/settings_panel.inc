@@ -11,8 +11,8 @@
 //          V2 另有"prefill 4-bit 加速"勾选框（MOE_A4，勾 = 3 / 不勾 = 0，会降低
 //          prompt 部分精度，检查区出 [警告] 说明代价；V1/GGUF 不显示、原值保留）。
 //   第 2 页 上下文与并发：MAX_CONTEXT / PARALLEL / 并发总池（KV_POOL_TOKENS）/
-//          KV_PAGED / PREFILL_CHUNK / KV 快照（KVSNAP_MAX_GB + KVSNAP_DIR）/
-//          YaRN 勾选（ROPE_FACTOR 按上限自动推导）。
+//          KV_PAGED / PREFILL_CHUNK / QSA_INDEXER_BUDGET（默认 2048，可选 4096）/
+//          KV 快照（KVSNAP_MAX_GB + KVSNAP_DIR）/ YaRN 勾选（ROPE_FACTOR 自动推导）。
 //          ROPE_ORIGINAL_CTX 不做 UI 行（用户不该改）：校验仍从 g_conf/环境读，
 //          也不在 kManagedKeys 里，save_conf 永远不会改写 conf 中的该行。
 //   第 3 页 端口与监听：ENGINE_HOST / ENGINE_PORT / API_HOST / API_PORT。
@@ -139,7 +139,7 @@ using svcconf::is_optional_file_key;
 int page_of_key(const std::string& k) {
     if (k == "MAX_CONTEXT" || k == "PARALLEL" || k == "KV_POOL_TOKENS" || k == "KV_PAGED" ||
         k == "PREFILL_CHUNK" || k == "ROPE_FACTOR" || k == "KVSNAP_MAX_GB" ||
-        k == "KVSNAP_DIR")
+        k == "KVSNAP_DIR" || k == "QSA_INDEXER_BUDGET")
         return 1;
     if (k == "ENGINE_HOST" || k == "ENGINE_PORT" || k == "API_HOST" || k == "API_PORT")
         return 2;
@@ -381,6 +381,7 @@ struct PanelVals {
     std::string kvsnap_max_gb;
     std::string kvsnap_dir;  // KVSNAP_DIR：空 = 引擎默认 data\kvsnap
     std::string moe_a4 = "0";  // MOE_A4：0 关，1–3 开（只对 V2 生效）
+    std::string qsa_indexer_budget = "0";  // 0 = 2048；4096 = 扩大 QSA 检索预算
     std::string engine_host, engine_port, api_host, api_port;
 };
 
@@ -413,6 +414,7 @@ PanelVals panel_vals_from_conf() {
     v.kv_pool = cfg("KV_POOL_TOKENS", "0");
     v.kv_paged = cfg("KV_PAGED", "1") != "0";
     v.prefill_chunk = cfg("PREFILL_CHUNK", "0");
+    v.qsa_indexer_budget = cfg("QSA_INDEXER_BUDGET", "0");
     v.rope_factor = cfg("ROPE_FACTOR", "1");
     v.rope_original = cfg("ROPE_ORIGINAL_CTX", "262144");
     v.kvsnap_max_gb = cfg("KVSNAP_MAX_GB", "20");
@@ -461,6 +463,7 @@ std::map<std::string, std::string> panel_vals_to_conf(const PanelVals& v) {
     m["KV_POOL_TOKENS"] = v.kv_pool;
     m["KV_PAGED"] = v.kv_paged ? "1" : "0";
     m["PREFILL_CHUNK"] = v.prefill_chunk;
+    m["QSA_INDEXER_BUDGET"] = v.qsa_indexer_budget;
     m["ROPE_FACTOR"] = v.rope_factor;
     m["KVSNAP_MAX_GB"] = v.kvsnap_max_gb;
     std::string kdir = v.kvsnap_dir;
@@ -667,6 +670,16 @@ void check_context_page(CheckLines& c, const PanelVals& v) {
                    TR("ROPE_FACTOR 必须 >=1（当前为 \"", "ROPE_FACTOR must be >=1 (current: \"") +
                        v.rope_factor + TR("\"）", "\")"));
         nums_ok = false;
+    }
+    if (v.qsa_indexer_budget != "0" && v.qsa_indexer_budget != "4096") {
+        check_line(c, kLvFail,
+                   TR("QSA_INDEXER_BUDGET 只允许 0（默认 2048）或 4096",
+                      "QSA_INDEXER_BUDGET must be 0 (default 2048) or 4096"));
+        nums_ok = false;
+    } else if (v.qsa_indexer_budget == "4096") {
+        check_line(c, kLvWarn,
+                   TR("QSA 检索预算 4096 已开启：长上下文检索可能改善，prefill 会变慢",
+                      "QSA indexer budget 4096 enabled: long-context retrieval may improve; prefill will be slower"));
     }
     if (!nums_ok) return;
     if (parallel > 1 && !v.kv_paged)
@@ -1090,7 +1103,7 @@ enum PanelId : int {
     kCkYarn, kEdKvsnap, kEdKvsnapDir, kBrKvsnapDir,
     kEdEHost, kEdEPort, kEdAHost, kEdAPort,
     kEdOut1, kEdOut2, kEdOut3, kEdReport, kEdSummary, kBtnLang,
-    kCkMoeA4,
+    kCkMoeA4, kCkQsaBudget,
 };
 
 struct FileRow {
@@ -1107,6 +1120,7 @@ struct PanelCtl {
     HWND maxctx = nullptr, maxctx_preset = nullptr, parallel = nullptr, kv_pool = nullptr,
          kv_paged = nullptr, prefill = nullptr;
     HWND yarn = nullptr;  // "YaRN 长上下文扩展" 勾选框（ROPE_FACTOR 自动推导，无编辑行）
+    HWND qsa_budget = nullptr;
     HWND kvsnap = nullptr;
     HWND kvsnap_dir = nullptr, kvsnap_dir_br = nullptr;
     HWND ehost = nullptr, eport = nullptr, ahost = nullptr, aport = nullptr;
@@ -1304,6 +1318,7 @@ PanelVals panel_collect() {
     if (v.kv_pool == v.max_context || v.kv_pool == "0" || !g_pool_touched) v.kv_pool = "0";
     v.kv_paged = get_check(g_pc.kv_paged);
     v.prefill_chunk = get_edit(g_pc.prefill);
+    v.qsa_indexer_budget = get_check(g_pc.qsa_budget) ? "4096" : "0";
     v.rope_original = cfg("ROPE_ORIGINAL_CTX", "262144");  // 无 UI 行，conf/环境原样读
     v.rope_factor = derive_rope_factor(get_check(g_pc.yarn), v.max_context, v.rope_original);
     v.kvsnap_max_gb = get_edit(g_pc.kvsnap);
@@ -2149,6 +2164,13 @@ PanelResult panel_run() {
     plabel(1, h, kHintX, y2, TR(L"0 = 默认 6144（≈5.2 GiB 工作区）",
                                 L"0 = default 6144 (≈5.2 GiB workspace)"),
            kHintW);
+    y2 += 26;
+    g_pc.qsa_budget = pctl(1, h, L"Button", BS_AUTOCHECKBOX | WS_TABSTOP, kEdX, y2, 434, 20,
+                           TR(L"QSA 检索预算 4096（默认关闭，prefill 较慢）",
+                              L"QSA indexer budget 4096 (off by default; slower prefill)"),
+                           kCkQsaBudget);
+    SendMessageW(g_pc.qsa_budget, BM_SETCHECK,
+                 init.qsa_indexer_budget == "4096" ? BST_CHECKED : BST_UNCHECKED, 0);
     y2 += 26;
     {
         // YaRN 勾选框（ROPE_FACTOR 自动推导 = max(2, ceil(上限/原生))，无编辑行）

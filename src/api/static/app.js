@@ -1243,7 +1243,7 @@ async function renderRequests(force) {
 }
 
 // ---------------- 引擎 / 设置（service.conf + 启停） ----------------
-// 数据源：GET/POST /admin/config（20 个受管键，与托盘面板相同）、
+// 数据源：GET/POST /admin/config（受管键与托盘面板相同）、
 // GET /admin/files（工作空间内的受限目录浏览，权重路径键的"浏览"弹窗数据）、
 // GET /admin/engine/status、POST /admin/engine/start|stop（仅 Windows）。
 // Linux 上隐藏启停按钮、显示提示，只保留配置编辑（保存后下次启动生效）。
@@ -1253,7 +1253,7 @@ const CFG_GROUPS = [
       "MTP_FILE", "VISION_FILE", "GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE",
       "TOKENIZER_DIR"] },
   { title: "cfg.grp_ctx", keys: ["MAX_CONTEXT", "PARALLEL", "KV_POOL_TOKENS", "KV_PAGED",
-      "PREFILL_CHUNK", "ROPE_FACTOR", "KVSNAP_MAX_GB"] },
+      "PREFILL_CHUNK", "QSA_INDEXER_BUDGET", "ROPE_FACTOR", "KVSNAP_MAX_GB"] },
   { title: "cfg.grp_net", keys: ["ENGINE_HOST", "ENGINE_PORT", "API_HOST", "API_PORT"] },
 ];
 // 权重组键带"浏览"弹窗（数据来自 /admin/files，仍可手输）：

@@ -429,14 +429,17 @@ struct PleWinPrefetch {
 
 struct PleWinPrefetch;
 
-constexpr int INDEX_BUDGET = 512;
 constexpr int INDEX_BATCH = 1024;
+
+__device__ __forceinline__ int qsa_index_tokens() { return g_index_budget_d * 4; }
+__device__ __forceinline__ int qsa_index_first() { return qsa_index_tokens() + 3; }
 
 __device__ __forceinline__ int qsa_source_pos(int slot, int visible,
                                               const int* blocks) {
-  if (!blocks || visible < 2052) return slot;
-  return slot < 2048 ? 4 * blocks[slot / 4] + slot % 4
-                     : (visible / 4) * 4 + slot - 2048;
+  const int tokens = qsa_index_tokens();
+  if (!blocks || visible < tokens + 4) return slot;
+  return slot < tokens ? 4 * blocks[slot / 4] + slot % 4
+                       : (visible / 4) * 4 + slot - tokens;
 }
 
 // ---- Paged QSA KV (memory model Phase A) ----
@@ -751,7 +754,7 @@ __global__ void k_index_scores(const float* queries, const float* keys, float* s
                                 const int* __restrict__ ptab = nullptr) {
   int b = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
   int lane = threadIdx.x % warpSize;
-  if (*pos < 2051 || b >= (*pos + 1) / 4) return;
+  if (*pos < qsa_index_first() || b >= (*pos + 1) / 4) return;
   const float* kb = keys + (size_t)ik_blk(ptab, b) * 128;
   for (int h = 0; h < 4; h++) {
     float sum = 0.f;
@@ -793,30 +796,33 @@ __global__ void k_ik_twin_build(const float* __restrict__ src,
   dst[blk] = __half_as_ushort(__float2half_rn(src[blk]));
 }
 
-// Exact top-512 via bounded merges, using rocPRIM radix sort. Float scores are
+// Exact top-K via bounded merges, using rocPRIM radix sort. Float scores are
 // nonnegative; low bits break equal-score ties by smaller block id.
-template <int Items = 4, bool Combined = false>
+template <int Items, int IB, bool Combined = false>
 __global__ void k_index_select(const float* scores, int stride, int* selected,
                                 int first, const int* pos = nullptr) {
+  static_assert(256 * Items > IB, "selector needs new score items");
+  constexpr int IdItems = IB / 256;
   using TopSort = rocprim::block_radix_sort<uint64_t, 256, Items>;
-  using IdSort = rocprim::block_radix_sort<int, 256, 2>;
+  using IdSort = rocprim::block_radix_sort<int, 256, IdItems>;
   __shared__ union { typename TopSort::storage_type top; IdSort::storage_type ids; } storage;
-  __shared__ uint64_t best[512];
+  __shared__ uint64_t best[IB];
   int q = blockIdx.x, t = pos ? *pos : first + q, n = (t + 1) / 4;
   int tid = threadIdx.x;
-  if (n <= 512) {
-    for (int i = tid; i < 512; i += 256) selected[(size_t)q * 512 + i] = i < n ? i : -1;
+  if (n <= IB) {
+    for (int i = tid; i < IB; i += 256)
+      selected[(size_t)q * IB + i] = i < n ? i : -1;
     return;
   }
-  best[tid] = best[tid + 256] = 0;
+  for (int i = tid; i < IB; i += 256) best[i] = 0;
   __syncthreads();
-  for (int base = 0; base < n; base += 256 * Items - 512) {
+  for (int base = 0; base < n; base += 256 * Items - IB) {
     uint64_t items[Items];
     for (int i = 0; i < Items; i++) {
       int rank = tid * Items + i;
-      if (rank < 512) items[i] = best[rank];
+      if (rank < IB) items[i] = best[rank];
       else {
-        int b = base + rank - 512;
+        int b = base + rank - IB;
         float s = 0.f;
         if constexpr (Combined) {
           if (b < n) s = scores[(size_t)q * stride + b];
@@ -831,35 +837,43 @@ __global__ void k_index_select(const float* scores, int stride, int* selected,
     TopSort().sort_desc(items, storage.top);
     __syncthreads();
     for (int i = 0; i < Items; i++)
-      if (tid * Items + i < 512) best[tid * Items + i] = items[i];
+      if (tid * Items + i < IB) best[tid * Items + i] = items[i];
     __syncthreads();
   }
-  int ids[2];
-  for (int i = 0; i < 2; i++) ids[i] = (int)(0xffffffffu - (uint32_t)best[tid * 2 + i]);
+  int ids[IdItems];
+  for (int i = 0; i < IdItems; i++)
+    ids[i] = (int)(0xffffffffu - (uint32_t)best[tid * IdItems + i]);
   __syncthreads();
   IdSort().sort(ids, storage.ids);
-  for (int i = 0; i < 2; i++) selected[(size_t)q * 512 + tid * 2 + i] = ids[i];
+  for (int i = 0; i < IdItems; i++)
+    selected[(size_t)q * IB + tid * IdItems + i] = ids[i];
 }
 
 // k_index_select_rs / k_index_select_stream / k_index_scores_tiled and the
 // faster bit-exact replacements live in 09_kernels_index.inc (standalone so
 // tools/index_fast_test.cu can include them).
 
+template <bool Combined>
+static void index_select_rocprim(const float* scores, int stride, int* selected,
+                                 int first, int count, const int* pos = nullptr) {
+  if (g_index_budget == 512)
+    k_index_select<4, 512, Combined><<<count, 256, 0, g_str>>>(
+        scores, stride, selected, first, pos);
+  else
+    k_index_select<8, 1024, Combined><<<count, 256, 0, g_str>>>(
+        scores, stride, selected, first, pos);
+}
+
 static void index_select(const float* scores, int stride, int* selected,
                          int first, int count, const int* pos = nullptr) {
   int n = pos ? stride : min(stride, (first + count) / 4);
   static bool old_sel = getenv("QWENOX_INDEX_OLDSEL") != nullptr;
-  if (!old_sel && n > 512 && n <= 8192) {
+  if (!old_sel && n > g_index_budget && n <= 8192) {
     k_index_select_rs<<<count, 256, 0, g_str>>>(scores, stride, selected, first,
                                                 pos);
     return;
   }
-  if (n <= 1024)
-    k_index_select<4><<<count, 256, 0, g_str>>>(scores, stride, selected, first, pos);
-  else if (n <= 2048)
-    k_index_select<8><<<count, 256, 0, g_str>>>(scores, stride, selected, first, pos);
-  else
-    k_index_select<16><<<count, 256, 0, g_str>>>(scores, stride, selected, first, pos);
+  index_select_rocprim<false>(scores, stride, selected, first, count, pos);
 }
 
 __global__ void k_moe_route_pack(const int* ids, int* keys, int* values, int pairs, int k) {

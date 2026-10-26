@@ -1,7 +1,11 @@
-// ---------------- Lightning indexer: fused score + top-512 select kernels ----
+// ---------------- Lightning indexer: fused score + top-K select kernels ----
 // Self-contained (HIP only, no engine globals) so tools/index_fast_test.cu can
 // include it next to the production kernels it is checked against.
 #include <hip/hip_fp16.h>
+#ifndef INDEX_BUDGET
+#define INDEX_BUDGET 1024
+#endif
+__device__ int g_index_budget_d = 512;
 //
 // Old (reference) kernels, moved verbatim from 10_ple_io.inc:
 //   k_index_select_rs      n <= 8192, LDS row cache, 4 MSD radix passes
@@ -63,15 +67,15 @@ __device__ __forceinline__ void isel_h16x8_bits(uint4 u, unsigned bits[8]) {
   }
 }
 
-// Exact top-512 selection, bit-identical output to k_index_select (same
+// Exact top-K selection, bit-identical output to k_index_select (same
 // combined-score formula and the same total order: score desc, then smaller
 // block id), but sort-free. Four MSD radix passes over the fp32 bit pattern
-// (scores are nonnegative, so bits are monotone) resolve the exact 512th
+// (scores are nonnegative, so bits are monotone) resolve the exact Kth
 // score threshold s*; the selected set is {s > s*} plus the smallest-id
 // elements of {s == s*}, which is exactly the old kernel's uint64-key order.
 // Emission scans b ascending, so ids come out in the same ascending order the
 // old kernel's final IdSort produced. Requires n <= 8192 (LDS combined-score
-// cache); larger n keeps the old kernel. n <= 512 fills directly (same as old).
+// cache); larger n keeps the old kernel. n <= g_index_budget_d fills directly (same as old).
 template <bool Combined = false, class ST = float>
 __global__ void k_index_select_rs(const ST* __restrict__ scores, int stride,
                                   int* __restrict__ selected, int first,
@@ -83,9 +87,9 @@ __global__ void k_index_select_rs(const ST* __restrict__ scores, int stride,
   __shared__ int s_passcnt, s_passbyte, s_cntgt;
   const int q = blockIdx.x, t = pos ? *pos : first + q, n = (t + 1) / 4;
   const int tid = threadIdx.x;
-  if (n <= 512) {
-    for (int i = tid; i < 512; i += 256)
-      selected[(size_t)q * 512 + i] = i < n ? i : -1;
+  if (n <= g_index_budget_d) {
+    for (int i = tid; i < g_index_budget_d; i += 256)
+      selected[(size_t)q * g_index_budget_d + i] = i < n ? i : -1;
     return;
   }
   // combine (ReLU per head, ordered sum, scale) into LDS + top-byte histogram
@@ -131,9 +135,9 @@ __global__ void k_index_select_rs(const ST* __restrict__ scores, int stride,
     atomicAdd(&hist[__float_as_uint(s) >> 24], 1u);
   }
   __syncthreads();
-  // 4 MSD radix passes -> exact 512th-largest score bits in prefix
+  // 4 MSD radix passes -> exact Kth-largest score bits in prefix
   unsigned prefix = 0;
-  int K = 512;
+  int K = g_index_budget_d;
   if (tid == 0) s_cntgt = 0;
   for (int p = 0; p < 4; p++) {
     const int shift = (3 - p) * 8;
@@ -168,8 +172,8 @@ __global__ void k_index_select_rs(const ST* __restrict__ scores, int stride,
     __syncthreads();
   }
   const unsigned sstar = prefix;
-  const int cnt_gt = s_cntgt;  // < 512 by construction
-  const int need = 512 - cnt_gt;  // tie slots taken by smallest ids
+  const int cnt_gt = s_cntgt;  // < g_index_budget_d by construction
+  const int need = g_index_budget_d - cnt_gt;  // tie slots taken by smallest ids
   // Single ascending-b emit: sel = (s > s*) || (s == s* && tie-rank < need).
   // The old kernel's final IdSort yields ascending ids, so ties and strict
   // greaters must interleave in one id-ordered scan (not two phases).
@@ -199,7 +203,7 @@ __global__ void k_index_select_rs(const ST* __restrict__ scores, int stride,
       eqtot += (int)shr_eq[i];
     }
     if (sel)
-      selected[(size_t)q * 512 + outbase + woff +
+      selected[(size_t)q * g_index_budget_d + outbase + woff +
                __popcll(bal_sel & (lane ? (~0ull) >> (64 - lane) : 0ull))] = b;
     outbase += wtot;
     eqbase = min(eqbase + eqtot, need);
@@ -229,9 +233,9 @@ __global__ void k_index_select_stream(const float* __restrict__ scores, int stri
   __shared__ int s_passcnt, s_passbyte, s_cntgt;
   const int q = blockIdx.x, t = pos ? *pos : first + q, n = (t + 1) / 4;
   const int tid = threadIdx.x;
-  if (n <= 512) {
-    for (int i = tid; i < 512; i += 256)
-      selected[(size_t)q * 512 + i] = i < n ? i : -1;
+  if (n <= g_index_budget_d) {
+    for (int i = tid; i < g_index_budget_d; i += 256)
+      selected[(size_t)q * g_index_budget_d + i] = i < n ? i : -1;
     return;
   }
   // First pass: combine scores and build the top-byte histogram.
@@ -250,9 +254,9 @@ __global__ void k_index_select_stream(const float* __restrict__ scores, int stri
     atomicAdd(&hist[__float_as_uint(s) >> 24], 1u);
   }
   __syncthreads();
-  // 4 MSD radix passes -> exact 512th-largest score bits in prefix
+  // 4 MSD radix passes -> exact Kth-largest score bits in prefix
   unsigned prefix = 0;
-  int K = 512;
+  int K = g_index_budget_d;
   if (tid == 0) s_cntgt = 0;
   for (int p = 0; p < 4; p++) {
     const int shift = (3 - p) * 8;
@@ -287,8 +291,8 @@ __global__ void k_index_select_stream(const float* __restrict__ scores, int stri
     __syncthreads();
   }
   const unsigned sstar = prefix;
-  const int cnt_gt = s_cntgt;  // < 512 by construction
-  const int need = 512 - cnt_gt;  // tie slots taken by smallest ids
+  const int cnt_gt = s_cntgt;  // < g_index_budget_d by construction
+  const int need = g_index_budget_d - cnt_gt;  // tie slots taken by smallest ids
   // Single ascending-b emit: sel = (s > s*) || (s == s* && tie-rank < need).
   // The old kernel's final IdSort yields ascending ids, so ties and strict
   // greaters must interleave in one id-ordered scan (not two phases).
@@ -318,7 +322,7 @@ __global__ void k_index_select_stream(const float* __restrict__ scores, int stri
       eqtot += (int)shr_eq[i];
     }
     if (sel)
-      selected[(size_t)q * 512 + outbase + woff +
+      selected[(size_t)q * g_index_budget_d + outbase + woff +
                __popcll(bal_sel & (lane ? (~0ull) >> (64 - lane) : 0ull))] = b;
     outbase += wtot;
     eqbase = min(eqbase + eqtot, need);
@@ -645,16 +649,16 @@ static inline dim3 index_wmma16_grid(int nb, int count) {
 }
 
 // ---------------------------------------------------------------------------
-// k_index_select_2p: exact top-512 over combined score rows, bit-identical to
+// k_index_select_2p: exact top-K over combined score rows, bit-identical to
 // k_index_select_stream<true> / k_index_select_rs<true> / k_index_select
-// (score desc, ties -> smaller block id; output = the 512 ids ascending;
-// n <= 512 -> 0..n-1 then -1). Two global passes instead of five:
+// (score desc, ties -> smaller block id; output = the K ids ascending;
+// n <= g_index_budget_d -> 0..n-1 then -1). Two global passes instead of five:
 //   1. 8192-bin histogram of bits >> 18 (scores are >= 0, so fp32 bits are
 //      monotone and bit 31 is 0) -> threshold bin T, cnt_gt = #(bin > T)
 //   2. bin > T -> selected directly; bin == T -> (bits, id) candidates in LDS
-//   then, all in LDS: exact s* = (512 - cnt_gt)-th largest candidate (4 radix
+//   then, all in LDS: exact s* = (g_index_budget_d - cnt_gt)-th largest candidate (4 radix
 //   passes), ties at s* resolved by the smallest ids (radix on ~id), and a
-//   512-entry bitonic sort for the ascending output.
+//   runtime-budget bitonic sort for the ascending output.
 // If the threshold bin holds more than `cap` (<= ISEL_CAP) candidates the
 // block falls back to exact streaming radix passes over the remaining 18
 // bits + one ascending emit scan (same algorithm as k_index_select_stream).
@@ -738,7 +742,7 @@ __global__ void __launch_bounds__(256)
 k_index_select_2p(const ST* __restrict__ scores, int stride,
                   int* __restrict__ selected, int first, int cap = ISEL_CAP) {
   __shared__ unsigned big[ISEL_BINS];  // pass 1 histogram; then cand bits | cand ids
-  __shared__ int sel[512];
+  __shared__ int sel[INDEX_BUDGET];
   __shared__ unsigned h256[256];
   __shared__ unsigned wsum[8];
   __shared__ unsigned shr_cnt[8], shr_eq[8];
@@ -746,9 +750,9 @@ k_index_select_2p(const ST* __restrict__ scores, int stride,
   __shared__ int s_nsel, s_ncand, s_eq;
   const int q = blockIdx.x, t = first + q, n = (t + 1) / 4;
   const int tid = threadIdx.x;
-  if (n <= 512) {
-    for (int i = tid; i < 512; i += 256)
-      selected[(size_t)q * 512 + i] = i < n ? i : -1;
+  if (n <= g_index_budget_d) {
+    for (int i = tid; i < g_index_budget_d; i += 256)
+      selected[(size_t)q * g_index_budget_d + i] = i < n ? i : -1;
     return;
   }
   cap = min(cap, ISEL_CAP);
@@ -790,7 +794,7 @@ k_index_select_2p(const ST* __restrict__ scores, int stride,
   }
   }
   __syncthreads();
-  isel_find_desc<ISEL_BINS / 256>(big, 512, sh, wsum);
+  isel_find_desc<ISEL_BINS / 256>(big, g_index_budget_d, sh, wsum);
   const int cnt_gt = sh[0];
   const unsigned T = (unsigned)sh[1];
   const int ncand = (int)big[T];
@@ -800,7 +804,7 @@ k_index_select_2p(const ST* __restrict__ scores, int stride,
     // (bits 17..10, 9..2, 1..0), then one ascending emit scan (as
     // k_index_select_stream).
     unsigned prefix = T;
-    int K = 512 - cnt_gt, cgt = cnt_gt;
+    int K = g_index_budget_d - cnt_gt, cgt = cnt_gt;
     const int shifts[3] = {10, 2, 0}, widths[3] = {8, 8, 2};
 #pragma unroll 1
     for (int p = 0; p < 3; p++) {
@@ -820,7 +824,7 @@ k_index_select_2p(const ST* __restrict__ scores, int stride,
       __syncthreads();
     }
     const unsigned sstar = prefix;
-    const int need = 512 - cgt;
+    const int need = g_index_budget_d - cgt;
     int outbase = 0, eqbase = 0;
     const int lane = tid % warpSize, w = tid / warpSize, nw = 256 / warpSize;
 #pragma unroll 1
@@ -847,7 +851,7 @@ k_index_select_2p(const ST* __restrict__ scores, int stride,
         eqtot += (int)shr_eq[i];
       }
       if (pick)
-        selected[(size_t)q * 512 + outbase + woff +
+        selected[(size_t)q * g_index_budget_d + outbase + woff +
                  __popcll(bal_sel & (lane ? (~0ull) >> (64 - lane) : 0ull))] = b;
       outbase += wtot;
       eqbase = min(eqbase + eqtot, need);
@@ -905,9 +909,9 @@ k_index_select_2p(const ST* __restrict__ scores, int stride,
   // ---- exact s* among the candidates
   int gt2;
   const unsigned sstar = isel_kth(
-      ncand, 512 - cnt_gt, [&](int i, unsigned& k) { k = cbits[i]; return true; },
+      ncand, g_index_budget_d - cnt_gt, [&](int i, unsigned& k) { k = cbits[i]; return true; },
       h256, sh, wsum, gt2);
-  const int need = 512 - cnt_gt - gt2;  // >= 1 slots for ties at s*
+  const int need = g_index_budget_d - cnt_gt - gt2;  // >= 1 slots for ties at s*
   for (int i = tid; i < ncand; i += 256)
     if (cbits[i] == sstar) atomicAdd(&s_eq, 1);
   __syncthreads();
@@ -926,20 +930,22 @@ k_index_select_2p(const ST* __restrict__ scores, int stride,
       sel[atomicAdd(&s_nsel, 1)] = cid[i];
   }
   __syncthreads();
-  // ---- ascending ids: bitonic sort of the 512 selected (distinct) ids
+  // ---- ascending ids: bitonic sort of the selected (distinct) ids
 #pragma unroll 1
-  for (int k = 2; k <= 512; k <<= 1) {
+  for (int k = 2; k <= g_index_budget_d; k <<= 1) {
 #pragma unroll 1
     for (int j = k >> 1; j > 0; j >>= 1) {
-      const int i = (tid / j) * 2 * j + (tid % j), p = i + j;
-      const int a = sel[i], b = sel[p];
-      if ((a > b) == ((i & k) == 0)) {
-        sel[i] = b;
-        sel[p] = a;
+      for (int c = tid; c < g_index_budget_d / 2; c += 256) {
+        const int i = (c / j) * 2 * j + (c % j), p = i + j;
+        const int a = sel[i], b = sel[p];
+        if ((a > b) == ((i & k) == 0)) {
+          sel[i] = b;
+          sel[p] = a;
+        }
       }
       __syncthreads();
     }
   }
-  selected[(size_t)q * 512 + tid] = sel[tid];
-  selected[(size_t)q * 512 + tid + 256] = sel[tid + 256];
+  for (int i = tid; i < g_index_budget_d; i += 256)
+    selected[(size_t)q * g_index_budget_d + i] = sel[i];
 }

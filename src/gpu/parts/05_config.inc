@@ -22,6 +22,10 @@ struct Cfg {
   int vocab = 248320;
 };
 static Cfg g_cfg;
+static int g_index_budget = 512;
+static int g_index_tokens = 2048;
+static int g_index_first = 2051;
+static int g_index_sparse = 2052;
 static hipStream_t g_str = nullptr;  // capture stream during graph build, else default
 // D1b: >0 while the GPU is lent out mid-prefill-chunk; during the window only
 // light rounds (chunks of at most QWENOX_CONC_RMAX rows) may start on it.

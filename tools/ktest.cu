@@ -3805,7 +3805,7 @@ int main() {
       int* sel_old = (int*)dalloc((size_t)count * 512);
       int* sel_new = (int*)dalloc((size_t)count * 512);
       int first = 4 * n - 1 - (count - 1);  // per-token n varies a little
-      k_index_select<16><<<count, 256>>>(d_sc, stride, sel_old, first, nullptr);
+      k_index_select<16, 512><<<count, 256>>>(d_sc, stride, sel_old, first, nullptr);
       k_index_select_rs<<<count, 256>>>(d_sc, stride, sel_new, first, nullptr);
       std::vector<int> a((size_t)count * 512), b((size_t)count * 512);
       TCK(hipMemcpy(a.data(), sel_old, a.size() * 4, hipMemcpyDeviceToHost));

@@ -78,7 +78,8 @@
 // through a small pinned staging buffer.
 //
 // Semantics follow reference/modeling_qwen4_exp.py exactly (same as ref.cpp).
-// QSA selects 512 complete 4-token blocks plus all incomplete tail tokens.
+// QSA selects 512 complete 4-token blocks by default, or 1024 with
+// QWENOX_INDEXER_BUDGET=4096, plus all incomplete tail tokens.
 // QWENOX_QSA_DENSE=1 restores the old dense path for performance comparisons.
 //
 // Build: hipcc -O3 -o qwenox qwenox.cpp -lrocblas -lhipblaslt

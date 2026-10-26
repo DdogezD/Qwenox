@@ -403,6 +403,11 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
     const std::string rope_fast_s = svcconf::cfg(conf, "ROPE_BETA_FAST", "32");
     const std::string rope_slow_s = svcconf::cfg(conf, "ROPE_BETA_SLOW", "1");
     const std::string rope_attn_s = svcconf::cfg(conf, "ROPE_ATTN_SCALE", "0");
+    const std::string qsa_budget = svcconf::cfg(conf, "QSA_INDEXER_BUDGET", "0");
+    if (qsa_budget != "0" && qsa_budget != "4096") {
+        *err = "QSA_INDEXER_BUDGET must be 0 or 4096";
+        return false;
+    }
 
     // 启动前文件检查（同 launch_win.cpp 启动检查；overlay 缺失只警告并跳过）
     const std::string exe = root + "\\build\\qwenox-engine-win.exe";
@@ -442,6 +447,8 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
         "QWENOX_INDEX_FUSED2", "QWENOX_PP_MOE_OUT", "QWENOX_INDEX_STREAM_SELECT",
     };
     for (const char* f : flags) SetEnvironmentVariableA(f, "1");
+    SetEnvironmentVariableA("QWENOX_INDEXER_BUDGET",
+                            qsa_budget == "4096" ? "4096" : nullptr);
     SetEnvironmentVariableA("QWENOX_KVSNAP", kvsnap_max_gb ? "1" : "0");
     SetEnvironmentVariableA("QWENOX_KVSNAP_MAX_GB", std::to_string(kvsnap_max_gb).c_str());
     // KVSNAP_DIR（见 service.conf）：缓存放在它下面的 qwenox-kvsnap 子目录；

@@ -1026,23 +1026,25 @@ __global__ void k_qsa_flash(const float* __restrict__ q, const KVT* __restrict__
                             const int* __restrict__ dvb = nullptr) {
   static_assert(!SharedV || Sparse, "shared V is a sparse-attention specialization");
   // P3-B: dvb carries the batch base on device (graph capture); sparse first
-  // is recomputed as max(base, 2051), matching the host launcher exactly.
+  // is recomputed as max(base, qsa_index_first()), matching the host launcher exactly.
   const int kb = dvb ? *dvb : kbase;
   const int h = blockIdx.y;
   const int kvh = Sparse ? h : h / (hq / hkv);
-  const int token = pos ? *pos : (dvb && Sparse ? max(kb, 2051) : first) + (int)blockIdx.x;
-  // Dense decode tokens (< 2051) are handled here too: ntok = token+1 and
+  const int token = pos ? *pos : (dvb && Sparse ? max(kb, qsa_index_first()) : first) + (int)blockIdx.x;
+  // Dense decode tokens (< qsa_index_first()) are handled here too: ntok = token+1 and
   // qsa_source_pos degrades to identity, so the split partials cover the
   // whole visible range (empty splits write m=-1e30, l=0 and merge as 0).
-  const int* blocks =
-      Sparse ? selected + (size_t)(Split ? 0 : (dvb ? token - kb : (int)blockIdx.x)) * 512 : nullptr;
+  const int* blocks = Sparse ? selected + (size_t)(Split ? 0 : (dvb ? token - kb : (int)blockIdx.x)) *
+                                      g_index_budget_d
+                             : nullptr;
   const int ts = blockIdx.x * QSA_TR;   // first q row of this tile
   // Sparse: q/out rows are batch-local (token - kb); token stays absolute
   // for ntok/source bookkeeping. Dense: rows local, keys/mask absolute (kb).
   const int qrow = token - kb;
   // selected == nullptr (QWENOX_QSA_DENSE decode): every visible position.
-  const int ntok = Sparse ? ((token < 2051 || !selected) ? token + 1
-                                                         : 2048 + (token + 1) % 4)
+  const int ntok = Sparse ? ((token < qsa_index_first() || !selected)
+                                 ? token + 1
+                                 : qsa_index_tokens() + (token + 1) % 4)
                           : min(kb + P, kb + ts + QSA_TR);
   constexpr int QR = SharedV ? 12 : QSA_TR;
   __shared__ float qs[QR][QSA_LP];
@@ -1239,7 +1241,7 @@ __global__ void k_qsa_flash_combine(const float* __restrict__ pml,
                                     const float* __restrict__ pacc,
                                     float* __restrict__ out, int qpg, int dh,
                                     const int* __restrict__ d_pos) {
-  (void)d_pos;  // dense tokens now take this path too (no <2051 early-out)
+  (void)d_pos;  // dense tokens now take this path too (no <qsa_index_first() early-out)
   const int h = blockIdx.y, row = blockIdx.x;
   const float* pm = pml + ((size_t)h * QSA_DEC_NSPLIT * qpg + row) * 2;
   float M = -1e30f, L = 0.f;
@@ -1318,10 +1320,10 @@ __global__ void k_qsa_flash_bf16(const float* __restrict__ q,
   // P3-B: dvb carries the batch base on device (graph capture).
   const int kb = dvb ? *dvb : kbase;
   const int kvh = blockIdx.y;
-  const int token = (dvb ? max(kb, 2051) : first) + (int)blockIdx.x;
+  const int token = (dvb ? max(kb, qsa_index_first()) : first) + (int)blockIdx.x;
   const int qrow = token - kb;  // batch-local q/out row; token stays absolute
-  const int* blocks = selected + (size_t)(dvb ? token - kb : (int)blockIdx.x) * 512;
-  const int ntok = token < 2051 ? token + 1 : 2048 + (token + 1) % 4;
+  const int* blocks = selected + (size_t)(dvb ? token - kb : (int)blockIdx.x) * g_index_budget_d;
+  const int ntok = token < qsa_index_first() ? token + 1 : qsa_index_tokens() + (token + 1) % 4;
   constexpr int QR = 12;
   __shared__ __align__(16) uint16_t qs[QR][QSA_LPB];
   __shared__ __align__(16) uint16_t kt[QSA_KT][QSA_LPB];
@@ -1502,15 +1504,15 @@ __device__ __forceinline__ void tr16x16_bf16(unsigned a[8]) {
 #define QW_QR 12
 #define QW_KTILE 16
 #define QW_KITER 128
-#define QW_NITER 17   // ceil(2051 / 128)
+#define QW_NITER ((INDEX_BUDGET * 4 + 3 + QW_KITER - 1) / QW_KITER)
 #define QW_NKSTEP (QW_KITER / QW_KTILE)
 // Paged (A1c): KV rows / vct blocks go through the page table ptab
 // (kv_row / ik_blk). Compile-time switch so the unpaged production
 // instantiations keep their exact codegen (this kernel is VGPR-sensitive).
-// Dense (F1, §11.1): the dense prefix [0, 2051) reuses this kernel instead of
+// Dense (F1, §11.1): the dense prefix [0, qsa_index_first()) reuses this kernel instead of
 // the fp32 scalar k_qsa_flash<false>. Keys are logically contiguous:
 // ntok = token + 1, src = gkey / vs = vk (identity, no blocks[]/tail0), and the
-// iteration count is the runtime ceil(ntok / QW_KITER) (<= 17 here). Q/KV
+// iteration count is the runtime ceil(ntok / QW_KITER) (<= QW_NITER here). Q/KV
 // layouts, softmax and the output write are identical to the sparse tail; the
 // launcher uses grid = (dense_P, 2), first = kbase = base, selected = nullptr.
 // Body of k_qsa_wmma for grid cell (bx, kvh); k_qsa_wmma_vseg (batched
@@ -1524,20 +1526,20 @@ __device__ __forceinline__ void qsa_wmma_body(
     const int* __restrict__ ptab, const int* __restrict__ dvb, int dvb_edge) {
   (void)ptab;
   // P3-B: dvb carries the batch base on device (graph capture). dvb_edge:
-  // 0 = full sparse range [max(kb,2051), kb+P) (grid == P), 1 = union right
-  // ragged edge [(kb+P)&~3, kb+P), 2 = union left ragged edge [max(kb,2051),
-  // (max(kb,2051)+3)&~3). Grids are baked worst-case; out-of-range blocks
+  // 0 = full sparse range [max(kb,qsa_index_first()), kb+P) (grid == P), 1 = union right
+  // ragged edge [(kb+P)&~3, kb+P), 2 = union left ragged edge [max(kb,qsa_index_first()),
+  // (max(kb,qsa_index_first())+3)&~3). Grids are baked worst-case; out-of-range blocks
   // exit. Dense: first = kbase = kb, exactly as the scalar launcher passes.
   const int kb = dvb ? *dvb : kbase;
   int first_ = first;
   if (dvb) {
     if (Dense) first_ = kb;
     else if (dvb_edge == 1) first_ = (kb + P) & ~3;
-    else first_ = max(kb, 2051);
+    else first_ = max(kb, qsa_index_first());
   }
   const int token = first_ + bx, kvh = kvh_;
   if (dvb && !Dense) {
-    const int ga_ = (max(kb, 2051) + 3) & ~3;
+    const int ga_ = (max(kb, qsa_index_first()) + 3) & ~3;
     if (dvb_edge == 1) {
       // right edge [ge, kb+P): only exists when ge >= ga (as the host check)
       if (token >= kb + P || ((kb + P) & ~3) < ga_) return;
@@ -1569,10 +1571,11 @@ __device__ __forceinline__ void qsa_wmma_body(
     }
   }
   __syncthreads();
-  const int* blocks = Dense ? nullptr : selected + (size_t)(dvb ? token - kb : bx) * 512;
-  const int ntok = Dense ? token + 1 : 2048 + (token + 1) % 4;
+  const int* blocks = Dense ? nullptr : selected + (size_t)(dvb ? token - kb : bx) * g_index_budget_d;
+  const int ntok = Dense ? token + 1 : qsa_index_tokens() + (token + 1) % 4;
   const long tail0 = Dense ? 0 : ((token + 1) / 4) * 4L;  // dense tail (visible = token+1)
-  const int qw_niter = Dense ? (ntok + QW_KITER - 1) / QW_KITER : QW_NITER;
+  const int qw_niter = Dense ? (ntok + QW_KITER - 1) / QW_KITER
+                             : (qsa_index_first() + QW_KITER - 1) / QW_KITER;
   float m_run[8], l_run[8];   // per-elem qrow state (row = lane<16 ? e : 8+e)
 #pragma unroll
   for (int e = 0; e < 8; ++e) { m_run[e] = -1e30f; l_run[e] = 0.f; }
@@ -1596,8 +1599,8 @@ __device__ __forceinline__ void qsa_wmma_body(
     long src = 0;
     if (gkey < ntok) {
       if constexpr (Dense) src = gkey;
-      else src = gkey < 2048 ? 4L * blocks[gkey / 4] + gkey % 4
-                             : tail0 + gkey - 2048;
+      else src = gkey < qsa_index_tokens() ? 4L * blocks[gkey / 4] + gkey % 4
+                                     : tail0 + gkey - qsa_index_tokens();
     }
     if constexpr (Paged) src = kv_row(ptab, (int)src);
     const uint16_t* kp = kc + ((size_t)src * hkv + kvh) * dh;
@@ -1696,8 +1699,8 @@ __device__ __forceinline__ void qsa_wmma_body(
           long vs = 0;
           if (vk < ntok) {
             if constexpr (Dense) vs = vk;
-            else vs = vk < 2048 ? 4L * blocks[vk / 4] + vk % 4
-                                : tail0 + vk - 2048;
+            else vs = vk < qsa_index_tokens() ? 4L * blocks[vk / 4] + vk % 4
+                                        : tail0 + vk - qsa_index_tokens();
           }
           // vs is 4-aligned here (blk*4 steps, 4-aligned tail0)
           if constexpr (Paged) vs = (long)ik_blk(ptab, (int)(vs / 4)) * 4;
@@ -1754,8 +1757,8 @@ __device__ __forceinline__ void qsa_wmma_body(
         long vs = 0;
         if (vk < ntok) {
           if constexpr (Dense) vs = vk;
-          else vs = vk < 2048 ? 4L * blocks[vk / 4] + vk % 4
-                              : tail0 + vk - 2048;
+          else vs = vk < qsa_index_tokens() ? 4L * blocks[vk / 4] + vk % 4
+                                      : tail0 + vk - qsa_index_tokens();
         }
         if constexpr (Paged) vs = kv_row(ptab, (int)vs);
         const uint16_t* vp =
@@ -1902,7 +1905,7 @@ __global__ void __launch_bounds__(128)
     }
   }
   __syncthreads();  // Sel visible block-wide
-  const int ntok = 2048 + (token + 1) % 4;
+  const int ntok = qsa_index_tokens() + (token + 1) % 4;
   const long tail0 = ((token + 1) / 4) * 4L;  // dense tail (visible = token+1)
   const float scale = 1.f / sqrtf((float)dh);
   const int keylane = lane & 15;
@@ -2069,7 +2072,7 @@ __global__ void __launch_bounds__(128)
   // P3-B: dvb carries the batch base on device (graph capture); g0/sbase are
   // recomputed and the baked worst-case grid is masked by the ge guard.
   const int kb = dvb ? *dvb : sbase;
-  const int g0_ = dvb ? ((max(kb, 2051) + 3) & ~3) : g0;
+  const int g0_ = dvb ? ((max(kb, qsa_index_first()) + 3) & ~3) : g0;
   const int t0 = g0_ + 4 * g;  // 组首 token（绝对，4 对齐）
   if (dvb && t0 >= ((kb + dvb_P) & ~3)) return;
 #pragma unroll
@@ -2209,7 +2212,7 @@ __global__ void __launch_bounds__(256)
   // P3-B: dvb carries the batch base on device (graph capture); g0/kbase are
   // recomputed and the baked worst-case grid is masked by the ge guard.
   const int kb = dvb ? *dvb : kbase;
-  const int g0_ = dvb ? ((max(kb, 2051) + 3) & ~3) : g0;
+  const int g0_ = dvb ? ((max(kb, qsa_index_first()) + 3) & ~3) : g0;
   if (dvb && g0_ + 4 * g >= ((kb + dvb_P) & ~3)) return;
   __shared__ float4 part[3][8][64];
   __shared__ uint4 ptile[3][32];
