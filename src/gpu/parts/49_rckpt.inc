@@ -201,6 +201,7 @@ void prewarm(bool with_mtp) {
   const size_t sets = g_cap + 2;
   g_pool_per_size = sets;
   std::thread([sizes, sets] {
+    hip_use_selected_device();
     for (size_t s = 0; s < sets; s++)
       for (size_t cnt : sizes) {
         void* q = nullptr;

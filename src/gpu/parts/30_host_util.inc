@@ -853,6 +853,7 @@ static void load_arena(const Checkpoint& ck) {
     }
   }
   auto wworker = [&](int wid) {
+    hip_use_selected_device();
     WSlot* slots = wslots[wid];
     for (;;) {
       size_t ji = next.fetch_add(1);
@@ -938,6 +939,7 @@ static void load_arena(const Checkpoint& ck) {
     CK(hipStreamCreate(&st[i]));
   }
   auto worker = [&](int wid) {
+    hip_use_selected_device();
     for (;;) {
       size_t ji = next.fetch_add(1);
       if (ji >= jobs.size()) break;

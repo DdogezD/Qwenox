@@ -7842,7 +7842,7 @@ struct GpuModel {
       unsigned long long h[16];
       CK(hipMemcpyFromSymbol(h, g_ph, sizeof(h)));
       hipDeviceProp_t dp;
-      CK(hipGetDeviceProperties(&dp, 0));
+      CK(hipGetDeviceProperties(&dp, g_hip_device));
       double cyc2ms = 1.0 / (dp.clockRate * 1e3);  // clockRate is kHz
       const char* names[11] = {"in_staging", "in_dots",   "in_solve", "in_vpkcd",
                                "in_attn2",   "st_Sstage", "st_vnew",  "st_out",

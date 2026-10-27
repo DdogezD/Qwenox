@@ -92,6 +92,41 @@ static void diag_log_env(const char* tag, const std::string& s) {
     a = e + 1;
   }
 }
+static bool select_gfx1151_apu() {
+  int n = 0;
+  const hipError_t ce = hipGetDeviceCount(&n);
+  if (ce != hipSuccess) {
+    fprintf(stderr, "gpu: hipGetDeviceCount failed: %s\n", hipGetErrorString(ce));
+    return false;
+  }
+  int selected = -1;
+  hipDeviceProp_t chosen{};
+  for (int d = 0; d < n; d++) {
+    hipDeviceProp_t p{};
+    if (hipGetDeviceProperties(&p, d) != hipSuccess) continue;
+    if (p.integrated && strcmp(p.gcnArchName, "gfx1151") == 0) {
+      selected = d;
+      chosen = p;
+      break;
+    }
+  }
+  if (selected < 0) {
+    fprintf(stderr,
+            "gpu: no integrated gfx1151 APU found among %d HIP device(s); "
+            "refusing to use another GPU\n", n);
+    return false;
+  }
+  const hipError_t se = hipSetDevice(selected);
+  if (se != hipSuccess) {
+    fprintf(stderr, "gpu: hipSetDevice(%d) for gfx1151 failed: %s\n", selected,
+            hipGetErrorString(se));
+    return false;
+  }
+  g_hip_device = selected;
+  fprintf(stderr, "gpu: selected hip-device %d: %s (%s), integrated %d\n", selected,
+          chosen.name, chosen.gcnArchName, (int)chosen.integrated);
+  return true;
+}
 // HIP 运行时/驱动版本、设备属性、显存，及此刻已加载的 GPU 栈模块版本
 // （amd_comgr 等在首次加载 kernel 时才载入，故模型就绪后再记一次）。
 static std::string diag_hip_report() {
@@ -137,6 +172,7 @@ int main(int argc, char** argv) {
     printf("qwenox-engine %s\n", QWENOX_VERSION_FULL);
     return 0;
   }
+  if (!select_gfx1151_apu()) return 1;
   const char* index_budget_env = getenv("QWENOX_INDEXER_BUDGET");
   if (!index_budget_env || !strcmp(index_budget_env, "2048"))
     g_index_budget = 512;
@@ -387,7 +423,7 @@ int main(int argc, char** argv) {
               g[1], g[2], P);
       return 2;
     }
-    CK(hipSetDevice(0));
+    hip_use_selected_device();
     hipblasLtHandle_t vlth;
     rocblas_handle vrbh;
     hipblasLtCreate(&vlth);

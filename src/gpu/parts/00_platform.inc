@@ -137,6 +137,10 @@ using hgn::Tensor;
                        __FILE__, __LINE__);                            \
   } while (0)
 
+static int g_hip_device = 0;
+// HIP 的当前设备按宿主线程记录；每个会调用 HIP 的工作线程都要显式绑定。
+static inline void hip_use_selected_device() { CK(hipSetDevice(g_hip_device)); }
+
 // 崩溃链路自测（分发后验证报告/诊断包是否生成）：
 //   QWENOX_CRASH_TEST=<kind>   kind 见 crashdiag::self_test_kinds()，另有
 //                              hipfatal（走一次 CK 失败路径）

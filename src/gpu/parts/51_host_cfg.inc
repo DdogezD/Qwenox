@@ -3162,6 +3162,7 @@ struct Conn {
 static void gen_one(GpuModel& m, Conn& c, GenReq g,
                     std::vector<std::vector<float>> vpatches,
                     const kvsnap::Cfg& kvs) {
+  hip_use_selected_device();
   kvsnap::Turn kv_turn;  // KVSYNC waits for this turn's SSD commit
   const std::atomic<bool>& cancel = c.cancel;
   char db[192];
@@ -4111,6 +4112,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
 
 // Connection reader: control verbs inline, GEN handed to a worker thread.
 static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
+  hip_use_selected_device();
   Conn c;
   c.fd = cfd;
   c.id = ++g_conn_id;
