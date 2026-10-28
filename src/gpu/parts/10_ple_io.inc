@@ -32,6 +32,7 @@ static void ple_uring_open(const char* path) {
 }
 
 struct PleUring {
+  std::mutex run_mu;  // serialize run() on this ring (see below)
   int fd = -1;
   int err = 0;  // errno from the failed setup step, for the fallback message
   unsigned entries = 0;
@@ -110,6 +111,7 @@ struct PleUring {
   // no silent mid-batch fallback onto half-written staging.
   void run(const uint64_t* addrs, uint8_t* staging, uint64_t table_va,
            size_t n) {
+    std::lock_guard<std::mutex> lk(run_mu);
     size_t sub = 0, done = 0;
     unsigned ltail = __atomic_load_n(sq_tail, __ATOMIC_RELAXED);
     while (done < n) {
