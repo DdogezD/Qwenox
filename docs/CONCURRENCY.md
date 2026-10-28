@@ -34,6 +34,10 @@ rckpt 检查点连同 MTP 层的页一起钉住，恢复后继续 MTP 投机（`
   有 1 个，在第 27 个 token 上“are:”与“are G…”的差别，大约一半的并发运行出现）：并发时
   MTP 投机的 γ 按同时在跑的人数选（OccGamma），而 GGUF 路径的输出对 γ 不严格不变。需要
   严格一致时设 `QWENOX_OCC_FORCE=4`，greedy 的 γ 在任何并发下都固定为 4（吞吐会低一些）。
+- **投机验证的确定性/性能开关**：`QWENOX_SPEC_ROW_INVARIANT` 默认开启，投机验证与拒绝后的
+  前缀重放固定使用逐行等价的 FP32 indexer 评分，并禁用该路径上的提前 BF16 gate、MoE LUT
+  和 QSA union，避免动态 γ 或并发调度改变 greedy / fixed-seed 输出。设为 `0` 可恢复这些
+  快速路径和更高吞吐，但近似平局处可能重新出现输出分叉；普通 prefill 不受此开关影响。
 - **会合 verify 的行窗口备份**：多条序列的 MTP verify 合成一批跑完后，GPU 会先交出去，
   各序列再依次回来提交 / 回滚，期间别的请求（prefill、ngram verify、单段 verify）可能已经
   改写了共享缓冲里它们那几行。引擎在交出前按槽备份这些行，回来时先拷回（每槽 48.4 MB，

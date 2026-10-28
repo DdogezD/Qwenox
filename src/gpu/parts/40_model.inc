@@ -793,6 +793,7 @@ struct GpuModel {
     return ckpt.find("mtp.fc_hidden.weight") && mtp_moe_default();
   }
   bool ngram_verify_active = false;
+  bool spec_row_invariant = !env_zero("QWENOX_SPEC_ROW_INVARIANT");
   bool ngram_legacy_gdn = getenv("QWENOX_NGRAM_LEGACY_GDN") != nullptr;
   bool ngram_legacy_final = getenv("QWENOX_NGRAM_LEGACY_FINAL") != nullptr;
   bool mtp_tap_capture = false;  // prefill_chunk copies d_Rb rows into d_mtap
@@ -4199,7 +4200,9 @@ struct GpuModel {
         // same row lands in a group at P=4 but on a ragged edge at P=3 —
         // and the union kernel is NOT bit-identical to the per-token one
         // (key order). Row invariance across gamma requires one kernel.
-        if (qsa_union && vc_transposed && !usnap) {
+        // ngram 验证和拒绝后的前缀重放也必须保持逐 token 算术。
+        if (qsa_union && vc_transposed && !usnap &&
+            !(spec_row_invariant && ngram_verify_active)) {
           // 并集路径：[ga, ge) 内的 4 对齐完整组走 merge + k_qsa_wmma_u，
           // 两侧 ragged 边缘回退逐 token 的 k_qsa_wmma<true>
           const int ga = (first_abs + 3) & ~3;
@@ -4686,6 +4689,7 @@ struct GpuModel {
     float* const iraw = slot_d_iraw(bs);
     const int* const ptabc = slot_ptab_eff(bs, P);
     const bool usnap = slot_spec_snap(bs);
+    const bool verify = spec_row_invariant && (usnap || slot_ngram_verify_active(bs));
     const int vrow0 = slot_vsnap_row0_(bs);
     const int cutr = slot_cut_r_(bs);
     const int* const vb = vseg ? nullptr : vbptr();
@@ -4820,9 +4824,11 @@ struct GpuModel {
         int nxt = first < grid ? min(grid, base + P)
                                : min(first + INDEX_BATCH, base + P);
         int count = nxt - first;
-        if (index_fused2 && count >= 16 && getenv("QWENOX_INDEX_OLDSEL") == nullptr) {
+        // 验证和重放不能随块大小切换 FP16 排名或 SGEMM 归约顺序。
+        if ((verify || (index_fused2 && count >= 16)) &&
+            getenv("QWENOX_INDEX_OLDSEL") == nullptr) {
           int* const selrow = iselb + (size_t)(first - base) * g_index_budget;  // batch-local
-          if (index_f16()) {
+          if (index_f16() && !verify) {
             // C1: f16 WMMA 打分 + f16 score（复用 d_iscores 内存）+ f16 select
             uint16_t* const sc16 = (uint16_t*)d_iscores;
             k_index_scores_wmma16<false>
@@ -5054,7 +5060,10 @@ struct GpuModel {
       // into k_sigmoid_gate_bf16_v4, which reads the gate half of d_qgb
       // directly (qsplit skips its gs copy). QWENOX_QSA_GATE_BF16=0 disables.
       static const bool gate_bf16_on = !env_zero("QWENOX_QSA_GATE_BF16");
-      const bool gate_bf16 = gate_bf16_on && P > 8 && !vseg;
+      // 验证行的分块随 γ 和接受深度变化，不能按 P 提前舍入输入。
+      const bool verify = spec_row_invariant &&
+                          (slot_spec_snap(bs) || slot_ngram_verify_active(bs));
+      const bool gate_bf16 = gate_bf16_on && P > 8 && !vseg && !verify;
 #ifdef QWENOX_NPU
       npu_qg_finish_q(l);  // M4：qsplit 读 q 半前收尾（qsa:idx+k/v 已盖窗口）
 #endif
@@ -5954,7 +5963,9 @@ struct GpuModel {
     // D2-S1c: vseg = batched multi-segment verify (R can exceed moe_naive_max
     // while each segment's serial run takes the per-row path) — force the
     // non-LUT per-row path so batched rows stay bit-identical to serial.
-    const bool lut = !vseg && moe_q4w && !moe_naive && P > moe_naive_max && k == 10 && moe_deterministic &&
+    // ngram 长验证块和短前缀重放须与 MTP 保持同一精度。
+    const bool lut = !vseg && !(spec_row_invariant && (spec_snap || ngram_verify_active)) &&
+                     moe_q4w && !moe_naive && P > moe_naive_max && k == 10 && moe_deterministic &&
                      !moe_host_route && !moe_ordered && !moe_untiled && P <= maxbatch_cap &&
                      mid % 64 == 0 &&
                      moelut::lut_ok(moelut::kI4R, pgu, true, d) &&
