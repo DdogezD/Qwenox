@@ -387,6 +387,45 @@ struct GpuModel {
   void yield_point() {
     if (yield_fn) yield_fn(*this);
   }
+  // Optional round-top admission hook. [begin, end) covers both trunk and
+  // MTP logical KV writes, including provisional writes later rolled back.
+  // The callback may suspend membership while waiting, but must return with
+  // the GPU turn and the same slot bound. Throwing unwinds the loop normally.
+  struct SpecMembership {
+    GpuModel& m;
+    bool vr, dr, suspended = false;
+    SpecMembership(GpuModel& m, bool vr, bool dr) : m(m), vr(vr), dr(dr) {
+      if ((vr && (!m.vseg_round_enter_fn || !m.vseg_round_exit_fn)) ||
+          (dr && (!m.dr_round_enter_fn || !m.dr_round_exit_fn)))
+        throw std::runtime_error("spec admission: incomplete membership callbacks");
+    }
+    SpecMembership(const SpecMembership&) = delete;
+    SpecMembership& operator=(const SpecMembership&) = delete;
+    void suspend() {
+      if (suspended) return;
+      if (dr) m.dr_round_exit();
+      if (vr) m.vseg_round_exit();
+      suspended = true;
+    }
+    void resume() {
+      if (!suspended) return;
+      if (vr) m.vseg_round_enter();
+      if (dr) m.dr_round_enter();
+      suspended = false;
+    }
+    ~SpecMembership() { resume(); }
+  };
+  void (*spec_round_fn)(GpuModel&, int remaining, int64_t begin, int64_t end,
+                        SpecMembership&) = nullptr;
+  // Greedy spec_loop's caller declares its enclosing memberships explicitly.
+  // A per-call object avoids shared-model state across yield/rebind.
+  struct SpecExternalMembership { bool vr, dr; };
+  void spec_round_point(int remaining, int64_t begin, int64_t end,
+                        bool vr, bool dr) {
+    if (!spec_round_fn) return;
+    SpecMembership membership(*this, vr, dr);
+    spec_round_fn(*this, remaining, begin, end, membership);
+  }
   // 客户端断连/取消标志（serve 模式下 gen_one 指向 Conn::cancel，平时为
   // nullptr）：仅 prompt 预填期间 armed，prefill_batch 在分段间检查并抛
   // ReqCancelled。投机 verify 也走 prefill_batch，但那时该指针为空——
@@ -9950,7 +9989,8 @@ struct GpuModel {
   // emit (optional): called with each committed token as it lands; returning
   // false aborts the loop early (serve: eos/cancel/streaming).
   std::vector<int> spec_loop(int cur, int gen, int gamma,
-                             const std::function<bool(int)>& emit = nullptr) {
+                             const std::function<bool(int)>& emit = nullptr,
+                             const SpecExternalMembership* external = nullptr) {
     last_spec_rounds = last_spec_commit = last_spec_rollbacks = 0;
     live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
     std::vector<int> out;
@@ -9969,11 +10009,22 @@ struct GpuModel {
       return std::chrono::duration<double, std::milli>(b - a).count();
     };
     auto T0 = std::chrono::steady_clock::now();
-    while ((int)out.size() < gen) {
+    while ((int)out.size() < gen && pos < maxctx) {
       yield_point();  // round top: mtp_pos == pos-1, d_R == h_{pos-1}
+      if (pos < 1 || pos >= maxctx)
+        throw std::runtime_error("spec: invalid round-top context position");
+      const int remaining = gen - (int)out.size();
+      // Verify consumes cur plus g drafts and emits at most g+1 tokens.
+      // Even g=0 consumes cur and advances the MTP row at pos-1.
+      const int g_bound = std::max(0, std::min({gctl.cur, remaining - 1,
+                                                maxctx - pos - 1}));
+      if (spec_round_fn && external) {
+        spec_round_point(remaining, (int64_t)pos - 1,
+                         (int64_t)pos + g_bound + 1, external->vr, external->dr);
+      }
       int q = pos - 1;  // trunk processed through q
       if (d_iraw) vg_dump_buf("irT", 2, d_iraw, 512 * 4);  // P3-B bisect
-      int g = std::min(gctl.cur, gen - (int)out.size());
+      int g = g_bound;
       // D2-S2a row budget + D2 阶段 3 occupancy γ (round-top snapshot of the
       // rendezvous membership; may return 0 = batched AR round).
       g = occ.pick(g, vseg_active_fn ? vseg_active_fn() : 1, (int)kVSnapRows);
@@ -10251,6 +10302,16 @@ struct GpuModel {
     };
     while ((int)out.size() < gen && pos < maxctx) {
       yield_point();  // round top: only persistent slot state is live
+      if (spec_round_fn) {
+        const int remaining = gen - (int)out.size();
+        const int ng_bound = std::max(0, std::min({maxg, remaining - 1,
+                                                   maxctx - pos - 1}));
+        const int mtp_bound = std::max(0, std::min({gctl.cur, remaining - 1,
+                                                    maxctx - pos - 1}));
+        spec_round_point(remaining, (int64_t)pos - 1,
+                         (int64_t)pos + std::max(ng_bound, mtp_bound) + 1,
+                         vseg_round_enter_fn != nullptr, dr_on);
+      }
       if (chist.size() != (size_t)pos)
         throw std::runtime_error(
             "chain: token history and trunk position disagree");
@@ -10624,11 +10685,20 @@ struct GpuModel {
       return std::chrono::duration<double, std::milli>(b - a).count();
     };
     auto T0 = std::chrono::steady_clock::now();
-    while ((int)out.size() < gen) {
+    while ((int)out.size() < gen && pos < maxctx) {
       yield_point();  // round top: mtp_pos == pos-1, d_R == h_{pos-1}
+      if (pos < 1 || pos >= maxctx)
+        throw std::runtime_error("spec: invalid round-top context position");
+      const int remaining = gen - (int)out.size();
+      const int g_bound = std::max(0, std::min({
+          spec_conf() > 0 ? kSpecConfMax : gctl.cur, remaining - 1,
+          maxctx - pos - 1}));
+      if (spec_round_fn) {
+        spec_round_point(remaining, (int64_t)pos - 1,
+                         (int64_t)pos + g_bound + 1, false, false);
+      }
       int q = pos - 1;
-      int g = std::min(spec_conf() > 0 ? kSpecConfMax : gctl.cur,
-                       gen - (int)out.size());
+      int g = g_bound;
       size_t chist_sz = chist.size();
       mtp_ckpt_save();
       Sampler draft_sampler = sampler.fork_stream(
@@ -10973,6 +11043,17 @@ struct GpuModel {
       rp_t = rp_top;
       yield_point();  // round top: only persistent slot state is live
       rp_lap(RP_YIELD);
+      if (spec_round_fn) {
+        const int remaining = gen - (int)out.size();
+        const int ng_bound = std::max(0, std::min({maxg, remaining - 1,
+                                                   maxctx - pos - 1}));
+        const int mtp_bound = mtp_ok ? std::max(0, std::min({
+            spec_conf() > 0 ? kSpecConfMax : gctl.cur, remaining - 1,
+            maxctx - pos - 1})) : 0;
+        spec_round_point(remaining, (int64_t)pos - (mtp_ok ? 1 : 0),
+                         (int64_t)pos + std::max(ng_bound, mtp_bound) + 1,
+                         vr_on, dr_on);
+      }
       if (chist.size() != (size_t)pos)
         throw std::runtime_error(
             "chain-sample: token history and trunk position disagree");
