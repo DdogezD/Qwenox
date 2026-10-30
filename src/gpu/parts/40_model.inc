@@ -4369,8 +4369,15 @@ struct GpuModel {
       kv_fatal_seq("beyond maxctx", end, seq.mapped);
     const int m0 = seq.mapped;
     // pool dry: evict pinned checkpoints (LRU first) until the rows fit
-    while (!seq.reserve(kv_pool, end))
-      if (!kv_evict_one()) kv_fatal_seq("pool exhausted", end, seq.mapped);
+    try {
+      while (!seq.reserve(kv_pool, end))
+        if (!kv_evict_one()) kv_fatal_seq("pool exhausted", end, seq.mapped);
+    } catch (...) {
+      if (seq.mapped > m0)
+        CK(hipMemcpy(ptab + m0, seq.tab.data() + m0,
+                     (size_t)(seq.mapped - m0) * 4, hipMemcpyHostToDevice));
+      throw;
+    }
     CK(hipMemcpy(ptab + m0, seq.tab.data() + m0,
                  (size_t)(seq.mapped - m0) * 4, hipMemcpyHostToDevice));
     if (kv_zero_dbg)  // debug: fresh pages read as zeros, like a zeroed unpaged cache
@@ -4386,6 +4393,19 @@ struct GpuModel {
   // checkpoint shares are copied first (in practice only the partial page
   // holding `start`), then the tail is mapped. Cheap host check otherwise.
   void kv_prepare(int start, int end) { kv_prepare_seq(kv_seq, d_ptab, start, end); }
+  // The caller owns the GPU turn throughout the check and prepare. No page
+  // mutation occurs when the whole round cannot be backed immediately.
+  bool kv_prepare_nowait(int start, int end) {
+    if (start < 0 || end < start || end > maxctx) return false;
+    if (!kv_paged || start == end) return true;
+    const int last = (end + KV_PAGE - 1) / KV_PAGE;
+    int need = std::max(0, last - kv_seq.mapped);
+    for (int lp = start / KV_PAGE; lp < std::min(last, kv_seq.mapped); ++lp)
+      if (kv_pool.ref[(size_t)kv_seq.tab[(size_t)lp]] > 1) ++need;
+    if (kv_pool.nfree() < need) return false;
+    kv_prepare(start, end);
+    return true;
+  }
   void kv_prepare_seq(KvSeqTable& seq, int* ptab, int start, int end) {
     if (!kv_paged) return;
     const int lp1 = std::min(seq.mapped, (end + KV_PAGE - 1) / KV_PAGE);
