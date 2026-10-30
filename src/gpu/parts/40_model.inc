@@ -12367,6 +12367,25 @@ struct GpuModel {
   int slot_pages(int s) const {
     return s == bound_ ? kv_seq.mapped : slots_[(size_t)s].kv_seq.mapped;
   }
+  // Predict the physical pages released by trimming exactly this sequence.
+  // Each mapped occurrence owns one reference, including repeated IDs.
+  static int kv_reclaimable_pages(const KvPagePool& pool, const KvSeqTable& seq) {
+    std::vector<int> pages(seq.tab.begin(), seq.tab.begin() + seq.mapped);
+    std::sort(pages.begin(), pages.end());
+    int released = 0;
+    for (size_t i = 0; i < pages.size();) {
+      size_t j = i + 1;
+      while (j < pages.size() && pages[j] == pages[i]) ++j;
+      if ((size_t)pool.ref[(size_t)pages[i]] == j - i) ++released;
+      i = j;
+    }
+    return released;
+  }
+  // Caller holds the GPU turn; s must be a valid slot. This is a snapshot,
+  // not a reservation, and excludes any later checkpoint eviction.
+  int slot_reclaimable_pages(int s) const {
+    return kv_paged ? kv_reclaimable_pages(kv_pool, slot_kv_seq(s)) : 0;
+  }
   // Drop slot s's sequence (returns its pages to the pool) while `back`
   // stays the slot the caller runs on.
   void slot_reset(int s, int back) {
