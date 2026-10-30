@@ -209,6 +209,15 @@ static std::mutex g_pool_mtx;
 static std::vector<HBuf> g_pool;
 static size_t g_pool_bytes = 0;
 static const size_t g_pool_max = 512ull << 20;
+static HBuf buf_exact(size_t n) {
+  HBuf b;
+  b.cap = os_dio_round(n ? n : 1);
+  b.p.reset(new (std::nothrow) char[b.cap + OS_DIO_ALIGN]);
+  if (!b.p) return b;
+  b.a = (char*)(((uintptr_t)b.p.get() + OS_DIO_ALIGN - 1) & ~(uintptr_t)(OS_DIO_ALIGN - 1));
+  b.n = n;
+  return b;
+}
 static HBuf buf_get(size_t n) {
   {
     std::lock_guard<std::mutex> lk(g_pool_mtx);
@@ -245,6 +254,9 @@ static void buf_put(HBuf&& b) {
 static std::string g_dir;
 static uint64_t g_cap = 0, g_qcap = 0;
 static bool g_on = false;
+// CkHdr's reserved field identifies a private trunk checkpoint. The existing
+// mR_b body segment carries d_R even though mtp is zero.
+static constexpr int32_t REQ_PAD = 0x52514b31;
 static std::string ch_name(uint64_t k) {
   char b[32];
   snprintf(b, sizeof b, "c_%016llx.kvc", (unsigned long long)k);
@@ -319,7 +331,8 @@ static void direct_unsupported(const char* op) {
 // tmp_<name>, fdatasync, rename: a crash never publishes a torn file.
 // `p` is an HBuf's data (aligned, padded capacity).
 static bool write_file(const std::string& name, const char* p, size_t n) {
-  const std::string tmp = path_of("tmp_" + name);
+  const std::filesystem::path rel(name);
+  const std::string tmp = path_of((rel.parent_path() / ("tmp_" + rel.filename().string())).string());
   bool ok = false, done = false;
   if (g_direct.load()) {
     const int rc = os_write_direct(tmp.c_str(), p, n);
@@ -381,10 +394,15 @@ struct CkEnt {
   uint64_t seed = 0, base = 0, id = 0, bytes = 0;
   int n = 0, nc = 0, nl = 0;
   bool mtp = false, pub = false;
+  bool failed = false, delete_file = false, require_mtp = false;
+  bool required = false;              // private, never a prefix-cache match
+  std::string req_prefix;             // unique session/snapshot file namespace
+  std::vector<int> req_pages;         // private page writer states, under g_mtx
+  CkHdr hdr{};                         // restore geometry, including loaded checkpoints
   std::vector<uint64_t> chunks, mtps;  // mtps[i] == 0: not referenced
   std::vector<int> tail;               // tokens [256*nc, n)
   int64_t t = 0;                       // LRU time (file_time clock)
-  int busy = 0;                        // restores in progress: not evictable
+  int busy = 0;                        // restores and explicit pins: not evictable
   int hits = 0;                        // successful restores (kvsnap_hits.txt)
   bool hot = false;                    // hot segment (two-segment eviction)
 };
@@ -392,7 +410,12 @@ static std::mutex g_mtx;
 static std::condition_variable g_cv;
 static std::unordered_map<uint64_t, Blk> g_ch, g_mt;
 static std::vector<std::shared_ptr<CkEnt>> g_ck;
-static uint64_t g_total = 0;  // bytes of published files
+static uint64_t g_total = 0;  // ordinary published cache files
+static std::string req_page_name(const CkEnt& e, int i, bool mtp = false) {
+  char b[24];
+  snprintf(b, sizeof b, "_%08x.%s", (unsigned)i, mtp ? "kvm" : "kvc");
+  return e.req_prefix + b;
+}
 
 // ---- janitor: file deletes and LRU mtime bumps, off the lock ------------------
 // Each is a round trip on a share (2-8 ms), and evicting one checkpoint can
@@ -427,6 +450,11 @@ static void hits_dirty_locked() {
 }
 // The index holds this name (published or pending): its file is wanted.
 static bool live_locked(const std::string& n) {
+  for (const auto& e : g_ck) {
+    if (!e->required || n.compare(0, e->req_prefix.size(), e->req_prefix)) continue;
+    if (n == e->name || (n.size() > e->req_prefix.size() &&
+                         n[e->req_prefix.size()] == '_')) return true;
+  }
   if (n.size() == 22 && n[1] == '_' && (n[0] == 'c' || n[0] == 'm')) {
     const uint64_t k = strtoull(n.substr(2, 16).c_str(), nullptr, 16);
     return (n[0] == 'c' ? g_ch : g_mt).count(k) > 0;
@@ -441,20 +469,33 @@ static void unref_locked(std::unordered_map<uint64_t, Blk>& mp, uint64_t key, bo
   auto it = mp.find(key);
   if (it == mp.end() || --it->second.refs > 0) return;
   if (it->second.st == ST_PEND) return;  // the writer deletes it on publish
-  if (it->second.st == ST_PUB) {
-    del_locked(mtp ? mt_name(key) : ch_name(key));
-    g_total -= it->second.bytes;
-  }
+  // A failed rewrite can leave an older file at this content-addressed name.
+  del_locked(mtp ? mt_name(key) : ch_name(key));
+  if (it->second.bytes) g_total -= it->second.bytes;  // published, then marked bad
   mp.erase(it);
 }
+// Invalid entries remain indexed, with their files and references intact, while
+// any restore or explicit pin is using them. New matches must not select them.
 static void drop_ck_locked(std::shared_ptr<CkEnt> e, bool del_file) {
   auto it = std::find(g_ck.begin(), g_ck.end(), e);
   if (it == g_ck.end()) return;
+  e->failed = true;
+  e->delete_file = e->delete_file || del_file;
+  g_cv.notify_all();
+  if (e->busy) return;
   g_ck.erase(it);
-  if (e->pub) {
-    g_total -= e->bytes;
-    if (del_file) del_locked(e->name);
+  if (e->required) {
+    // Writers already holding an item also schedule a delete after they finish.
+    del_locked(e->name);
+    for (int i = 0; i < e->nc; i++) {
+      del_locked(req_page_name(*e, i));
+      if (e->mtp) del_locked(req_page_name(*e, i, true));
+    }
+    return;
   }
+  if (e->pub) g_total -= e->bytes;
+  // A pending replacement can still have the previous file at this name.
+  if (e->delete_file) del_locked(e->name);
   // its line must leave kvsnap_hits.txt: the name may be saved again later
   if (e->hits > 0) hits_dirty_locked();
   for (uint64_t k : e->chunks) unref_locked(g_ch, k, false);
@@ -506,6 +547,10 @@ static void evict_locked(const CkEnt* keep) {
     drop_ck_locked(v, true);
   }
 }
+static void unbusy_locked(const std::shared_ptr<CkEnt>& e) {
+  if (--e->busy == 0 && e->failed) drop_ck_locked(e, false);
+}
+
 static void touch_locked(const std::shared_ptr<CkEnt>& e) {
   e->t = now_t();
   g_jq.push_back({e->name, J_TOUCH});  // the file mtime carries it across restarts
@@ -614,17 +659,52 @@ static void janitor() {
 }
 
 // ---- background writers ------------------------------------------------------
-// g_writers detached threads take captured images in FIFO order: a commit
-// enqueues its pages, then its MTP sections, then its checkpoints. Pages are
-// written in parallel; a writer taking a checkpoint first waits until no page
-// it names is still pending (those were taken earlier, so they are being
-// written), then requires them all published: a checkpoint never names a
-// page that is not on disk.
+// Dependency state under g_mtx. Ordinary checkpoints may lose speculation on
+// an MTP failure, as before, but must not publish while an MTP write is pending.
+// Required checkpoints need every MTP section as well as every trunk page.
+static int deps_locked(const CkEnt& e, bool strict) {
+  if (e.failed || (strict && (e.chunks.size() != (size_t)e.nc ||
+                             e.mtps.size() != (size_t)e.nc))) return ST_FAIL;
+  if (e.required) {
+    if (e.req_pages.size() != (size_t)e.nc * (e.mtp ? 2 : 1)) return ST_FAIL;
+    int st = ST_PUB;
+    for (int page : e.req_pages) {
+      if (page == ST_FAIL) return ST_FAIL;
+      if (page != ST_PUB) st = ST_PEND;
+    }
+    return st;
+  }
+  int st = ST_PUB;
+  for (uint64_t k : e.chunks) {
+    auto f = g_ch.find(k);
+    if (f == g_ch.end() || f->second.st == ST_FAIL) return ST_FAIL;
+    if (f->second.st == ST_PEND) st = ST_PEND;
+  }
+  for (uint64_t k : e.mtps) {
+    if (!k) {
+      if (strict && e.mtp) return ST_FAIL;
+      continue;
+    }
+    auto f = g_mt.find(k);
+    if (f == g_mt.end() || f->second.st == ST_FAIL) {
+      if (strict && e.mtp) return ST_FAIL;
+    } else if (f->second.st == ST_PEND) {
+      st = ST_PEND;
+    }
+  }
+  return st;
+}
+
+// Writers never occupy a worker waiting for a checkpoint's dependencies: a
+// dependency can have been registered by another commit but not enqueued yet.
+// Select a ready item instead, even if it is behind that checkpoint.
 struct Item {
   int kind = 0;  // 0 trunk page, 1 MTP section, 2 checkpoint
   uint64_t key = 0;
   HBuf buf;
   std::shared_ptr<CkEnt> ck;
+  int req_page = -1;       // private page index; ck also owns its lifetime
+  uint64_t charge = 0;     // zero: ordinary logical length
   double cap_s = 0;
   int new_ch = 0, new_mt = 0;
   uint64_t new_b = 0;
@@ -632,66 +712,73 @@ struct Item {
 static std::deque<Item> g_q;
 static uint64_t g_q_bytes = 0;  // queued + being written
 static int g_wbusy = 0;         // writers holding an item
+static uint64_t item_charge(const Item& it) { return it.charge ? it.charge : it.buf.n; }
 // Wall time of page/MTP-section writes since the last checkpoint log: from
 // the first write start to the last write end (writers overlap).
 static bool g_pw_on = false;
 static std::chrono::steady_clock::time_point g_pw_t0, g_pw_t1;
+static bool runnable_locked(const Item& it) {
+  return it.kind != 2 || deps_locked(*it.ck, it.ck->require_mtp) != ST_PEND;
+}
 
 static void writer() {
   for (;;) {
     Item it;
+    bool go = true;
     {
       std::unique_lock<std::mutex> lk(g_mtx);
-      g_cv.wait(lk, [] { return !g_q.empty(); });
-      it = std::move(g_q.front());
-      g_q.pop_front();
+      g_cv.wait(lk, [] {
+        return std::find_if(g_q.begin(), g_q.end(), runnable_locked) != g_q.end();
+      });
+      auto pos = std::find_if(g_q.begin(), g_q.end(), runnable_locked);
+      it = std::move(*pos);
+      g_q.erase(pos);
       g_wbusy++;
+      if (it.kind == 2) go = deps_locked(*it.ck, it.ck->require_mtp) == ST_PUB;
+      else if (it.ck && it.ck->required) go = !it.ck->failed;
     }
     const size_t len = it.buf.n;
+    const uint64_t charge = item_charge(it);
     char* p = it.buf.data();
-    std::string name;
-    bool go = true;
-    if (it.kind == 2) {
-      std::unique_lock<std::mutex> lk(g_mtx);
-      g_cv.wait_for(lk, std::chrono::seconds(60), [&] {
-        for (uint64_t k : it.ck->chunks) {
-          auto f = g_ch.find(k);
-          if (f != g_ch.end() && f->second.st == ST_PEND) return false;
-        }
-        return true;
-      });
-      for (uint64_t k : it.ck->chunks) {
-        auto f = g_ch.find(k);
-        if (f == g_ch.end() || f->second.st != ST_PUB) go = false;
-      }
-      name = it.ck->name;
-    } else {
-      name = it.kind ? mt_name(it.key) : ch_name(it.key);
-    }
+    const bool req = it.ck && it.ck->required;
+    std::string name = it.kind == 2 ? it.ck->name : req ? req_page_name(*it.ck, it.req_page % it.ck->nc, it.kind == 1) :
+                       it.kind ? mt_name(it.key) : ch_name(it.key);
     {  // an earlier copy of this name is being deleted: publish after it
       std::unique_lock<std::mutex> lk(g_mtx);
       g_cv.wait(lk, [&] { return g_jcur != name; });
+      if (req && it.ck->failed) go = false;
     }
     const size_t hb = it.kind == 2 ? sizeof(CkHdr) : sizeof(ChHdr);
-    const uint64_t sum = sum64(p + hb, len - hb);
-    memcpy(p + (it.kind == 2 ? offsetof(CkHdr, sum) : offsetof(ChHdr, sum)), &sum, 8);
+    if (go) {
+      const uint64_t sum = sum64(p + hb, len - hb);
+      memcpy(p + (it.kind == 2 ? offsetof(CkHdr, sum) : offsetof(ChHdr, sum)), &sum, 8);
+    }
     const auto w0 = std::chrono::steady_clock::now();
-    if (it.kind < 2) {
+    if (it.kind < 2 && !req) {
       std::lock_guard<std::mutex> lk(g_mtx);
       if (!g_pw_on) g_pw_on = true, g_pw_t0 = w0;
     }
-    const bool ok = go && write_file(name, p, len);
+    bool ok = go && write_file(name, p, len);
     const auto w1 = std::chrono::steady_clock::now();
     const double ws = std::chrono::duration<double>(w1 - w0).count();
+    // Keep the charge until the private allocation really has been freed.
+    if (req) it.buf = HBuf{};
     {
       std::lock_guard<std::mutex> lk(g_mtx);
-      g_q_bytes -= len;
-      if (it.kind < 2) {
+      g_q_bytes -= charge;
+      if (req && it.kind < 2) {
+        if (it.ck->failed) {
+          del_locked(name);  // including a write which raced cancellation
+        } else {
+          it.ck->req_pages[(size_t)it.req_page] = ok ? ST_PUB : ST_FAIL;
+          if (!ok) logf_locked("kvsnap: required page write failed: %s\n", name.c_str());
+        }
+      } else if (it.kind < 2) {
         if (w1 > g_pw_t1) g_pw_t1 = w1;
         auto& mp = it.kind ? g_mt : g_ch;
         auto f = mp.find(it.key);
         if (f == mp.end() || f->second.refs == 0) {
-          if (ok) del_locked(name);  // every referencing checkpoint is gone
+          del_locked(name);  // no references; remove this or any older copy
           if (f != mp.end()) mp.erase(f);
         } else if (ok) {
           f->second.st = ST_PUB;
@@ -703,24 +790,23 @@ static void writer() {
         }
       } else {
         const auto& e = it.ck;
+        // A concurrent restore can invalidate a dependency during the write.
+        if (deps_locked(*e, e->require_mtp) != ST_PUB) ok = false;
         if (!ok) {
           logf_locked("kvsnap: save of %d tokens failed (%s, non-fatal)\n", e->n,
-                      go ? "write error" : "a page write failed");
-          drop_ck_locked(e, false);
+                      go ? "write error or invalid dependency" : "a dependency failed");
+          drop_ck_locked(e, true);
+          if (req) del_locked(name);  // the entry may already have been removed
+        } else if (req) {
+          e->pub = true;
+          e->bytes = len;
+          e->t = now_t();
         } else {
-          // same state saved before without MTP state: this file replaced it
-          // (it inherits the restore count and segment)
-          for (auto& o : g_ck)
-            if (o != e && o->name == e->name) {
-              e->hits = o->hits;
-              e->hot = o->hot;
-              drop_ck_locked(o, false);
-              break;
-            }
           e->pub = true;
           e->bytes = len;
           e->t = now_t();
           g_total += len;
+          if (e->hits > 0) hits_dirty_locked();
           // "pages write": wall time of the page files written since the last
           // checkpoint log (this commit's new pages, unless commits overlap)
           const double pw =
@@ -748,8 +834,15 @@ static void writer() {
 static double enqueue(Item&& it) {
   const auto t0 = std::chrono::steady_clock::now();
   std::unique_lock<std::mutex> lk(g_mtx);
-  // bounded: the GPU thread waits for the disk rather than hoard host memory
-  g_cv.wait(lk, [&] { return g_q_bytes == 0 || g_q_bytes + it.buf.n <= g_qcap; });
+  // Bounded except for one dependency needed to unblock a queue containing
+  // only checkpoints. Otherwise a producer could wait for space held by a
+  // checkpoint whose page it has not been able to enqueue yet.
+  g_cv.wait(lk, [&] {
+    const bool fits = g_q_bytes <= g_qcap && it.buf.n <= g_qcap - g_q_bytes;
+    return fits || g_q_bytes == 0 ||
+           (it.kind < 2 && !g_wbusy &&
+            std::find_if(g_q.begin(), g_q.end(), runnable_locked) == g_q.end());
+  });
   g_q_bytes += it.buf.n;
   g_q.push_back(std::move(it));
   lk.unlock();
@@ -779,10 +872,11 @@ struct Turn {
 static std::string sync_line() {
   std::unique_lock<std::mutex> lk(g_mtx);
   g_cv.wait(lk, [] {
-    return g_q.empty() && !g_wbusy && !g_turns && g_jq.empty() && !g_jbusy;
+    return g_q.empty() && !g_wbusy && !g_q_bytes && !g_turns &&
+           g_jq.empty() && !g_jbusy;
   });
   size_t nck = 0;
-  for (auto& e : g_ck) nck += e->pub;
+  for (auto& e : g_ck) nck += e->pub && !e->required;
   char b[128];
   snprintf(b, sizeof b, "K %zu %zu %zu %llu\n", nck, g_ch.size(), g_mt.size(),
            (unsigned long long)g_total);
@@ -796,6 +890,12 @@ struct Pending {
   std::shared_ptr<CkEnt> ck;
   HBuf buf;  // checkpoint file image (the writer fills in the checksum)
   double cap_s = 0;
+};
+
+struct ExactCapture {
+  uint64_t seed;
+  int ringpos;
+  std::string prefix;
 };
 
 // GPU-owner thread. Without `rc`: `toks` must be exactly the live state
@@ -814,7 +914,8 @@ struct Pending {
 // re-pools that block from the raw ring and re-ingests MTP row n-1 at the
 // continuation boundary.
 static void capture_impl(GpuModel& m, const std::vector<int>& toks, bool mtp,
-                         const rckpt::Ck* rc, std::vector<Pending>& out) {
+                         const rckpt::Ck* rc, std::vector<Pending>& out,
+                         const ExactCapture* exact = nullptr) {
   if (!g_on) return;
   crashdiag::note("kvsnap capture %zu tokens (mtp %d, from rckpt %d)", toks.size(), (int)mtp,
                   (int)(rc != nullptr));
@@ -839,7 +940,7 @@ static void capture_impl(GpuModel& m, const std::vector<int>& toks, bool mtp,
   }
   const int nc = (n - 1) / KV_PAGE, nt = n - nc * KV_PAGE;
   auto e = std::make_shared<CkEnt>();
-  e->seed = seed_of(m, toks.data(), (size_t)n);
+  e->seed = exact ? exact->seed : seed_of(m, toks.data(), (size_t)n);
   std::vector<uint64_t> ch = chain(e->seed, toks.data(), nc);
   e->base = ch[(size_t)nc];
   e->id = ck_id(e->seed, toks.data(), (size_t)n);
@@ -853,7 +954,15 @@ static void capture_impl(GpuModel& m, const std::vector<int>& toks, bool mtp,
     for (int i = 0; i < nc; i++)
       e->mtps[(size_t)i] = mtp_key(ch[(size_t)i + 1], toks[(size_t)(i + 1) * KV_PAGE]);
   e->tail.assign(toks.begin() + (size_t)nc * KV_PAGE, toks.end());
-  e->name = ck_name(n, e->id);
+  if (exact) {
+    e->required = true;
+    e->req_prefix = exact->prefix;
+    e->name = e->req_prefix + ".kck";
+    e->require_mtp = mtp;
+    e->req_pages.assign((size_t)nc * (mtp ? 2 : 1), ST_PEND);
+  } else {
+    e->name = ck_name(n, e->id);
+  }
   CkHdr h{};
   memcpy(h.magic, MAG_K, 8);
   h.seed = e->seed;
@@ -863,7 +972,7 @@ static void capture_impl(GpuModel& m, const std::vector<int>& toks, bool mtp,
   h.nc = nc;
   h.nl = e->nl;
   h.kvb = G.kvb;
-  h.ringpos = rc ? rc->ringpos : m.ple_ringpos;
+  h.ringpos = exact ? exact->ringpos : rc ? rc->ringpos : m.ple_ringpos;
   h.mtp = mtp;
   h.mtp_pos = mtp ? (rc ? rc->mtp_pos : m.mtp_pos) : 0;
   h.nik = tail_ik(m, n, nc);
@@ -872,10 +981,12 @@ static void capture_impl(GpuModel& m, const std::vector<int>& toks, bool mtp,
   h.conv_b = G.conv_b;
   h.ring_b = G.ring_b;
   h.iraw_b = G.iraw_b;
-  h.mR_b = mtp ? (uint64_t)g_cfg.branches * g_cfg.d * 4 : 0;
+  h.mR_b = (mtp || exact) ? (uint64_t)g_cfg.branches * g_cfg.d * 4 : 0;
   h.miraw_b = mtp && m.d_miraw ? 4 * 128 * 4 : 0;
+  h.pad = exact ? REQ_PAD : 0;
+  e->hdr = h;
   const size_t len = sizeof h + ck_body_b(h);
-  HBuf b = buf_get(len);
+  HBuf b = exact ? buf_exact(len) : buf_get(len);
   if (!b.p) return;
   char* p = b.data();
   memcpy(p, &h, sizeof h);
@@ -886,7 +997,16 @@ static void capture_impl(GpuModel& m, const std::vector<int>& toks, bool mtp,
   p += (size_t)nc * 8;
   memcpy(p, e->tail.data(), (size_t)nt * 4);
   p += (size_t)nt * 4;
-  CK(hipStreamSynchronize(g_str));  // also completes rckpt's async D2H into rc
+  // Also completes rckpt's async D2H into rc. Preserve the ordinary fatal-HIP
+  // policy, but let a required capture report a synchronization failure.
+  if (exact) {
+    if (hipStreamSynchronize(g_str) != hipSuccess) {
+      fprintf(stderr, "kvsnap: required capture stream synchronization failed\n");
+      return;
+    }
+  } else {
+    CK(hipStreamSynchronize(g_str));
+  }
   bool ok = true;
   // device state (rc == nullptr) or its RAM checkpoint copy
   auto blob = [&](const void* d, const void* host, size_t sz) {
@@ -946,10 +1066,12 @@ static void capture_ram(GpuModel& m, const std::vector<int>& hist, size_t n,
 
 // One page's (or MTP section's) file image, read from the live sequence.
 static bool page_image(GpuModel& m, const Geo& G, bool mtp, int i, uint64_t key,
-                       uint64_t parent, int look, const int* toks, HBuf& b) {
+                       uint64_t parent, int look, const int* toks, HBuf& b,
+                       bool exact = false) {
   const int l0 = mtp ? G.nqsa : 0, nl = mtp ? 1 : G.nqsa;
   const size_t lb = page_layer_b(G.kvb, G.has_ik);
-  b = buf_get(sizeof(ChHdr) + (size_t)nl * lb);
+  const size_t len = sizeof(ChHdr) + (size_t)nl * lb;
+  b = exact ? buf_exact(len) : buf_get(len);
   if (!b.p) return false;
   ChHdr h{};
   memcpy(h.magic, mtp ? MAG_M : MAG_C, 8);
@@ -973,6 +1095,16 @@ static bool page_image(GpuModel& m, const Geo& G, bool mtp, int i, uint64_t key,
   return ok;
 }
 
+static bool same_identity(const CkEnt& a, const CkEnt& b) {
+  return a.seed == b.seed && a.base == b.base && a.id == b.id && a.n == b.n &&
+         a.nc == b.nc && a.chunks == b.chunks && a.tail == b.tail;
+}
+static bool same_header_shape(const CkHdr& x, const CkHdr& y) {
+  return x.nl == y.nl && x.kvb == y.kvb && x.ringpos == y.ringpos && x.mtp == y.mtp &&
+         x.mtp_pos == y.mtp_pos && x.nik == y.nik && x.has_ik == y.has_ik && x.pad == y.pad &&
+         x.s_b == y.s_b && x.conv_b == y.conv_b && x.ring_b == y.ring_b &&
+         x.iraw_b == y.iraw_b && x.mR_b == y.mR_b && x.miraw_b == y.miraw_b;
+}
 // End of turn (GPU-owner thread, `hist` == the live state): register the
 // pending checkpoints, capture the pages/MTP sections none of the cached
 // files hold yet, and hand everything to the writer. Every pending state is
@@ -1015,17 +1147,22 @@ static void commit_seed(GpuModel& m, const std::vector<int>& hist,
     std::lock_guard<std::mutex> lk(g_mtx);
     for (size_t pi = 0; pi < pend.size(); pi++) {
       auto& e = pend[pi].ck;
-      if (e->seed != seed || e->nc > np || ch[(size_t)e->nc] != e->base ||
+      if (e->seed != seed || e->n <= 0 || (size_t)e->n > hist.size() ||
+          e->nc < 0 || e->nc > np || ch[(size_t)e->nc] != e->base ||
           !std::equal(e->tail.begin(), e->tail.end(),
                       hist.begin() + (size_t)e->nc * KV_PAGE))
         continue;  // not a prefix of the final state (should not happen)
       std::shared_ptr<CkEnt> old;
       for (auto& o : g_ck)
-        if (o->name == e->name) old = o;
-      if (old && (old->mtp || !e->mtp)) {  // already cached (or queued)
+        if (o->name == e->name) { old = o; break; }
+      if (old && !same_identity(*old, *e)) continue;  // name collision
+      if (old && !old->failed && (old->mtp || !e->mtp)) {
         if (old->pub) touch_locked(old);
         continue;
       }
+      // Never replace a pending writer, an entry held by a restore/pin, or a
+      // richer MTP entry with a non-MTP one.
+      if (old && (!old->pub || old->busy || (old->mtp && !e->mtp))) continue;
       bool bad = false;  // a failed page write whose references linger
       for (uint64_t k : e->chunks) {
         auto f = g_ch.find(k);
@@ -1043,11 +1180,22 @@ static void commit_seed(GpuModel& m, const std::vector<int>& hist,
         auto f = g_mt.find(k);
         if (f != g_mt.end() && f->second.st == ST_FAIL) {
           k = 0;  // restores then find the section missing: no MTP state
+          // capture already serialized this key; the writer checksums the image later.
+          memcpy(pend[pi].buf.data() + sizeof(CkHdr) +
+                     ((size_t)e->nc + (size_t)i) * sizeof(k),
+                 &k, sizeof(k));
           continue;
         }
         auto r = g_mt.try_emplace(k);
         r.first->second.refs++;
         if (r.second) need_mt[(size_t)i] = 1, owner_mt[(size_t)i] = (int)pi;
+      }
+      if (old) {
+        // Claim new references before dropping the old entry, then hide its
+        // name from match() until the replacement has actually published.
+        e->hits = old->hits;
+        e->hot = old->hot;
+        drop_ck_locked(old, true);
       }
       g_ck.push_back(e);  // pending (pub = false): dedupes the next commit
       keep.push_back(pi);
@@ -1056,9 +1204,18 @@ static void commit_seed(GpuModel& m, const std::vector<int>& hist,
   std::vector<int> nch(pend.size(), 0), nmt(pend.size(), 0);
   std::vector<uint64_t> nb(pend.size(), 0);
   auto fail_blk = [&](std::unordered_map<uint64_t, Blk>& mp, uint64_t k) {
-    std::lock_guard<std::mutex> lk(g_mtx);
-    auto f = mp.find(k);
-    if (f != mp.end()) f->second.st = ST_FAIL;
+    {
+      std::lock_guard<std::mutex> lk(g_mtx);
+      auto f = mp.find(k);
+      if (f != mp.end()) {
+        if (f->second.refs) f->second.st = ST_FAIL;
+        else {
+          del_locked(&mp == &g_mt ? mt_name(k) : ch_name(k));
+          mp.erase(f);
+        }
+      }
+    }
+    g_cv.notify_all();
   };
   CK(hipStreamSynchronize(g_str));
   for (int pass = 0; pass < 2; pass++)
@@ -1144,9 +1301,16 @@ static void note_prefill(size_t n, double ms) {
 }
 // Drop a match() that is not restored (its busy mark).
 static void release(const std::shared_ptr<CkEnt>& e) {
-  std::lock_guard<std::mutex> lk(g_mtx);
-  e->busy--;
+  {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    unbusy_locked(e);
+  }
+  g_cv.notify_all();
 }
+struct RestoreBusy {
+  std::shared_ptr<CkEnt> e;
+  ~RestoreBusy() { if (e) release(e); }
+};
 // Restore `e` rather than a RAM checkpoint of `ram_n` tokens? A RAM
 // checkpoint that carries the MTP state wins over one here that does not
 // (the turn would decode without speculation).
@@ -1180,23 +1344,27 @@ static bool prefer_over_ram(const CkEnt& e, size_t ram_n, bool ram_mtp, long lon
 // ---- restore -----------------------------------------------------------------
 // Longest published checkpoint whose tokens are a strict prefix of `prompt`
 // (strictly shorter: a full-length match has no logits to resume from).
+// `exact` is reserved for same-request suspension, whose pending `cur` and
+// sampler remain on the caller stack and therefore need no fresh logits.
 // `seed2` (optional): a second seed to search, e.g. g_fp for the text
 // prefix of a vision prompt. The returned entry is marked busy until
 // restore() releases it.
 static std::shared_ptr<CkEnt> match(const std::vector<int>& prompt, uint64_t seed,
-                                    uint64_t seed2 = 0) {
+                                    uint64_t seed2 = 0, bool exact = false) {
   if (!g_on || prompt.size() < 2) return nullptr;
   if (seed2 == seed) seed2 = 0;
-  const int np = (int)((prompt.size() - 1) / KV_PAGE);
+  const int np = (int)(exact ? prompt.size() / KV_PAGE
+                             : (prompt.size() - 1) / KV_PAGE);
   const std::vector<uint64_t> ch = chain(seed, prompt.data(), np);
   const std::vector<uint64_t> ch2 =
       seed2 ? chain(seed2, prompt.data(), np) : std::vector<uint64_t>();
   std::lock_guard<std::mutex> lk(g_mtx);
   std::shared_ptr<CkEnt> best;
   for (auto& e : g_ck) {
-    if (!e->pub || (e->seed != seed && (!seed2 || e->seed != seed2))) continue;
+    if (e->required || !e->pub || e->failed ||
+        (e->seed != seed && (!seed2 || e->seed != seed2))) continue;
     const std::vector<uint64_t>& c = e->seed == seed ? ch : ch2;
-    if ((size_t)e->n >= prompt.size() ||
+    if ((exact ? (size_t)e->n != prompt.size() : (size_t)e->n >= prompt.size()) ||
         (best && e->n <= best->n) || e->nc > np || c[(size_t)e->nc] != e->base ||
         !std::equal(e->tail.begin(), e->tail.end(),
                     prompt.begin() + (size_t)e->nc * KV_PAGE))
@@ -1260,7 +1428,8 @@ enum { RS_OK, RS_CKPT, RS_PAGE, RS_OTHER };
 // Pages stream in on a prefetch thread (read + checksum) while the previous
 // one is copied to the device. *bad_page: the trunk page that failed.
 static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& prompt,
-                        bool* mtp_out, uint64_t* bad_page, int* npages, RsTime& tm) {
+                        bool* mtp_out, uint64_t* bad_page, uint64_t* bad_mtp,
+                        int* npages, RsTime& tm) {
   const Geo G = geo(m);
   HBuf cb;
   const auto tc = std::chrono::steady_clock::now();
@@ -1273,7 +1442,7 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
   if (cb.n < sizeof h) return RS_CKPT;
   memcpy(&h, cb.data(), sizeof h);
   if (!ck_sane(h) || cb.n != sizeof h + ck_body_b(h) || h.id != e.id || h.n != e.n ||
-      h.seed != e.seed || h.base != e.base ||
+      h.seed != e.seed || h.base != e.base || !same_header_shape(h, e.hdr) ||
       h.sum != sum64(cb.data() + sizeof h, cb.n - sizeof h))
     return RS_CKPT;
   tm.ck_s = secs_since(tc);
@@ -1283,10 +1452,26 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
       h.conv_b != G.conv_b || h.ring_b != G.ring_b || h.iraw_b != G.iraw_b ||
       h.nl < G.nqsa || h.nl > G.nqsa + 1 || (h.nl > G.nqsa && !h.mtp))
     return RS_OTHER;
+  if (e.required && (h.pad != REQ_PAD || (bool)h.mtp != e.mtp ||
+                     h.nl != G.nqsa + (e.mtp ? 1 : 0) ||
+                     h.miraw_b != (e.mtp ? 4 * 128 * 4u : 0u) ||
+                     (e.mtp && (m.kv_nl <= G.nqsa || !m.d_miraw || !m.d_mpos ||
+                                h.mtp_pos != n - 1)) ||
+                     h.mR_b != (uint64_t)g_cfg.branches * g_cfg.d * 4 || !m.d_R ||
+                     h.ringpos < 0 || h.ringpos >= 9 || h.nik != tail_ik(m, n, nc) ||
+                     m.mrope_active_ || m.rope_delta_ || !m.mrope_pos_.empty() ||
+                     !m.img_inj.empty())) return RS_OTHER;
   const char* p = cb.data() + sizeof h;
   std::vector<uint64_t> chunks((size_t)nc), mtps((size_t)nc);
   memcpy(chunks.data(), p, (size_t)nc * 8);
   memcpy(mtps.data(), p + (size_t)nc * 8, (size_t)nc * 8);
+  // Only indexed keys are protected by the checkpoint's busy reference.
+  // Startup may have zeroed missing MTP keys without rewriting the file.
+  if (chunks != e.chunks || mtps.size() != e.mtps.size()) return RS_CKPT;
+  for (size_t i = 0; i < mtps.size(); i++) {
+    if ((e.required || e.mtps[i]) && mtps[i] != e.mtps[i]) return RS_CKPT;
+    mtps[i] = e.mtps[i];
+  }
   p += (size_t)nc * 16;
   if (memcmp(p, prompt.data() + (size_t)nc * KV_PAGE, (size_t)nt * 4)) return RS_CKPT;
   p += (size_t)nt * 4;
@@ -1294,7 +1479,8 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
                   h.mtp_pos == n - 1 &&
                   h.mR_b == (uint64_t)g_cfg.branches * g_cfg.d * 4 &&
                   h.miraw_b == (m.d_miraw ? 4 * 128 * 4u : 0u);
-  if (want_mtp) {
+  if (e.required && e.mtp && !want_mtp) return RS_OTHER;
+  if (want_mtp && !e.required) {
     std::lock_guard<std::mutex> lk(g_mtx);
     for (uint64_t k : mtps) {
       auto f = g_mt.find(k);
@@ -1311,6 +1497,7 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
     const int i = mt ? j - nc : j;
     const int* toks = prompt.data() + (size_t)i * KV_PAGE;
     return std::async(std::launch::async, read_page,
+                      e.required ? req_page_name(e, i, mt) :
                       mt ? mt_name(mtps[(size_t)i]) : ch_name(chunks[(size_t)i]), mt,
                       mt ? mtps[(size_t)i] : chunks[(size_t)i],
                       mt ? chunks[(size_t)i] : ch[(size_t)i], mt ? 1 : G.nqsa, G.kvb,
@@ -1349,6 +1536,8 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
         *bad_page = chunks[(size_t)i];
         return RS_PAGE;
       }
+      if (e.required) return RS_PAGE;
+      *bad_mtp = mtps[(size_t)i];
       want_mtp = false;  // the trunk is complete; only speculation is lost
       break;             // (win was drained above)
     }
@@ -1388,7 +1577,7 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
   blob(m.d_convst, h.conv_b, true);
   blob(m.d_ring, h.ring_b, true);
   blob(m.d_iraw, h.iraw_b, true);
-  blob(m.d_R, h.mR_b, want_mtp);
+  blob(m.d_R, h.mR_b, want_mtp || e.required);
   blob(m.d_miraw, h.miraw_b, want_mtp);
   const int r0 = nc * KV_PAGE, k0 = nc * KV_PAGE_BLOCKS;
   const int nik = std::min(
@@ -1406,7 +1595,11 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
   if (!ok) return RS_OTHER;
   if (want_mtp) {
     m.mtp_pos = h.mtp_pos;
-    CK(hipMemcpy(m.d_mpos, &m.mtp_pos, 4, hipMemcpyHostToDevice));
+    if (e.required) {
+      if (!h2d(m.d_mpos, &m.mtp_pos, 4)) return RS_OTHER;
+    } else {
+      CK(hipMemcpy(m.d_mpos, &m.mtp_pos, 4, hipMemcpyHostToDevice));
+    }
   }
   // QWENOX_QSA_WMMA_BTV: the transposed prefill V cache is derived state (not
   // saved); rebuild it for [0, n) from the restored row-major V, or sparse
@@ -1422,8 +1615,13 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
         k_bf16_rows_to_bt<<<grid, 256, 0, g_str>>>(
             m.d_vcb + (size_t)qi * m.kv_layer_rows * 512, m.vct_layer(qi), pr, pr + cnt);
       });
-    CK(hipGetLastError());
-    CK(hipStreamSynchronize(g_str));
+    if (e.required) {
+      if (hipGetLastError() != hipSuccess || hipStreamSynchronize(g_str) != hipSuccess)
+        return RS_OTHER;
+    } else {
+      CK(hipGetLastError());
+      CK(hipStreamSynchronize(g_str));
+    }
   }
   // C1 f16 twins: derived state (not saved); rebuild the complete blocks
   // [0, n/4) from the restored fp32 indexer keys, or f16 scoring in a later
@@ -1431,19 +1629,29 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
   // re-pooled from the raw ring by the continuation prefill.
   if (m.d_ikh && G.has_ik && n / 4 > 0) {
     const int nb = n / 4;
-    for (int qi = 0; qi < m.kv_nl; qi++)
+    const int twins_nl = e.required ? nl : m.kv_nl;
+    for (int qi = 0; qi < twins_nl; qi++)
       k_ik_twin_build<<<nb, 128, 0, g_str>>>(
           m.d_ik + (size_t)qi * m.ik_layer_blocks * 128,
           m.kv_paged ? m.d_ptab : nullptr,
           m.d_ikh + (size_t)qi * m.ik_layer_blocks * 128, nb);
-    CK(hipGetLastError());
-    CK(hipStreamSynchronize(g_str));
+    if (e.required) {
+      if (hipGetLastError() != hipSuccess || hipStreamSynchronize(g_str) != hipSuccess)
+        return RS_OTHER;
+    } else {
+      CK(hipGetLastError());
+      CK(hipStreamSynchronize(g_str));
+    }
   }
   // host-side and scalar state: pos/ringpos (both mirrors), PLE token history
   m.pos = n;
   m.ple_ringpos = h.ringpos;
-  CK(hipMemcpy(m.d_pos, &m.pos, 4, hipMemcpyHostToDevice));
-  CK(hipMemcpy(m.d_ringpos, &m.ple_ringpos, 4, hipMemcpyHostToDevice));
+  if (e.required) {
+    if (!h2d(m.d_pos, &m.pos, 4) || !h2d(m.d_ringpos, &m.ple_ringpos, 4)) return RS_OTHER;
+  } else {
+    CK(hipMemcpy(m.d_pos, &m.pos, 4, hipMemcpyHostToDevice));
+    CK(hipMemcpy(m.d_ringpos, &m.ple_ringpos, 4, hipMemcpyHostToDevice));
+  }
   m.chist.assign(prompt.begin(), prompt.begin() + n);
   *mtp_out = want_mtp;
   return RS_OK;
@@ -1455,29 +1663,40 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
 static bool restore(GpuModel& m, const std::shared_ptr<CkEnt>& e,
                     const std::vector<int>& prompt, std::vector<int>& hist,
                     bool* mtp_out) {
+  RestoreBusy busy{e};
   *mtp_out = false;
   crashdiag::note("kvsnap restore %d tokens from %.60s", e->n, e->name.c_str());
   const auto t0 = std::chrono::steady_clock::now();
-  uint64_t bad = 0;
+  uint64_t bad = 0, bad_mt = 0;
   int npages = 0;
   RsTime tm;
-  const int rc = restore_body(m, *e, prompt, mtp_out, &bad, &npages, tm);
+  int rc = restore_body(m, *e, prompt, mtp_out, &bad, &bad_mt, &npages, tm);
   {
     std::lock_guard<std::mutex> lk(g_mtx);
-    e->busy--;
+    if (bad_mt) {
+      auto f = g_mt.find(bad_mt);
+      if (f != g_mt.end()) f->second.st = ST_FAIL;
+    }
+    if (rc == RS_OK && e->failed) rc = RS_CKPT;
     if (rc == RS_OK) {
-      hit_locked(e);
-    } else if (rc == RS_CKPT) {
+      if (!e->required) hit_locked(e);
+    } else if (rc == RS_CKPT || (rc == RS_PAGE && e->required)) {
       drop_ck_locked(e, true);
     } else if (rc == RS_PAGE) {
-      // a damaged page invalidates every checkpoint built on it
+      // Invalidate busy entries too, but retain their files until released.
+      // Pending checkpoints sharing this page must not publish either.
+      auto f = g_ch.find(bad);
+      if (f != g_ch.end()) f->second.st = ST_FAIL;
       std::vector<std::shared_ptr<CkEnt>> v;
       for (auto& o : g_ck)
-        if (o->pub && !o->busy && std::count(o->chunks.begin(), o->chunks.end(), bad))
+        if (!o->required && o->pub && std::count(o->chunks.begin(), o->chunks.end(), bad))
           v.push_back(o);
       for (auto& o : v) drop_ck_locked(o, true);
     }
+    unbusy_locked(e);
+    busy.e.reset();
   }
+  g_cv.notify_all();
   flush_log();
   const double s =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -1488,7 +1707,7 @@ static bool restore(GpuModel& m, const std::shared_ptr<CkEnt>& e,
     return false;
   }
   hist.assign(prompt.begin(), prompt.begin() + e->n);
-  if (tm.bytes >= (64ull << 20) && s > 0) {  // restore throughput (prefer_over_ram)
+  if (!e->required && tm.bytes >= (64ull << 20) && s > 0) {  // prefer_over_ram
     std::lock_guard<std::mutex> lk(g_mtx);
     const double bps = tm.bytes / s;
     g_rs_bps = g_rs_bps > 0 ? 0.7 * g_rs_bps + 0.3 * bps : bps;
@@ -1534,6 +1753,35 @@ static bool ends_with(const std::string& s, const char* suf) {
   const size_t k = strlen(suf);
   return s.size() >= k && !s.compare(s.size() - k, k, suf);
 }
+static bool req_hex(const std::string& s, size_t off, size_t n) {
+  if (off + n > s.size()) return false;
+  for (size_t i = off; i < off + n; i++)
+    if (!((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f'))) return false;
+  return true;
+}
+static bool req_dir_name(const std::string& s) {
+  return s.size() == 27 && !s.compare(0, 11, "kvsnap_req_") && req_hex(s, 11, 16);
+}
+static bool req_file_name(std::string s) {
+  if (!s.rfind("tmp_", 0)) s.erase(0, 4);
+  if (s.size() < 18 || s.compare(0, 2, "s_") || !req_hex(s, 2, 16)) return false;
+  return (s.size() == 22 && s.compare(18, 4, ".kck") == 0) ||
+         (s.size() == 31 && s[18] == '_' && req_hex(s, 19, 8) &&
+          (s.compare(27, 4, ".kvc") == 0 || s.compare(27, 4, ".kvm") == 0));
+}
+// A crashed process cannot have a live request pin. Remove only our recognized
+// private images and temporaries; leave any other files in the directory alone.
+// Like the ordinary index scan, this assumes one engine owns a cache directory.
+static void clean_req_dir(const std::filesystem::path& dir) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+    std::error_code e2;
+    if (req_file_name(it->path().filename().string()) &&
+        fs::is_regular_file(it->symlink_status(e2))) fs::remove(it->path(), e2);
+  }
+  fs::remove(dir, ec);  // succeeds only if nothing unrecognized remains
+}
 // A name this cache writes (c_*.kvc, m_*.kvm, k_*.kck). Startup cleanup only
 // ever touches these, their tmp_ temporaries and pre-A4 s_* snapshot
 // directories, so a cache dir that is shared with other files is safe.
@@ -1576,6 +1824,7 @@ static std::shared_ptr<CkEnt> load_ck(const std::string& fn) {
   e->nc = h.nc;
   e->nl = h.nl;
   e->mtp = h.mtp != 0;
+  e->hdr = h;
   e->pub = true;
   e->chunks.resize((size_t)h.nc);
   e->mtps.resize((size_t)h.nc);
@@ -1628,7 +1877,9 @@ static void init(GpuModel& m, Cfg& cfg) {
     const fs::directory_entry& de = *it;
     std::error_code e2;
     const std::string fn = de.path().filename().string();
-    if (!fn.rfind("tmp_", 0)) {
+    if (req_dir_name(fn) && fs::is_directory(de.symlink_status(e2))) {
+      clean_req_dir(de.path());
+    } else if (!fn.rfind("tmp_", 0)) {
       if ((own_name(fn.substr(4)) || fn.substr(4) == HITS_FILE) && de.is_regular_file(e2))
         fs::remove(de.path(), e2);
     } else if (!fn.rfind("s_", 0) && de.is_directory(e2) &&
@@ -1691,6 +1942,7 @@ static void init(GpuModel& m, Cfg& cfg) {
     }
     for (uint64_t k : e->chunks) g_ch[k].refs++;
     for (uint64_t& k : e->mtps) {
+      if (!k) continue;  // zero never owns a reference
       auto f = g_mt.find(k);
       if (f == g_mt.end()) k = 0;
       else f->second.refs++;
