@@ -10169,7 +10169,6 @@ struct GpuModel {
           CK(hipMemcpyAsync(d_ring + (size_t)(p % 9) * 10240,
                             ckring + (size_t)(p % 9) * 10240, 10240 * 4,
                             hipMemcpyDeviceToDevice, g_str));
-        chist.resize(chist_sz + d + 1);
         pos = q + d + 2;
         ple_ringpos = pos % 9;
         CK(hipMemcpyAsync(d_pos, &pos, 4, hipMemcpyHostToDevice, g_str));
@@ -10180,6 +10179,8 @@ struct GpuModel {
         restore_dR_row(d, vsnap_row0_);
         cur = v[d];
       }
+      chist.resize(chist_sz);
+      chist.insert(chist.end(), vt.begin(), vt.begin() + d + 1);
       auto t4 = std::chrono::steady_clock::now();
       // Rebuild MTP KV over committed positions q+1..q+d with trunk taps
       // (d_Rb rows of the state-advancing pass) and committed tokens.
@@ -10207,8 +10208,8 @@ struct GpuModel {
       fprintf(stderr,
               "\nspec: %d tokens in %.2f s = %.1f tok/s | rounds=%d commit/round=%.2f "
               "rollbacks=%d\n",
-              (int)out.size(), sec, out.size() / sec, rounds,
-              (double)out.size() / rounds, rollbacks);
+              (int)out.size(), sec, sec > 0 ? out.size() / sec : 0.0, rounds,
+              rounds ? (double)out.size() / rounds : 0.0, rollbacks);
       fprintf(stderr, "spec depth acc:");
       for (int j = 0; j < 8 && depth_tot[j]; j++)
         fprintf(stderr, " %d:%.3f", j + 1, (double)depth_hits[j] / depth_tot[j]);
@@ -10498,8 +10499,8 @@ struct GpuModel {
         // ---- (same machinery as spec_loop). This worker is counted by the
         // ---- loop-scope VrLoop; the rendezvous happens at the verify below.
         int q = pos - 1;
-        int g = std::min({gctl.cur, gen - (int)out.size(), maxctx - pos - 1});
-        if (g < 1) break;  // context edge: no room for even one draft
+        int g = std::max(0, std::min({gctl.cur, gen - (int)out.size() - 1,
+                                      maxctx - pos - 1}));
         // Shared row budget + occupancy γ, as spec_loop (may return 0: the
         // round still drafts one step to keep the MTP KV, verifies cur only).
         g = occ.pick(g, vseg_active_fn ? vseg_active_fn() : 1, (int)kVSnapRows);
@@ -10608,7 +10609,7 @@ struct GpuModel {
           cur = v[d];
         }
         // Committed-token history: rebuild explicitly so it is right whether
-        // or not ple_on made the verify append (spec_loop relies on ple_on).
+        // or not ple_on made the verify append.
         chist.resize(chist_sz);
         chist.insert(chist.end(), vt.begin(), vt.begin() + d + 1);
         // MTP self-repair over committed positions q+1..q+d (as spec_loop).
@@ -10712,6 +10713,13 @@ struct GpuModel {
       const bool smg = sms_gpu_active(sampler) && sms_round_shared(sampler);
       std::vector<typename Sampler::SDist> q_sd(smg ? g : 0);
       std::vector<char> q_sparse(g, 0);
+      if (g == 0) {
+        // Maintain the causal MTP row and its ring checkpoint, but do not
+        // draw a proposal: the only draw is from the target verify row.
+        mtp_step(d_R, cur, nullptr, false);
+        CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4,
+                          hipMemcpyDeviceToDevice, g_str));
+      }
       for (int j = 0; j < g; j++) {
         bool dense = true;
         if (smg) {
@@ -10840,7 +10848,7 @@ struct GpuModel {
         depth_tot[j]++;
         if (j < a) depth_hits[j]++;
       }
-      gctl.update(g, a);
+      if (g > 0) gctl.update(g, a);
       rounds++;
       live_spec_rounds = rounds;
       live_spec_proposed += g;
@@ -10892,7 +10900,6 @@ struct GpuModel {
           CK(hipMemcpyAsync(d_ring + (size_t)(p % 9) * 10240,
                             ckring + (size_t)(p % 9) * 10240, 10240 * 4,
                             hipMemcpyDeviceToDevice, g_str));
-        chist.resize(chist_sz + d + 1);
         pos = q + d + 2;
         ple_ringpos = pos % 9;
         CK(hipMemcpyAsync(d_pos, &pos, 4, hipMemcpyHostToDevice, g_str));
@@ -10901,6 +10908,8 @@ struct GpuModel {
         restore_dR_row(d);
         cur = stopped_token >= 0 ? stopped_token : next;
       }
+      chist.resize(chist_sz);
+      chist.insert(chist.end(), vt.begin(), vt.begin() + d + 1);
       auto t4 = std::chrono::steady_clock::now();
       CK(hipMemcpyAsync(d_miraw, d_mring_ckpt, 512 * 4,
                         hipMemcpyDeviceToDevice, g_str));
@@ -11323,15 +11332,15 @@ struct GpuModel {
         // ---- MTP round (ngram table missed): spec_loop_sample's round ----
         rp_lap(RP_TOP);
         int q = pos - 1;
-        int g = std::min({spec_conf() > 0 ? kSpecConfMax : gctl.cur,
-                          gen - (int)out.size(), maxctx - pos - 1});
-        if (g < 1) break;  // context edge: no room for even one draft
+        int g = std::max(0, std::min({spec_conf() > 0 ? kSpecConfMax : gctl.cur,
+                                      gen - (int)out.size() - 1,
+                                      maxctx - pos - 1}));
         // Row budget + occupancy γ. A sampled round's γ shapes its RNG draws:
         // for a client-seeded request OccGamma sees a deterministic B (nslots)
         // so the output does not depend on peers (the old live-member clamp
         // here let C7/C8 peers change it: 48/8 - 1 = 5 < adaptive γ max 7);
-        // unseeded requests use the live B. γ = 0 still drafts one step (MTP
-        // KV at q; the draft stream is forked per position) and verifies cur.
+        // unseeded requests use the live B. γ = 0 maintains the MTP row at q
+        // without drawing a proposal, and verifies cur.
         g = occ.pick(g, vr_on ? (vseg_active_fn ? vseg_active_fn() : 1) : 0,
                      (int)kVSnapRows);
         const int gd = std::max(1, g);
@@ -11404,11 +11413,17 @@ struct GpuModel {
                 tok = drafts[j];
                 return more;
               };
-          dr_done = dr_pool_fn(*this, DrSeg{bound_, gd, cur, drafts.data(), &step});
+          dr_done = dr_pool_fn(*this, DrSeg{bound_, gd, cur, drafts.data(),
+                                           g > 0 ? &step : nullptr});
           // peers ran while we waited: restore our lists for the verify below
           if (dr_done && smg) sms_round_shared(sampler);
         }
-        if (!dr_done)
+        if (!dr_done && g == 0) {
+          // Like pure MTP sampling, advance the causal row without a draw.
+          mtp_step(d_R, cur, nullptr, false);
+          CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4,
+                            hipMemcpyDeviceToDevice, g_str));
+        } else if (!dr_done)
         for (int j = 0; j < gd; j++) {
           if (smg)
             mtp_step(j ? d_mR : d_R, j ? drafts[j - 1] : cur, nullptr, false);
