@@ -4,6 +4,18 @@
 
 *中文版:[README.md](README.md)*
 
+> ## Project status: archived, no longer maintained
+>
+> This project has reached its goals and is now frozen:
+>
+> - **Windows and Linux performance (prefill and decode) is at parity** — see the measured
+>   numbers below;
+> - **hgn weight deployment on gfx1151 (Strix Halo) is at or near the engineering ceiling**,
+>   so further optimization work is not warranted.
+>
+> The code remains available as-is and builds and runs normally. Feature requests are no
+> longer accepted: if you want peripheral features, fork the project and build them yourself.
+
 Qwenox is a local inference engine for Qwen3.8-Flash-Next (177B MoE, qwen4_exp architecture). It is written
 for AMD Strix Halo (Ryzen AI Max+ 395, gfx1151) and similar 128 GB unified-memory APUs, and runs on both
 Linux and Windows. It serves an OpenAI-compatible API and the Anthropic Messages API (streaming, tool calls, image input)
@@ -31,13 +43,14 @@ Linux (ROCm 10.1, production config, prefill with MOE_A4=3, PREFILL_CHUNK=16384)
 | --- | --- |
 | Prefill (2K) | ~1610–1651 tok/s (measured 10-18) |
 | Prefill (8K) | 1902.7 tok/s (measured 10-18) |
+| Prefill (16K) | over 2000 tok/s (peak, measured 11-28) |
 | Prefill (32K) | 1938.5 tok/s (measured 10-18) |
 | Prefill (64K) | 1936.4 tok/s (measured 10-18) |
 | Prefill (128K) | 1840.8 tok/s (measured 10-18) |
 | Prefill weighted average | 1874.5 tok/s (7 files, 2 samples each, measured 10-18) |
 | Prefill (256K context) | ~1590 native, ~1580 with YaRN factor 2 (~0.5% overhead, measured 10-07) |
 | Decode (speculative, greedy, γ=4) | ~51 tok/s at 8K, ~50 at 64K (real text, 10-07) |
-| Decode (no speculation) | ~34 tok/s at 8K (measured 10-07, hgn v2 weights; weights with 8-bit dense read more per token, ~12–16% slower) |
+| Decode (no speculation) | 43 tok/s at short context, decreasing with context length (measured 11-28) |
 | Average power draw | ~120 W |
 | Peak (instantaneous) power draw | ~130 W (bursts for a few seconds, then settles back to ~120 W) |
 
@@ -48,9 +61,10 @@ PREFILL_CHUNK=16384, measured 11-25):
 | --- | --- | --- |
 | Prefill (2K) | 1705.1 tok/s | |
 | Prefill (8K) | 1963.5 tok/s | |
+| Prefill (16K) | over 2000 tok/s (peak, 11-28) | |
 | Prefill (32K) | 1964.5 tok/s | ~1440 tok/s (10-13) |
 | Decode (speculative, 2K prompt) | 58.5 tok/s (10-13) | 46.8 tok/s (10-13) |
-| Decode (no speculation) | 31.4 tok/s (10-13) | 27.7 tok/s (10-13) |
+| Decode (no speculation) | 43 tok/s (short context, decreases with context length, 11-28) | 27.7 tok/s (10-13) |
 | Cold start (whole weight file read into VRAM) | ~35 s | ~50–60 s |
 
 After the 11-25 fixes for four long-standing Windows prefill drags (the PLE file's standby page

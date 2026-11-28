@@ -4,6 +4,16 @@
 
 *English: [README_EN.md](README_EN.md)*
 
+> ## 项目状态：已归档，停止维护
+>
+> 本项目已达到既定目标，就此封盘：
+>
+> - **Windows 与 Linux 双端的性能（prefill 与 decode）已经持平**，见下方实测表；
+> - **在 gfx1151（Strix Halo）上部署 hgn 权重的性能已做到接近工程上限**，没有继续优化的必要。
+>
+> 代码按现状保留，可正常编译、使用。Issues 不再受理功能请求：需要外围功能请自行 fork、自行实现，
+> 不要再许愿。
+
 Qwenox 是 Qwen3.8-Flash-Next（177B MoE，qwen4_exp 架构）的本地推理引擎，为 AMD Strix Halo
 （Ryzen AI Max+ 395，gfx1151）这类 128 GB 统一内存的 APU 编写，Linux 和 Windows 都能运行。
 对外提供 OpenAI 兼容 API 和 Anthropic Messages API（流式输出、工具调用、图片输入）以及网页控制台。
@@ -27,13 +37,14 @@ Linux（ROCm 10.1，生产配置，prefill 开 MOE_A4=3，PREFILL_CHUNK=16384）
 | --- | --- |
 | Prefill（2K） | 约 1610–1651 tok/s（10-18 实测） |
 | Prefill（8K） | 1902.7 tok/s（10-18 实测） |
+| Prefill（16K） | 超过 2000 tok/s（极限，11-28 实测） |
 | Prefill（32K） | 1938.5 tok/s（10-18 实测） |
 | Prefill（64K） | 1936.4 tok/s（10-18 实测） |
 | Prefill（128K） | 1840.8 tok/s（10-18 实测） |
 | Prefill 加权平均 | 1874.5 tok/s（7 个文件，每个 2 次采样，10-18 实测） |
 | Prefill（256K 上下文） | 原生约 1590、YaRN factor 2 约 1580 tok/s，开销约 0.5%（10-07 实测） |
 | Decode（投机，greedy，γ=4） | 8K 约 51、64K 约 50 tok/s（10-07 真实文本） |
-| Decode（不投机） | 8K 约 34 tok/s（10-07 实测，hgn v2 权重；dense 为 8-bit 的权重每 token 读量大，约低 12–16%） |
+| Decode（不投机） | 短上下文 43 tok/s，随上下文长度增加而下降（11-28 实测） |
 | 平均功耗 | 约 120 W |
 | 瞬时最大功耗 | 约 130 W（爆发持续几秒后回落至 120 W 左右） |
 
@@ -43,9 +54,10 @@ Windows（同一台机器，BIOS 划分 96 GiB 显存，生产配置，prefill �
 | --- | --- | --- |
 | Prefill（2K） | 1705.1 tok/s | |
 | Prefill（8K） | 1963.5 tok/s | |
+| Prefill（16K） | 超过 2000 tok/s（极限，11-28） | |
 | Prefill（32K） | 1964.5 tok/s | 约 1440 tok/s（10-13） |
 | Decode（投机，2K prompt） | 58.5 tok/s（10-13） | 46.8 tok/s（10-13） |
-| Decode（不投机） | 31.4 tok/s（10-13） | 27.7 tok/s（10-13） |
+| Decode（不投机） | 43 tok/s（短上下文，随上下文长度下降，11-28） | 27.7 tok/s（10-13） |
 | 冷启动（整份权重读进显存） | 约 35 s | 约 50–60 s |
 
 11-25 修复了四个长期拖累 Windows prefill 的问题后（PLE 文件被 `FILE_FLAG_NO_BUFFERING`
